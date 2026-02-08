@@ -1,0 +1,109 @@
+package config
+
+import (
+	"os"
+	"time"
+
+	"gopkg.in/yaml.v3"
+)
+
+// Config is the root configuration.
+type Config struct {
+	ThreatGraph ThreatGraphConfig `yaml:"threatgraph"`
+}
+
+// ThreatGraphConfig is the project configuration.
+type ThreatGraphConfig struct {
+	Input    InputConfig    `yaml:"input"`
+	Pipeline PipelineConfig `yaml:"pipeline"`
+	Rules    RulesConfig    `yaml:"rules"`
+	Alerts   AlertsConfig   `yaml:"alerts"`
+	Output   OutputConfig   `yaml:"output"`
+	Logging  LoggingConfig  `yaml:"logging"`
+}
+
+// InputConfig controls the input reader.
+type InputConfig struct {
+	Redis RedisConfig `yaml:"redis"`
+}
+
+// PipelineConfig controls pipeline behavior.
+type PipelineConfig struct {
+	Workers       int           `yaml:"workers"`
+	BatchSize     int           `yaml:"batch_size"`
+	FlushInterval time.Duration `yaml:"flush_interval"`
+}
+
+// RulesConfig controls IOA rules.
+type RulesConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Path    string `yaml:"path"`
+}
+
+// AlertsConfig controls subgraph alerting.
+type AlertsConfig struct {
+	Enabled   bool               `yaml:"enabled"`
+	Threshold int                `yaml:"threshold"`
+	Window    time.Duration      `yaml:"window"`
+	MaxRows   int                `yaml:"max_rows"`
+	Cooldown  time.Duration      `yaml:"cooldown"`
+	Output    AlertsOutputConfig `yaml:"output"`
+}
+
+// AlertsOutputConfig controls alert output.
+type AlertsOutputConfig struct {
+	Mode string           `yaml:"mode"`
+	File FileOutputConfig `yaml:"file"`
+	HTTP HTTPOutputConfig `yaml:"http"`
+}
+
+// RedisConfig controls Redis input.
+type RedisConfig struct {
+	Addr         string        `yaml:"addr"`
+	Password     string        `yaml:"password"`
+	DB           int           `yaml:"db"`
+	Key          string        `yaml:"key"`
+	BlockTimeout time.Duration `yaml:"block_timeout"`
+}
+
+// OutputConfig controls output.
+type OutputConfig struct {
+	Mode string           `yaml:"mode"`
+	File FileOutputConfig `yaml:"file"`
+	HTTP HTTPOutputConfig `yaml:"http"`
+}
+
+// FileOutputConfig config for local JSON output.
+type FileOutputConfig struct {
+	Path string `yaml:"path"`
+}
+
+// HTTPOutputConfig config for remote output.
+type HTTPOutputConfig struct {
+	URL     string            `yaml:"url"`
+	Timeout time.Duration     `yaml:"timeout"`
+	Headers map[string]string `yaml:"headers"`
+}
+
+// LoggingConfig controls logging output.
+type LoggingConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Level   string `yaml:"level"`
+	File    string `yaml:"file"`
+	Console bool   `yaml:"console"`
+}
+
+// LoadConfig reads and parses a YAML config file.
+func LoadConfig(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	var cfg Config
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, err
+	}
+
+	return &cfg, nil
+}

@@ -1,0 +1,498 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ThreatGraph Viewer</title>
+    <style>
+      :root {
+        color-scheme: light;
+        font-family: "Segoe UI", Arial, sans-serif;
+      }
+      body {
+        margin: 0;
+        background: #f7f7f9;
+        color: #222;
+      }
+      .toolbar {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        padding: 12px 16px;
+        background: #ffffff;
+        border-bottom: 1px solid #ddd;
+        align-items: center;
+      }
+      .toolbar label {
+        font-size: 12px;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+      }
+      .toolbar input[type="text"],
+      .toolbar input[type="number"] {
+        padding: 6px 8px;
+        border: 1px solid #ccc;
+        border-radius: 6px;
+        min-width: 180px;
+      }
+      .toolbar button {
+        padding: 8px 12px;
+        border: 0;
+        border-radius: 6px;
+        background: #1f6feb;
+        color: #fff;
+        cursor: pointer;
+      }
+      .toolbar button.secondary {
+        background: #6b7280;
+      }
+      #graph {
+        width: 100vw;
+        height: calc(100vh - 86px);
+      }
+      .status {
+        padding: 6px 16px;
+        font-size: 12px;
+        color: #555;
+      }
+      .tooltip {
+        position: absolute;
+        pointer-events: none;
+        background: rgba(0, 0, 0, 0.75);
+        color: #fff;
+        padding: 6px 8px;
+        border-radius: 6px;
+        font-size: 11px;
+        line-height: 1.2;
+        opacity: 0;
+        transition: opacity 0.1s ease;
+      }
+      .legend {
+        position: absolute;
+        right: 16px;
+        top: 100px;
+        background: #fff;
+        border: 1px solid #ddd;
+        border-radius: 8px;
+        padding: 10px 12px;
+        font-size: 12px;
+        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.08);
+      }
+      .legend div {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        margin: 4px 0;
+      }
+      .legend span.swatch {
+        width: 18px;
+        height: 3px;
+        display: inline-block;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="toolbar">
+      <label>
+        Adjacency JSONL
+        <input id="fileInput" type="file" accept=".jsonl,.txt" />
+      </label>
+      <label>
+        Root process
+        <input id="rootName" type="text" value="TelegramInstaller.exe" list="procList" />
+      </label>
+      <label>
+        Max nodes
+        <input id="maxNodes" type="number" min="50" max="2000" value="600" />
+      </label>
+      <label>
+        Edge types (comma)
+        <input id="edgeTypes" type="text" placeholder="ParentOfEdge,ImageOfEdge" />
+      </label>
+      <button id="renderBtn">Render</button>
+      <button id="clearBtn" class="secondary">Clear</button>
+    </div>
+    <div class="status" id="status">Load a JSONL file to begin.</div>
+    <div id="graph"></div>
+    <div class="tooltip" id="tooltip"></div>
+    <div class="legend" id="legend" style="display:none"></div>
+    <datalist id="procList"></datalist>
+
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <script>
+      const state = {
+        rows: [],
+        meta: new Map(),
+        edges: [],
+        procImage: new Map(),
+      };
+
+      const edgeColors = {
+        ProcessAccessEdge: "#e74c3c",
+        RemoteThreadEdge: "#e74c3c",
+        ConnectEdge: "#27ae60",
+        DNSQueryEdge: "#27ae60",
+        CreatedFileEdge: "#2980b9",
+        ImageLoadEdge: "#2980b9",
+        ImageOfEdge: "#f1c40f",
+      };
+
+      function setStatus(text) {
+        document.getElementById("status").textContent = text;
+      }
+
+      function vertexKind(id) {
+        if (!id || id.indexOf(":") === -1) return "unknown";
+        return id.split(":", 1)[0];
+      }
+
+      function basename(path) {
+        if (!path) return "";
+        return path.replace(/\\/g, "/").split("/").pop();
+      }
+
+      function parseJSONL(text) {
+        const rows = [];
+        const lines = text.split(/\r?\n/);
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            rows.push(JSON.parse(line));
+          } catch (err) {
+            continue;
+          }
+        }
+        return rows;
+      }
+
+      function buildIndexes(rows) {
+        state.meta.clear();
+        state.edges = [];
+        state.procImage.clear();
+
+        for (const row of rows) {
+          if (row.record_type === "vertex" && row.vertex_id) {
+            state.meta.set(row.vertex_id, row);
+            if (row.vertex_id.startsWith("proc:")) {
+              const data = row.data || {};
+              const img = data.image || data.Image;
+              if (img) {
+                state.procImage.set(row.vertex_id, img);
+              }
+            }
+          }
+        }
+
+        for (const row of rows) {
+          if (row.record_type !== "edge") continue;
+          if (!row.vertex_id || !row.adjacent_id) continue;
+          state.edges.push(row);
+
+          const fields = (row.data && row.data.fields) || {};
+          const img = fields.Image || fields.image;
+          if (img) {
+            if (String(row.vertex_id).startsWith("proc:")) {
+              state.procImage.set(row.vertex_id, img);
+            }
+            if (String(row.adjacent_id).startsWith("proc:")) {
+              state.procImage.set(row.adjacent_id, img);
+            }
+          }
+        }
+
+        updateProcList();
+      }
+
+      function updateProcList() {
+        const list = document.getElementById("procList");
+        list.innerHTML = "";
+        const names = new Set();
+        for (const img of state.procImage.values()) {
+          const name = basename(img).toLowerCase();
+          if (name) names.add(name);
+        }
+        for (const row of state.meta.values()) {
+          if (!row.vertex_id || !String(row.vertex_id).startsWith("proc:")) continue;
+          const data = row.data || {};
+          const img = data.image || data.Image;
+          const cmd = data.command_line || data.CommandLine;
+          if (img) names.add(basename(img).toLowerCase());
+          if (cmd) names.add(basename(cmd).toLowerCase());
+        }
+        Array.from(names)
+          .sort()
+          .slice(0, 500)
+          .forEach((name) => {
+            const opt = document.createElement("option");
+            opt.value = name;
+            list.appendChild(opt);
+          });
+      }
+
+      function findRootProc(name) {
+        const needle = name.toLowerCase();
+        for (const [pid, img] of state.procImage.entries()) {
+          if (basename(img).toLowerCase().includes(needle)) return pid;
+        }
+        for (const row of state.meta.values()) {
+          if (!row.vertex_id || !String(row.vertex_id).startsWith("proc:")) continue;
+          const data = row.data || {};
+          const img = data.image || data.Image;
+          const cmd = data.command_line || data.CommandLine;
+          if (img && basename(img).toLowerCase().includes(needle)) return row.vertex_id;
+          if (cmd && basename(cmd).toLowerCase().includes(needle)) return row.vertex_id;
+        }
+        return null;
+      }
+
+      function buildTree(rootId, maxNodes, edgeFilter) {
+        const allowedKinds = new Set(["proc", "file", "path", "net"]);
+        const edgeTypes = edgeFilter.size ? edgeFilter : null;
+
+        const procChildren = new Map();
+        const procAttachments = new Map();
+
+        for (const row of state.edges) {
+          const src = row.vertex_id;
+          const dst = row.adjacent_id;
+          if (!src || !dst) continue;
+          if (edgeTypes && !edgeTypes.has(row.type)) continue;
+
+          const srcKind = vertexKind(src);
+          const dstKind = vertexKind(dst);
+          if (!allowedKinds.has(srcKind) || !allowedKinds.has(dstKind)) continue;
+          if (shouldSkipFileEdge(src, dst)) continue;
+
+          if (row.type === "ParentOfEdge" && srcKind === "proc" && dstKind === "proc") {
+            if (!procChildren.has(src)) procChildren.set(src, []);
+            procChildren.get(src).push(row);
+            continue;
+          }
+
+          if (srcKind === "proc" && dstKind !== "proc") {
+            if (!procAttachments.has(src)) procAttachments.set(src, []);
+            procAttachments.get(src).push(row);
+          } else if (dstKind === "proc" && srcKind !== "proc") {
+            if (!procAttachments.has(dst)) procAttachments.set(dst, []);
+            procAttachments.get(dst).push(row);
+          }
+        }
+
+        const visited = new Set();
+        return buildProcNode(rootId, 0, visited, procChildren, procAttachments, maxNodes);
+      }
+
+      function buildProcNode(procId, depth, visited, procChildren, procAttachments, maxNodes) {
+        if (visited.size >= maxNodes) return null;
+        if (visited.has(procId)) return null;
+        visited.add(procId);
+
+        const image = state.procImage.get(procId) || procId;
+        const node = {
+          id: procId,
+          name: basename(image),
+          type: "proc",
+          depth,
+          children: [],
+        };
+
+        const children = procChildren.get(procId) || [];
+        children.sort((a, b) => (a.ts || "").localeCompare(b.ts || ""));
+        for (const edge of children) {
+          if (visited.size >= maxNodes) break;
+          const child = buildProcNode(edge.adjacent_id, depth + 1, visited, procChildren, procAttachments, maxNodes);
+          if (child) {
+            child.edgeType = edge.type;
+            child.edgeTs = edge.ts || "";
+            node.children.push(child);
+          }
+        }
+
+        const attachments = procAttachments.get(procId) || [];
+        attachments.sort((a, b) => (a.ts || "").localeCompare(b.ts || ""));
+        let attachIndex = 0;
+        for (const edge of attachments) {
+          if (visited.size >= maxNodes) break;
+          const otherId = edge.vertex_id === procId ? edge.adjacent_id : edge.vertex_id;
+          if (!otherId) continue;
+          const kind = vertexKind(otherId);
+          const childId = procId + "::" + edge.type + "::" + attachIndex++;
+          const label = buildLeafLabel(otherId);
+          node.children.push({
+            id: childId,
+            name: label,
+            type: kind,
+            depth: depth + 1,
+            edgeType: edge.type,
+            edgeTs: edge.ts || "",
+            children: [],
+          });
+        }
+
+        return node;
+      }
+
+      function buildLeafLabel(nodeId) {
+        const kind = vertexKind(nodeId);
+        if (kind === "path") return basename(nodeId.split(":").slice(2).join(":"));
+        if (kind === "file") return "file";
+        if (kind === "net") return nodeId.split(":").slice(1).join(":");
+        return nodeId;
+      }
+
+      function shouldSkipFileEdge(src, dst) {
+        const srcKind = vertexKind(src);
+        const dstKind = vertexKind(dst);
+        if (srcKind === "proc" && (dstKind === "path" || dstKind === "file")) {
+          return isSystemProc(src);
+        }
+        if (dstKind === "proc" && (srcKind === "path" || srcKind === "file")) {
+          return isSystemProc(dst);
+        }
+        return false;
+      }
+
+      function isSystemProc(procId) {
+        const img = state.procImage.get(procId) || "";
+        const lower = img.toLowerCase();
+        return lower.startsWith("c:\\windows\\system32\\") || lower.startsWith("c:\\windows\\syswow64\\");
+      }
+
+      function renderTree(treeData) {
+        const container = document.getElementById("graph");
+        container.innerHTML = "";
+
+        const width = container.clientWidth;
+        const height = container.clientHeight;
+        const svg = d3
+          .select(container)
+          .append("svg")
+          .attr("width", width)
+          .attr("height", height);
+
+        const g = svg.append("g");
+        const root = d3.hierarchy(treeData);
+        const labels = root.descendants().map((d) => d.data.name || "");
+        const maxChars = Math.max(6, ...labels.map((l) => l.length));
+        const nodeWidth = Math.min(220, Math.max(100, maxChars * 7 + 20));
+        const nodeHeight = 26;
+
+        const treeLayout = d3
+          .tree()
+          .nodeSize([nodeWidth + 80, 140])
+          .separation((a, b) => (a.parent === b.parent ? 1.4 : 1.8));
+        treeLayout(root);
+
+        const nodes = root.descendants();
+        const minX = d3.min(nodes, (d) => d.x - nodeWidth / 2) ?? 0;
+        const maxX = d3.max(nodes, (d) => d.x + nodeWidth / 2) ?? 0;
+        const minY = d3.min(nodes, (d) => d.y - nodeHeight / 2) ?? 0;
+        const maxY = d3.max(nodes, (d) => d.y + nodeHeight / 2) ?? 0;
+        const graphWidth = maxX - minX + 80;
+        const graphHeight = maxY - minY + 80;
+
+        const offsetX = (width - graphWidth) / 2 - minX + 40;
+        const offsetY = 20 - minY;
+        g.attr("transform", `translate(${offsetX},${offsetY})`);
+
+        const link = g
+          .selectAll(".link")
+          .data(root.links())
+          .enter()
+          .append("path")
+          .attr("class", "link")
+          .attr("fill", "none")
+          .attr("stroke", (d) => edgeColors[d.target.data.edgeType] || "#7f8c8d")
+          .attr("stroke-width", 1.2)
+          .attr("d", d3.linkVertical().x((d) => d.x).y((d) => d.y));
+
+        link.append("title").text((d) => {
+          const et = d.target.data.edgeType || "edge";
+          const ts = d.target.data.edgeTs || "";
+          const dir = d.target.data.edgeDir || "out";
+          const label = dir === "in" ? et + " (in)" : et;
+          return ts ? label + " @ " + ts : label;
+        });
+
+        const node = g
+          .selectAll(".node")
+          .data(root.descendants())
+          .enter()
+          .append("g")
+          .attr("class", "node")
+          .attr("transform", (d) => "translate(" + d.x + "," + d.y + ")");
+
+        node
+          .append("rect")
+          .attr("x", -nodeWidth / 2)
+          .attr("y", -nodeHeight / 2)
+          .attr("width", nodeWidth)
+          .attr("height", nodeHeight)
+          .attr("rx", 6)
+          .attr("fill", (d) => (d.data.type === "proc" ? "#c6e2ff" : "#f5f5f5"))
+          .attr("stroke", "#333")
+          .attr("stroke-width", 0.8);
+
+        node
+          .append("text")
+          .attr("text-anchor", "middle")
+          .attr("dy", "0.35em")
+          .attr("font-size", 11)
+          .text((d) => d.data.name);
+
+        node.append("title").text((d) => d.data.id || d.data.name);
+
+        const zoom = d3.zoom().on("zoom", (event) => g.attr("transform", event.transform));
+        svg.call(zoom);
+      }
+
+      function render() {
+        if (!state.rows.length) {
+          setStatus("Load a JSONL file first.");
+          return;
+        }
+        const name = document.getElementById("rootName").value.trim();
+        const rootId = findRootProc(name);
+        if (!rootId) {
+          setStatus(
+            "Root process not found: " +
+              name +
+              " (known processes: " +
+              state.procImage.size +
+              ")"
+          );
+          return;
+        }
+        const maxNodes = parseInt(document.getElementById("maxNodes").value || "600", 10);
+        const edgeInput = document.getElementById("edgeTypes").value.trim();
+        const edgeFilter = new Set(
+          edgeInput ? edgeInput.split(",").map((v) => v.trim()).filter(Boolean) : []
+        );
+
+        const tree = buildTree(rootId, maxNodes, edgeFilter);
+        renderTree(tree);
+        setStatus("Rendered tree with root: " + name + " (" + rootId + ")");
+      }
+
+      document.getElementById("fileInput").addEventListener("change", (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = () => {
+          state.rows = parseJSONL(reader.result);
+          buildIndexes(state.rows);
+          setStatus("Loaded " + state.rows.length + " rows.");
+          render();
+        };
+        reader.readAsText(file);
+      });
+
+      document.getElementById("renderBtn").addEventListener("click", render);
+      document.getElementById("clearBtn").addEventListener("click", () => {
+        document.getElementById("graph").innerHTML = "";
+        setStatus("Cleared.");
+      });
+    </script>
+  </body>
+</html>
