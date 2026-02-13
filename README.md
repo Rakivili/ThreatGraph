@@ -114,7 +114,10 @@ make
 
 ## 邻接表消费与时序遍历
 
-项目新增了离线分析器，可直接消费 `adjacency.jsonl`，按时间一致路径（`edge_time` 非递减，`record_id` 同刻度 tie-break）遍历 DAG，并输出命中的 IOA 序列。
+`analyze` 模式支持低成本两阶段检测：
+
+1) 先在时序事件流中按规则序列产出候选（不做全图遍历）
+2) 再在图上做时间一致连通验证（`edge_time` 非递减，`record_id` 同刻度 tie-break）
 
 支持两种方式：
 
@@ -126,6 +129,9 @@ make
 
 # 按边 name 做序列匹配（示例）
 ./bin/threatgraph analyze --input output/adjacency.jsonl --output output/ioa_findings.jsonl --name-seq "SuspiciousTool,NetworkConnect.SuspiciousPath"
+
+# 使用规则文件做两阶段（候选+连通验证）检测
+./bin/threatgraph analyze --input output/adjacency.jsonl --rules-file example/sequence_rules.yml --candidates-output output/ioa_candidates.jsonl --output output/ioa_findings.jsonl
 ```
 
 可选参数：
@@ -133,6 +139,8 @@ make
 - `--max-depth`：每个根进程的最大遍历深度（默认 `64`）
 - `--max-findings`：最多输出命中条数（默认 `10000`）
 - `--name-seq`：按顺序匹配边 name 的逗号序列（例如 `A,B,C`）
+- `--rules-file`：规则 YAML 文件（两阶段检测）
+- `--candidates-output`：候选序列输出路径（可选）
 
 ## 可视化工具（Python）
 
