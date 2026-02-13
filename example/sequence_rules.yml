@@ -18,3 +18,35 @@ rules:
       - SuspiciousTool
       - ProcessAccess.Sensitive.LSASS
     window: 10m
+
+  - id: dll_drop_then_unsigned_load
+    enabled: true
+    sequence:
+      - FileCreate.Executable.Dll
+      - ImageLoad.Unsigned
+    max_depth: 2
+    window: -1s
+
+  - id: unsigned_dll_load_then_injection
+    enabled: true
+    sequence:
+      - ImageLoad.Unsigned
+      - ProcessAccess.Shellcode.SuspiciousAccess
+    max_depth: 2
+    window: 1m
+
+  - id: unsigned_dll_load_then_direct_syscall_injection
+    enabled: true
+    sequence:
+      - ImageLoad.Unsigned
+      - ProcessAccess.Shellcode.DirectSyscall
+    max_depth: 2
+    window: 1m
+
+  - id: unsigned_dll_load_then_lsass_access
+    enabled: true
+    sequence:
+      - ImageLoad.Unsigned
+      - ProcessAccess.Sensitive.LSASS
+    max_depth: 2
+    window: 1m
