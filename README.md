@@ -42,6 +42,8 @@ ThreatGraph 是一个云端图构建器。它从 Redis 队列消费 Sysmon 事�
 
 只使用 `winlog.event_data` 字段。若缺失会记录告警并跳过。
 
+`ts` 仅使用 Sysmon `UtcTime`（事件真实发生时间）；若 `UtcTime` 缺失或解析失败，则该事件不写入邻接表并记录 ERROR 日志。
+
 - **Event ID 1 (ProcessCreate)**
   - `ProcessVertex(proc)`
   - `ParentOfEdge(parent -> child)`
@@ -53,7 +55,7 @@ ThreatGraph 是一个云端图构建器。它从 Redis 队列消费 Sysmon 事�
   - 当前不生成哈希节点（Sysmon 文件事件无哈希）
 
 - **Event ID 7 (ImageLoad)**
-  - `ImageLoadEdge(proc -> path)`（仅写边，不创建文件节点）
+  - `ImageLoadEdge(path -> proc)`（仅写边，不创建文件节点）
 
 - **Event ID 3 (NetworkConnect)**
   - `NetworkVertex(net:ip:port)`
@@ -109,6 +111,28 @@ make
 默认读取 `threatgraph.yml`（当前目录或可执行文件目录）。可传入路径参数指定配置文件。
 
 示例配置：`example/threatgraph.yml`
+
+## 邻接表消费与时序遍历
+
+项目新增了离线分析器，可直接消费 `adjacency.jsonl`，按时间一致路径（`edge_time` 非递减，`record_id` 同刻度 tie-break）遍历 DAG，并输出命中的 IOA 序列。
+
+支持两种方式：
+
+- 默认：注入相关边检出（路径上存在 `RemoteThreadEdge` 或 `ProcessAccessEdge`）
+- 序列匹配：按边的 `name`（来自事件字段，如 `RuleName`）进行有序匹配
+
+```bash
+go run ./cmd/adjacency-analyzer --input output/adjacency.jsonl --output output/ioa_findings.jsonl
+
+# 按边 name 做序列匹配（示例）
+go run ./cmd/adjacency-analyzer --input output/adjacency.jsonl --output output/ioa_findings.jsonl --name-seq "SuspiciousTool,NetworkConnect.SuspiciousPath"
+```
+
+可选参数：
+
+- `--max-depth`：每个根进程的最大遍历深度（默认 `64`）
+- `--max-findings`：最多输出命中条数（默认 `10000`）
+- `--name-seq`：按顺序匹配边 name 的逗号序列（例如 `A,B,C`）
 
 ## 可视化工具（Python）
 

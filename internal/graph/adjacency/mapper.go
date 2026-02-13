@@ -3,8 +3,8 @@ package adjacency
 import (
 	"fmt"
 	"strings"
-	"time"
 
+	"threatgraph/internal/logger"
 	"threatgraph/pkg/models"
 )
 
@@ -24,6 +24,10 @@ func NewMapper() *Mapper {
 // Map converts a single event into adjacency rows.
 func (m *Mapper) Map(event *models.Event) []*models.AdjacencyRow {
 	if event == nil {
+		return nil
+	}
+	if event.Timestamp.IsZero() {
+		logger.Errorf("Skipping event without valid UtcTime (event_id=%d, record_id=%s, host=%s, agent_id=%s)", event.EventID, event.RecordID, event.Hostname, event.AgentID)
 		return nil
 	}
 	var rows []*models.AdjacencyRow
@@ -147,7 +151,7 @@ func (m *Mapper) mapImageLoad(event *models.Event) []*models.AdjacencyRow {
 	pathID := filePathVertexID(host, imageLoaded)
 
 	return []*models.AdjacencyRow{
-		edgeRow("ImageLoadEdge", procID, pathID, event, nil),
+		edgeRow("ImageLoadEdge", pathID, procID, event, nil),
 	}
 }
 
@@ -192,8 +196,10 @@ func (m *Mapper) mapDNSQuery(event *models.Event) []*models.AdjacencyRow {
 }
 
 func (m *Mapper) mapRemoteThread(event *models.Event) []*models.AdjacencyRow {
-	sourceID := processVertexID(pickHost(event), event.Field("SourceProcessGuid"))
-	targetID := processVertexID(pickHost(event), event.Field("TargetProcessGuid"))
+	sourceGUID := event.Field("SourceProcessGuid")
+	targetGUID := event.Field("TargetProcessGuid")
+	sourceID := processVertexID(pickHost(event), sourceGUID)
+	targetID := processVertexID(pickHost(event), targetGUID)
 	if sourceID == "" || targetID == "" {
 		return nil
 	}
@@ -203,8 +209,10 @@ func (m *Mapper) mapRemoteThread(event *models.Event) []*models.AdjacencyRow {
 }
 
 func (m *Mapper) mapProcessAccess(event *models.Event) []*models.AdjacencyRow {
-	sourceID := processVertexID(pickHost(event), event.Field("SourceProcessGuid"))
-	targetID := processVertexID(pickHost(event), event.Field("TargetProcessGuid"))
+	sourceGUID := event.Field("SourceProcessGuid")
+	targetGUID := event.Field("TargetProcessGuid")
+	sourceID := processVertexID(pickHost(event), sourceGUID)
+	targetID := processVertexID(pickHost(event), targetGUID)
 	if sourceID == "" || targetID == "" {
 		return nil
 	}
@@ -227,15 +235,11 @@ func edgeRow(rowType, vertexID, adjacentID string, event *models.Event, data map
 }
 
 func baseRow(event *models.Event, recordType, rowType, vertexID, adjacentID string, data map[string]interface{}) *models.AdjacencyRow {
-	ts := event.Timestamp
-	if ts.IsZero() {
-		ts = time.Now()
-	}
 	if data == nil {
 		data = map[string]interface{}{}
 	}
 	return &models.AdjacencyRow{
-		Timestamp:  ts,
+		Timestamp:  event.Timestamp,
 		RecordType: recordType,
 		Type:       rowType,
 		VertexID:   vertexID,

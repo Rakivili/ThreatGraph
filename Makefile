@@ -1,6 +1,8 @@
 BIN_DIR := bin
 APP := threatgraph
 SRC := ./cmd/threatgraph
+ANALYZER_APP := adjacency-analyzer
+ANALYZER_SRC := ./cmd/adjacency-analyzer
 
 UNAME_S := $(shell uname -s 2>/dev/null)
 WIN :=
@@ -24,13 +26,17 @@ RMDIR := rm -rf $(BIN_DIR)
 EXE :=
 endif
 
-.PHONY: all build clean
+.PHONY: all build build-analyzer clean
 
 all: build
 
 build:
 	@$(MKDIR)
 	go build -o $(BIN_DIR)/$(APP)$(EXE) $(SRC)
+
+build-analyzer:
+	@$(MKDIR)
+	go build -o $(BIN_DIR)/$(ANALYZER_APP)$(EXE) $(ANALYZER_SRC)
 
 clean:
 	@$(RMDIR)
