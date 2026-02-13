@@ -150,11 +150,16 @@ make
 
 ```
 python tools/visualize_adjacency.py --input output/adjacency.jsonl --render simple-svg --layout tree --rankdir TB --proc-name TelegramInstaller.exe
+
+# 绘制 analyze 输出的已验证子图（finding JSONL）
+python tools/visualize_adjacency.py --input output/ioa_findings.jsonl --input-kind finding --finding-index 0 --render simple-svg --image output/finding_0.svg --layout tree --rankdir TB
 ```
 
 常见参数：
 
 - `--proc-name <name>`：以指定进程为根构建子图
+- `--input-kind auto|adjacency|finding`：输入类型（默认 auto 自动识别）
+- `--finding-index <n>`：仅绘制第 n 条 finding（默认 -1，绘制全部）
 - `--layout tree`：树形布局（根在上，向下生长）
 - `--edge-label text|hover|none`：边标签显示方式（默认 text）
 - `--edge-curve <n>`：曲线强度，0 表示直线

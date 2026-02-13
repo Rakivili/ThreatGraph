@@ -19,6 +19,18 @@ def parse_args():
         help="Path to adjacency JSONL (default: output/adjacency.jsonl)",
     )
     parser.add_argument(
+        "--input-kind",
+        choices=["auto", "adjacency", "finding"],
+        default="auto",
+        help="Input record kind (default: auto)",
+    )
+    parser.add_argument(
+        "--finding-index",
+        type=int,
+        default=-1,
+        help="Use only the Nth finding from finding JSONL (default: -1, all)",
+    )
+    parser.add_argument(
         "--dot",
         default="output/adjacency.dot",
         help="Path to output DOT file (default: output/adjacency.dot)",
@@ -424,7 +436,125 @@ def traverse_reverse_time(edges_by_dst, seeds):
     return visited, selected_edges
 
 
-def load_rows(path, match, limit, edge_types, allowed_kinds):
+def detect_input_kind(path):
+    with open(path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict):
+                if row.get("record_type") in ("vertex", "edge"):
+                    return "adjacency"
+                if isinstance(row.get("sequence"), list):
+                    return "finding"
+    return "adjacency"
+
+
+def finding_to_edges(row):
+    sequence = row.get("sequence")
+    if not isinstance(sequence, list):
+        return []
+    edges = []
+    for item in sequence:
+        if not isinstance(item, dict):
+            continue
+        src = item.get("from")
+        dst = item.get("to")
+        if not src or not dst:
+            continue
+        data = {}
+        name = item.get("name")
+        if name:
+            data["name"] = name
+        edges.append(
+            {
+                "record_type": "edge",
+                "vertex_id": src,
+                "adjacent_id": dst,
+                "type": item.get("type") or "edge",
+                "ts": item.get("ts"),
+                "record_id": item.get("record_id"),
+                "event_id": row.get("rule_id"),
+                "data": data,
+            }
+        )
+    return edges
+
+
+def load_rows(path, match, limit, edge_types, allowed_kinds, input_kind, finding_index):
+    if input_kind == "auto":
+        input_kind = detect_input_kind(path)
+
+    if input_kind == "finding":
+        return load_rows_from_findings(path, match, limit, edge_types, allowed_kinds, finding_index)
+
+    return load_rows_from_adjacency(path, match, limit, edge_types, allowed_kinds)
+
+
+def load_rows_from_findings(path, match, limit, edge_types, allowed_kinds, finding_index):
+    nodes = set()
+    edges = []
+    edge_keys = set()
+    meta = {}
+
+    finding_idx = -1
+    with open(path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            if not isinstance(row, dict) or not isinstance(row.get("sequence"), list):
+                continue
+
+            finding_idx += 1
+            if finding_index >= 0 and finding_idx != finding_index:
+                continue
+
+            for edge in finding_to_edges(row):
+                vertex_id = edge.get("vertex_id")
+                adjacent_id = edge.get("adjacent_id")
+                if not vertex_id or not adjacent_id:
+                    continue
+
+                if match and match not in vertex_id and match not in adjacent_id:
+                    continue
+
+                if edge_types and (edge.get("type") or "") not in edge_types:
+                    continue
+
+                if allowed_kinds and (vertex_kind(vertex_id) not in allowed_kinds or vertex_kind(adjacent_id) not in allowed_kinds):
+                    continue
+
+                key = edge_key(edge)
+                if key in edge_keys:
+                    continue
+                edge_keys.add(key)
+
+                nodes.add(vertex_id)
+                nodes.add(adjacent_id)
+                edges.append(edge)
+
+                if limit and len(edges) >= limit:
+                    break
+
+            if limit and len(edges) >= limit:
+                break
+            if finding_index >= 0 and finding_idx == finding_index:
+                break
+
+    return nodes, edges, meta
+
+
+def load_rows_from_adjacency(path, match, limit, edge_types, allowed_kinds):
     meta = {}
     with open(path, "r", encoding="utf-8") as handle:
         for line in handle:
@@ -1617,7 +1747,15 @@ def main():
     allowed_kinds = {t.strip() for t in args.vertex_types.split(",") if t.strip()}
     if "file" in allowed_kinds:
         allowed_kinds.add("path")
-    nodes, edges, meta = load_rows(args.input, args.match, args.limit, edge_types, allowed_kinds)
+    nodes, edges, meta = load_rows(
+        args.input,
+        args.match,
+        args.limit,
+        edge_types,
+        allowed_kinds,
+        args.input_kind,
+        args.finding_index,
+    )
     if through_types:
         nodes, edges = filter_paths_through(edges, through_types)
     if not edges:
