@@ -449,24 +449,30 @@
 		<!--DATA: UtcTime, ProcessGuid, ProcessId, Image, ImageLoaded, Hashes, Signed, Signature, SignatureStatus-->
 	<RuleGroup name="" groupRelation="or">
 		<ImageLoad onmatch="include">
-			<!--NOTE: Using "include" with no rules means nothing in this section will be logged-->
-			<!-- Unsigned images outside system paths -->
+			<!-- NOTE: include 规则用于分类标注，具体不上报范围在下面的 exclude 规则中控制 -->
 			<Rule name="ImageLoad.Unsigned" groupRelation="and">
-				<ImageLoaded condition="excludes any">C:\Windows\;C:\Program Files\;C:\Program Files (x86)\</ImageLoaded>
 				<Signed condition="is">false</Signed>
 			</Rule>
-			<!-- Signed but invalid/untrusted outside system paths -->
 			<Rule name="ImageLoad.InvalidSignature" groupRelation="and">
-				<ImageLoaded condition="excludes any">C:\Windows\;C:\Program Files\;C:\Program Files (x86)\</ImageLoaded>
 				<Signed condition="is">true</Signed>
 				<SignatureStatus condition="is not">Valid</SignatureStatus>
 			</Rule>
-			<!-- Valid signature that is not Microsoft, outside system paths -->
-			<Rule name="ImageLoad.ValidNonMicrosoft" groupRelation="and">
-				<ImageLoaded condition="excludes any">C:\Windows\;C:\Program Files\;C:\Program Files (x86)\</ImageLoaded>
+			<Rule name="ImageLoad.ValidSignature" groupRelation="and">
 				<Signed condition="is">true</Signed>
 				<SignatureStatus condition="is">Valid</SignatureStatus>
-				<Signature condition="excludes any">Microsoft;Microsoft Corporation;Microsoft Windows</Signature>
+			</Rule>
+		</ImageLoad>
+	</RuleGroup>
+
+	<RuleGroup name="" groupRelation="or">
+		<ImageLoad onmatch="exclude">
+			<!-- 默认不上报：C:\Windows\ 目录下全部镜像加载 -->
+			<ImageLoaded condition="begin with">C:\Windows\</ImageLoaded>
+			<!-- 默认不上报：微软签名且签名合法 -->
+			<Rule name="ImageLoad.Exclude.ValidMicrosoftSigned" groupRelation="and">
+				<Signed condition="is">true</Signed>
+				<SignatureStatus condition="is">Valid</SignatureStatus>
+				<Signature condition="contains any">Microsoft;Microsoft Corporation;Microsoft Windows</Signature>
 			</Rule>
 		</ImageLoad>
 	</RuleGroup>
