@@ -22,14 +22,6 @@ func Parse(data []byte) (*models.Event, error) {
 		Raw:    raw,
 	}
 
-	if ts := getString(raw, "@timestamp"); ts != "" {
-		if t, err := time.Parse(time.RFC3339Nano, ts); err == nil {
-			event.Timestamp = t
-		} else if t, err := time.Parse(time.RFC3339, ts); err == nil {
-			event.Timestamp = t
-		}
-	}
-
 	event.EventID = getInt(raw, "winlog.event_id", "event.code", "event_id")
 	event.AgentID = getString(raw, "agent.id", "agent_id")
 	event.Hostname = getString(raw, "host.name", "host.hostname", "hostname")
