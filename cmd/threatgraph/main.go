@@ -245,6 +245,8 @@ func runAnalyzer(args []string) int {
 	fs := flag.NewFlagSet("analyze", flag.ContinueOnError)
 	input := fs.String("input", "output/adjacency.jsonl", "Adjacency JSONL input path")
 	output := fs.String("output", "output/ioa_findings.jsonl", "Findings JSONL output path")
+	candidatesOutput := fs.String("candidates-output", "", "Optional stage-1 candidate JSONL output path")
+	rulesFile := fs.String("rules-file", "", "YAML file that defines sequence rules")
 	maxDepth := fs.Int("max-depth", 64, "Maximum traversal depth from each root")
 	maxFindings := fs.Int("max-findings", 10000, "Maximum number of findings to emit")
 	nameSeq := fs.String("name-seq", "", "Comma-separated edge name sequence (for example: stepA,stepB,stepC)")
@@ -259,6 +261,27 @@ func runAnalyzer(args []string) int {
 	}
 
 	cfg := analyzer.Config{MaxDepth: *maxDepth, MaxFindings: *maxFindings}
+	if strings.TrimSpace(*rulesFile) != "" {
+		rs, err := analyzer.LoadRuleSet(*rulesFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to load rules file: %v\n", err)
+			return 1
+		}
+		candidates, findings := analyzer.AnalyzeRuleSet(rows, rs, cfg)
+		if strings.TrimSpace(*candidatesOutput) != "" {
+			if err := writeJSONLines(*candidatesOutput, candidates); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to write candidates: %v\n", err)
+				return 1
+			}
+		}
+		if err := writeJSONLines(*output, findings); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to write findings: %v\n", err)
+			return 1
+		}
+		fmt.Printf("analyzed rows=%d candidates=%d findings=%d output=%s\n", len(rows), len(candidates), len(findings), *output)
+		return 0
+	}
+
 	var findings []analyzer.Finding
 	if strings.TrimSpace(*nameSeq) != "" {
 		findings = analyzer.DetectNamedSequencePaths(rows, parseNameSequence(*nameSeq), cfg)
@@ -266,7 +289,7 @@ func runAnalyzer(args []string) int {
 		findings = analyzer.DetectRemoteThreadPaths(rows, cfg)
 	}
 
-	if err := writeFindings(*output, findings); err != nil {
+	if err := writeJSONLines(*output, findings); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to write findings: %v\n", err)
 		return 1
 	}
@@ -275,7 +298,7 @@ func runAnalyzer(args []string) int {
 	return 0
 }
 
-func writeFindings(path string, findings []analyzer.Finding) error {
+func writeJSONLines[T any](path string, rows []T) error {
 	dir := filepath.Dir(path)
 	if dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0755); err != nil {
@@ -291,9 +314,9 @@ func writeFindings(path string, findings []analyzer.Finding) error {
 
 	w := bufio.NewWriter(f)
 	enc := json.NewEncoder(w)
-	for _, item := range findings {
+	for _, item := range rows {
 		if err := enc.Encode(item); err != nil {
-			return fmt.Errorf("encode finding: %w", err)
+			return fmt.Errorf("encode row: %w", err)
 		}
 	}
 	if err := w.Flush(); err != nil {
