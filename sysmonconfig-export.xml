@@ -557,15 +557,15 @@
 	<RuleGroup name="" groupRelation="or">
 		<FileCreate onmatch="include">
 			<!-- Executables / PE -->
-			<TargetFilename name="FileCreate.Executable" condition="end with">.exe</TargetFilename>
-			<TargetFilename name="FileCreate.Executable" condition="end with">.dll</TargetFilename>
-			<TargetFilename name="FileCreate.Executable" condition="end with">.sys</TargetFilename>
-			<TargetFilename name="FileCreate.Executable" condition="end with">.scr</TargetFilename>
-			<TargetFilename name="FileCreate.Executable" condition="end with">.cpl</TargetFilename>
-			<TargetFilename name="FileCreate.Executable" condition="end with">.ocx</TargetFilename>
-			<TargetFilename name="FileCreate.Executable" condition="end with">.com</TargetFilename>
-			<TargetFilename name="FileCreate.Executable" condition="end with">.drv</TargetFilename>
-			<TargetFilename name="FileCreate.Executable" condition="end with">.efi</TargetFilename>
+			<TargetFilename name="FileCreate.Executable.Exe" condition="end with">.exe</TargetFilename>
+			<TargetFilename name="FileCreate.Executable.Dll" condition="end with">.dll</TargetFilename>
+			<TargetFilename name="FileCreate.Executable.Sys" condition="end with">.sys</TargetFilename>
+			<TargetFilename name="FileCreate.Executable.Scr" condition="end with">.scr</TargetFilename>
+			<TargetFilename name="FileCreate.Executable.Cpl" condition="end with">.cpl</TargetFilename>
+			<TargetFilename name="FileCreate.Executable.Ocx" condition="end with">.ocx</TargetFilename>
+			<TargetFilename name="FileCreate.Executable.Com" condition="end with">.com</TargetFilename>
+			<TargetFilename name="FileCreate.Executable.Drv" condition="end with">.drv</TargetFilename>
+			<TargetFilename name="FileCreate.Executable.Efi" condition="end with">.efi</TargetFilename>
 
 			<!-- Scripts -->
 			<TargetFilename name="FileCreate.Script" condition="end with">.ps1</TargetFilename>

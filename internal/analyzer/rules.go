@@ -58,7 +58,9 @@ func LoadRuleSet(path string) (*RuleSet, error) {
 			r.ID = fmt.Sprintf("rule-%d", i+1)
 		}
 		if r.Window <= 0 {
-			r.Window = rs.Defaults.Window
+			if r.Window == 0 {
+				r.Window = rs.Defaults.Window
+			}
 		}
 		if r.MaxDepth <= 0 {
 			r.MaxDepth = rs.Defaults.MaxDepth
