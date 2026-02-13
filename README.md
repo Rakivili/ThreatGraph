@@ -105,10 +105,10 @@ threatgraph/
 
 ```
 make
-./bin/threatgraph
+./bin/threatgraph produce
 ```
 
-默认读取 `threatgraph.yml`（当前目录或可执行文件目录）。可传入路径参数指定配置文件。
+默认读取 `threatgraph.yml`（当前目录或可执行文件目录）。可传入路径参数指定配置文件：`./bin/threatgraph produce path/to/threatgraph.yml`。
 
 示例配置：`example/threatgraph.yml`
 
@@ -122,10 +122,10 @@ make
 - 序列匹配：按边的 `name`（来自事件字段，如 `RuleName`）进行有序匹配
 
 ```bash
-go run ./cmd/adjacency-analyzer --input output/adjacency.jsonl --output output/ioa_findings.jsonl
+./bin/threatgraph analyze --input output/adjacency.jsonl --output output/ioa_findings.jsonl
 
 # 按边 name 做序列匹配（示例）
-go run ./cmd/adjacency-analyzer --input output/adjacency.jsonl --output output/ioa_findings.jsonl --name-seq "SuspiciousTool,NetworkConnect.SuspiciousPath"
+./bin/threatgraph analyze --input output/adjacency.jsonl --output output/ioa_findings.jsonl --name-seq "SuspiciousTool,NetworkConnect.SuspiciousPath"
 ```
 
 可选参数：

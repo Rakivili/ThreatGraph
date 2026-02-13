@@ -1,16 +1,22 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
+	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
 	"threatgraph/config"
 	"threatgraph/internal/alerts"
+	"threatgraph/internal/analyzer"
 	"threatgraph/internal/graph/adjacency"
 	inputredis "threatgraph/internal/input/redis"
 	"threatgraph/internal/logger"
@@ -22,9 +28,9 @@ import (
 	"threatgraph/internal/rules"
 )
 
-func findConfigFile() string {
-	if len(os.Args) > 1 {
-		path := os.Args[1]
+func findConfigFile(configArg string) string {
+	if configArg != "" {
+		path := configArg
 		if _, err := os.Stat(path); err == nil {
 			return path
 		}
@@ -99,8 +105,13 @@ func applyDefaults(cfg *config.Config) {
 	}
 }
 
-func main() {
-	configPath := findConfigFile()
+func runProducer(args []string) {
+	configArg := ""
+	if len(args) > 0 {
+		configArg = args[0]
+	}
+
+	configPath := findConfigFile(configArg)
 
 	cfg, err := config.LoadConfig(configPath)
 	if err != nil {
@@ -228,4 +239,95 @@ func main() {
 	}
 
 	logger.Infof("ThreatGraph stopped")
+}
+
+func runAnalyzer(args []string) int {
+	fs := flag.NewFlagSet("analyze", flag.ContinueOnError)
+	input := fs.String("input", "output/adjacency.jsonl", "Adjacency JSONL input path")
+	output := fs.String("output", "output/ioa_findings.jsonl", "Findings JSONL output path")
+	maxDepth := fs.Int("max-depth", 64, "Maximum traversal depth from each root")
+	maxFindings := fs.Int("max-findings", 10000, "Maximum number of findings to emit")
+	nameSeq := fs.String("name-seq", "", "Comma-separated edge name sequence (for example: stepA,stepB,stepC)")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	rows, err := analyzer.LoadRowsJSONL(*input)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to load adjacency rows: %v\n", err)
+		return 1
+	}
+
+	cfg := analyzer.Config{MaxDepth: *maxDepth, MaxFindings: *maxFindings}
+	var findings []analyzer.Finding
+	if strings.TrimSpace(*nameSeq) != "" {
+		findings = analyzer.DetectNamedSequencePaths(rows, parseNameSequence(*nameSeq), cfg)
+	} else {
+		findings = analyzer.DetectRemoteThreadPaths(rows, cfg)
+	}
+
+	if err := writeFindings(*output, findings); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to write findings: %v\n", err)
+		return 1
+	}
+
+	fmt.Printf("analyzed rows=%d findings=%d output=%s\n", len(rows), len(findings), *output)
+	return 0
+}
+
+func writeFindings(path string, findings []analyzer.Finding) error {
+	dir := filepath.Dir(path)
+	if dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return fmt.Errorf("create output directory: %w", err)
+		}
+	}
+
+	f, err := os.Create(path)
+	if err != nil {
+		return fmt.Errorf("create output file: %w", err)
+	}
+	defer f.Close()
+
+	w := bufio.NewWriter(f)
+	enc := json.NewEncoder(w)
+	for _, item := range findings {
+		if err := enc.Encode(item); err != nil {
+			return fmt.Errorf("encode finding: %w", err)
+		}
+	}
+	if err := w.Flush(); err != nil {
+		return fmt.Errorf("flush output: %w", err)
+	}
+	return nil
+}
+
+func parseNameSequence(raw string) []string {
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		v := strings.TrimSpace(p)
+		if v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+func main() {
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "produce":
+			runProducer(os.Args[2:])
+			return
+		case "analyze":
+			os.Exit(runAnalyzer(os.Args[2:]))
+		default:
+			// Backward-compatible mode: first arg is config path.
+			runProducer(os.Args[1:])
+			return
+		}
+	}
+
+	runProducer(nil)
 }
