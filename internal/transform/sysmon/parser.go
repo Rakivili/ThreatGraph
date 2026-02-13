@@ -41,10 +41,42 @@ func Parse(data []byte) (*models.Event, error) {
 			event.Fields = m
 		}
 	}
+	if utcValue := getString(event.Fields, "UtcTime"); utcValue != "" {
+		if t, ok := parseUtcTime(utcValue); ok {
+			event.Timestamp = t
+		}
+	}
 	if len(event.Fields) == 0 {
 		logger.Warnf("Missing winlog.event_data (event_id=%d, record_id=%s)", event.EventID, event.RecordID)
 	}
 	return event, nil
+}
+
+func parseUtcTime(value string) (time.Time, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}, false
+	}
+
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
+		if t, err := time.Parse(layout, value); err == nil {
+			return t.UTC(), true
+		}
+	}
+
+	for _, layout := range []string{
+		"2006-01-02 15:04:05.000000000",
+		"2006-01-02 15:04:05.0000000",
+		"2006-01-02 15:04:05.000000",
+		"2006-01-02 15:04:05.000",
+		"2006-01-02 15:04:05",
+	} {
+		if t, err := time.ParseInLocation(layout, value, time.UTC); err == nil {
+			return t.UTC(), true
+		}
+	}
+
+	return time.Time{}, false
 }
 
 func getString(root map[string]interface{}, paths ...string) string {

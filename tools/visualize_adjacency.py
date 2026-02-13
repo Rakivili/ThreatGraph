@@ -6,6 +6,7 @@ import sys
 import math
 import random
 from datetime import datetime
+from typing import Dict, Optional
 
 
 def parse_args():
@@ -35,7 +36,7 @@ def parse_args():
     )
     parser.add_argument(
         "--layout",
-        choices=["force", "circle", "layered", "tree"],
+        choices=["force", "circle", "layered", "tree", "time"],
         default="force",
         help="Layout for simple-svg (default: force)",
     )
@@ -84,6 +85,13 @@ def parse_args():
         "--edge-types",
         default="",
         help="Comma-separated edge types to include (default: all)",
+    )
+    parser.add_argument(
+        "--through-edge",
+        default="",
+        help=(
+            "Comma-separated edge types; keep edges on paths that pass through these types"
+        ),
     )
     parser.add_argument(
         "--vertex-types",
@@ -179,7 +187,14 @@ def build_label(vertex_id, meta):
         image = data.get("image") or data.get("Image")
         if image:
             filename = os.path.basename(str(image).replace("\\", "/"))
+            if filename.lower() == "svchost.exe":
+                cmdline = proc_command_line(meta)
+                if cmdline:
+                    return "proc\n" + shorten(cmdline)
             return "proc\n" + shorten(filename)
+        cmdline = proc_command_line(meta)
+        if cmdline:
+            return "proc\n" + shorten(cmdline)
         return "proc"
     if kind == "path":
         value = data.get("path") or vertex_id
@@ -251,6 +266,164 @@ def parse_ts(row):
     return None
 
 
+def edge_time_key(row):
+    ts = parse_ts(row)
+    rid = parse_record_id(row)
+    if ts is None and rid is None:
+        return None
+    return (ts, rid)
+
+
+def time_cmp(left, right):
+    if left is None or right is None:
+        return None
+    left_ts, left_rid = left
+    right_ts, right_rid = right
+    if left_ts is None or right_ts is None:
+        return None
+    if left_ts < right_ts:
+        return -1
+    if left_ts > right_ts:
+        return 1
+    if left_rid is None or right_rid is None:
+        return 0
+    if left_rid < right_rid:
+        return -1
+    if left_rid > right_rid:
+        return 1
+    return 0
+
+
+def time_ge(edge_time, node_time):
+    if node_time is None or edge_time is None:
+        return True
+    edge_ts, edge_rid = edge_time
+    node_ts, node_rid = node_time
+    if edge_ts is None or node_ts is None:
+        return True
+    if edge_ts > node_ts:
+        return True
+    if edge_ts < node_ts:
+        return False
+    if edge_rid is None or node_rid is None:
+        return True
+    return edge_rid >= node_rid
+
+
+def time_le(edge_time, node_time):
+    if node_time is None or edge_time is None:
+        return True
+    edge_ts, edge_rid = edge_time
+    node_ts, node_rid = node_time
+    if edge_ts is None or node_ts is None:
+        return True
+    if edge_ts < node_ts:
+        return True
+    if edge_ts > node_ts:
+        return False
+    if edge_rid is None or node_rid is None:
+        return True
+    return edge_rid <= node_rid
+
+
+def edge_sort_key(row):
+    ts = parse_ts(row)
+    rid = parse_record_id(row)
+    return (ts is None, ts or 0, rid is None, rid or 0)
+
+
+def should_update_forward(old_time, new_time):
+    if old_time is None:
+        return False
+    if new_time is None:
+        return True
+    cmp_value = time_cmp(new_time, old_time)
+    if cmp_value is None:
+        return False
+    return cmp_value < 0
+
+
+def should_update_reverse(old_time, new_time):
+    if old_time is None:
+        return False
+    if new_time is None:
+        return True
+    cmp_value = time_cmp(new_time, old_time)
+    if cmp_value is None:
+        return False
+    return cmp_value > 0
+
+
+def traverse_forward_time(edges_by_src, seeds):
+    visited = set()
+    best_time = {}
+    selected_edges = set()
+    queue = []
+
+    for node, time_key in seeds:
+        if not node:
+            continue
+        visited.add(node)
+        best_time[node] = time_key
+        queue.append((node, time_key))
+
+    while queue:
+        src, src_time = queue.pop(0)
+        for row in edges_by_src.get(src, []):
+            dst = row.get("adjacent_id")
+            if not dst:
+                continue
+            edge_time = edge_time_key(row)
+            if not time_ge(edge_time, src_time):
+                continue
+            selected_edges.add(edge_key(row))
+            next_time = edge_time if edge_time is not None else src_time
+            if dst not in best_time:
+                best_time[dst] = next_time
+                visited.add(dst)
+                queue.append((dst, next_time))
+            elif should_update_forward(best_time[dst], next_time):
+                best_time[dst] = next_time
+                queue.append((dst, next_time))
+
+    return visited, selected_edges
+
+
+def traverse_reverse_time(edges_by_dst, seeds):
+    visited = set()
+    best_time = {}
+    selected_edges = set()
+    queue = []
+
+    for node, time_key in seeds:
+        if not node:
+            continue
+        visited.add(node)
+        best_time[node] = time_key
+        queue.append((node, time_key))
+
+    while queue:
+        dst, dst_time = queue.pop(0)
+        for row in edges_by_dst.get(dst, []):
+            src = row.get("vertex_id")
+            if not src:
+                continue
+            edge_time = edge_time_key(row)
+            if not time_le(edge_time, dst_time):
+                continue
+            selected_edges.add(edge_key(row))
+            next_time = edge_time if edge_time is not None else dst_time
+            if src not in best_time:
+                best_time[src] = next_time
+                visited.add(src)
+                queue.append((src, next_time))
+            elif should_update_reverse(best_time[src], next_time):
+                best_time[src] = next_time
+                queue.append((src, next_time))
+
+    return visited, selected_edges
+
+
 def load_rows(path, match, limit, edge_types, allowed_kinds):
     meta = {}
     with open(path, "r", encoding="utf-8") as handle:
@@ -316,6 +489,74 @@ def load_rows(path, match, limit, edge_types, allowed_kinds):
     return nodes, edges, meta
 
 
+def filter_paths_through(edges, through_types):
+    if not through_types:
+        nodes = set()
+        for row in edges:
+            src = row.get("vertex_id")
+            dst = row.get("adjacent_id")
+            if src:
+                nodes.add(src)
+            if dst:
+                nodes.add(dst)
+        return nodes, edges
+
+    special_edges = [
+        row for row in edges if (row.get("type") or "") in through_types
+    ]
+    if not special_edges:
+        return set(), []
+
+    forward = {}
+    reverse = {}
+    for row in edges:
+        src = row.get("vertex_id")
+        dst = row.get("adjacent_id")
+        if not src or not dst:
+            continue
+        forward.setdefault(src, []).append(row)
+        reverse.setdefault(dst, []).append(row)
+
+    for src in list(forward.keys()):
+        forward[src].sort(key=edge_sort_key)
+    for dst in list(reverse.keys()):
+        reverse[dst].sort(key=edge_sort_key)
+
+    pre_seeds = []
+    post_seeds = []
+    for row in special_edges:
+        time_key = edge_time_key(row)
+        src = row.get("vertex_id")
+        dst = row.get("adjacent_id")
+        if src:
+            pre_seeds.append((src, time_key))
+        if dst:
+            post_seeds.append((dst, time_key))
+
+    _, pre_edges = traverse_reverse_time(reverse, pre_seeds)
+    _, post_edges = traverse_forward_time(forward, post_seeds)
+
+    special_keys = {edge_key(row) for row in special_edges}
+    keep_keys = pre_edges | post_edges | special_keys
+
+    selected_edges = []
+    nodes = set()
+    seen = set()
+    for row in edges:
+        key = edge_key(row)
+        if key not in keep_keys or key in seen:
+            continue
+        seen.add(key)
+        selected_edges.append(row)
+        src = row.get("vertex_id")
+        dst = row.get("adjacent_id")
+        if src:
+            nodes.add(src)
+        if dst:
+            nodes.add(dst)
+    return nodes, selected_edges
+
+
 def should_skip_file_edge(vertex_id, adjacent_id, meta):
     vk = vertex_kind(vertex_id)
     ak = vertex_kind(adjacent_id)
@@ -352,24 +593,54 @@ def proc_image_name(meta_row):
     return filename
 
 
+def proc_command_line(meta_row):
+    if not meta_row:
+        return ""
+    data = meta_row.get("data", {}) if isinstance(meta_row, dict) else {}
+    for key in ("command_line", "CommandLine", "cmdline", "Cmdline", "cmd"):
+        value = data.get(key)
+        if value:
+            return str(value)
+    fields = data.get("fields", {}) if isinstance(data, dict) else {}
+    for key in ("CommandLine", "command_line", "cmdline", "Cmdline", "cmd"):
+        value = fields.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
 def maybe_fill_proc_meta(meta, vertex_id, row):
     if not vertex_id or vertex_kind(vertex_id) != "proc":
         return
     existing = meta.get(vertex_id)
-    if existing:
-        data = existing.get("data", {})
-        if data.get("image") or data.get("Image"):
-            return
-    data = row.get("data", {}) if isinstance(row, dict) else {}
-    fields = data.get("fields", {}) if isinstance(data, dict) else {}
+    existing_data = existing.get("data", {}) if existing else {}
+    has_image = bool(existing_data.get("image") or existing_data.get("Image"))
+    has_cmd = bool(existing_data.get("command_line") or existing_data.get("CommandLine"))
+    row_data = row.get("data", {}) if isinstance(row, dict) else {}
+    fields = row_data.get("fields", {}) if isinstance(row_data, dict) else {}
     image = fields.get("Image") or fields.get("image")
-    if not image:
+    cmdline = (
+        fields.get("CommandLine")
+        or fields.get("command_line")
+        or fields.get("cmdline")
+        or fields.get("Cmdline")
+        or fields.get("cmd")
+    )
+    if not image and not cmdline:
         return
-    meta[vertex_id] = {
-        "record_type": "vertex",
-        "vertex_id": vertex_id,
-        "data": {"image": image},
-    }
+    if not existing:
+        meta[vertex_id] = {
+            "record_type": "vertex",
+            "vertex_id": vertex_id,
+            "data": {},
+        }
+        existing_data = meta[vertex_id]["data"]
+        has_image = False
+        has_cmd = False
+    if image and not has_image:
+        existing_data["image"] = image
+    if cmdline and not has_cmd:
+        existing_data["command_line"] = cmdline
 
 
 def write_dot(path, nodes, edges, meta):
@@ -630,6 +901,8 @@ def layout_positions(nodes, edges, layout, iterations, seed, layer_edges, rankdi
         return layout_force(nodes, edges, iterations, seed)
     if layout == "tree":
         return layout_tree(nodes, edges, seeds, rankdir, layer_gap, node_gap, tree_edge_keys)
+    if layout == "time":
+        return layout_time(nodes, edges, rankdir, layer_gap, node_gap)
     if layout == "layered":
         return layout_layered(nodes, edges, layer_edges, rankdir, layer_gap, node_gap)
     return layout_circle(nodes)
@@ -808,6 +1081,109 @@ def layout_layered(nodes, edges, layer_edges, rankdir, layer_gap, node_gap):
     max_nodes = max(len(layer) for layer in layers) if layers else 1
     width = max(600.0, node_gap * max_nodes + 200)
     height = max(400.0, layer_gap * (max_level + 1) + 200)
+
+    positions = {}
+    for level, layer in enumerate(layers):
+        count = len(layer)
+        if count == 0:
+            continue
+        total_width = (count - 1) * node_gap
+        start_x = (width - total_width) / 2.0
+        y = 100.0 + level * layer_gap
+        for idx, node in enumerate(layer):
+            x = start_x + idx * node_gap
+            if rankdir == "LR":
+                positions[node] = (y, x)
+            else:
+                positions[node] = (x, y)
+
+    if rankdir == "LR":
+        width, height = height, width
+
+    return positions, width, height
+
+
+def layout_time(nodes, edges, rankdir, layer_gap, node_gap):
+    nodes = list(sorted(nodes))
+    if not nodes:
+        return {}, 0, 0
+
+    node_time: Dict[str, Optional[float]] = {node: None for node in nodes}
+    node_rid: Dict[str, Optional[int]] = {node: None for node in nodes}
+
+    for row in edges:
+        ts = parse_ts(row)
+        if ts is None:
+            continue
+        rid = parse_record_id(row)
+        for node in (row.get("vertex_id"), row.get("adjacent_id")):
+            if not node or node not in node_time:
+                continue
+            prev_ts = node_time.get(node)
+            prev_rid = node_rid.get(node)
+            if prev_ts is None or ts < prev_ts:
+                node_time[node] = ts
+                node_rid[node] = rid
+            elif ts == prev_ts and rid is not None and (prev_rid is None or rid < prev_rid):
+                node_rid[node] = rid
+
+    timed_nodes = [node for node in nodes if node_time.get(node) is not None]
+    unknown_nodes = [node for node in nodes if node_time.get(node) is None]
+
+    layers = []
+    if timed_nodes:
+        times: list[float] = []
+        for node in timed_nodes:
+            value = node_time.get(node)
+            if value is not None:
+                times.append(value)
+        min_t = min(times)
+        max_t = max(times)
+        unique_times = sorted(set(times))
+        max_layers = 120
+
+        if len(unique_times) > max_layers and max_t > min_t:
+            bucket = (max_t - min_t) / float(max_layers - 1)
+
+            def layer_index(value):
+                return int((value - min_t) / bucket) if bucket > 0 else 0
+
+        else:
+            time_to_layer = {t: idx for idx, t in enumerate(unique_times)}
+
+            def layer_index(value):
+                return time_to_layer[value]
+
+        layer_map = {}
+        for node in timed_nodes:
+            time_value = node_time.get(node)
+            if time_value is None:
+                continue
+            idx = layer_index(time_value)
+            layer_map.setdefault(idx, []).append(node)
+
+        for idx in sorted(layer_map.keys()):
+            layer = layer_map[idx]
+            layer.sort(
+                key=lambda n: (
+                    node_time[n],
+                    node_rid[n] is None,
+                    node_rid[n] or 0,
+                    n,
+                )
+            )
+            layers.append(layer)
+
+    if unknown_nodes:
+        unknown_nodes.sort()
+        layers.append(unknown_nodes)
+
+    if not layers:
+        layers = [nodes]
+
+    max_nodes = max(len(layer) for layer in layers) if layers else 1
+    width = max(600.0, node_gap * max_nodes + 200)
+    height = max(400.0, layer_gap * (len(layers) + 1) + 200)
 
     positions = {}
     for level, layer in enumerate(layers):
@@ -1124,38 +1500,44 @@ def build_subgraph(edges, seeds):
             continue
         edges_by_src.setdefault(src, []).append(row)
 
-    def sort_key(row):
-        ts = parse_ts(row)
-        rid = parse_record_id(row)
-        return (ts is None, ts or 0, rid is None, rid or 0)
-
     for src in list(edges_by_src.keys()):
-        edges_by_src[src].sort(key=sort_key)
+        edges_by_src[src].sort(key=edge_sort_key)
 
     selected_edges = []
     seen_edges = set()
     tree_edge_keys = set()
     visited = set()
+    best_time = {}
     queue = []
 
     for seed in seeds:
         if seed:
             visited.add(seed)
-            queue.append(seed)
+            best_time[seed] = None
+            queue.append((seed, None))
 
     while queue:
-        src = queue.pop(0)
+        src, src_time = queue.pop(0)
         for row in edges_by_src.get(src, []):
             dst = row.get("adjacent_id")
             if not dst:
+                continue
+            edge_time = edge_time_key(row)
+            if not time_ge(edge_time, src_time):
                 continue
             key = edge_key(row)
             if key not in seen_edges:
                 seen_edges.add(key)
                 selected_edges.append(row)
-            if dst not in visited:
+            next_time = edge_time if edge_time is not None else src_time
+            if dst not in best_time:
+                best_time[dst] = next_time
                 visited.add(dst)
-                queue.append(dst)
+                queue.append((dst, next_time))
+                tree_edge_keys.add(key)
+            elif should_update_forward(best_time[dst], next_time):
+                best_time[dst] = next_time
+                queue.append((dst, next_time))
                 tree_edge_keys.add(key)
 
     nodes = set(visited)
@@ -1231,10 +1613,13 @@ def main():
         return 1
 
     edge_types = {t.strip() for t in args.edge_types.split(",") if t.strip()}
+    through_types = {t.strip() for t in args.through_edge.split(",") if t.strip()}
     allowed_kinds = {t.strip() for t in args.vertex_types.split(",") if t.strip()}
     if "file" in allowed_kinds:
         allowed_kinds.add("path")
     nodes, edges, meta = load_rows(args.input, args.match, args.limit, edge_types, allowed_kinds)
+    if through_types:
+        nodes, edges = filter_paths_through(edges, through_types)
     if not edges:
         print("No edges found for the given filters.")
         return 1
