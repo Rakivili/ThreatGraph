@@ -11,9 +11,10 @@ import (
 
 // RuleSet defines sequence detection rules for staged analysis.
 type RuleSet struct {
-	Version  int          `yaml:"version"`
-	Defaults RuleDefaults `yaml:"defaults"`
-	Rules    []Rule       `yaml:"rules"`
+	Version    int             `yaml:"version"`
+	Defaults   RuleDefaults    `yaml:"defaults"`
+	Rules      []Rule          `yaml:"rules"`
+	Composites []CompositeRule `yaml:"composites"`
 }
 
 // RuleDefaults are fallback options for rules.
@@ -28,6 +29,16 @@ type Rule struct {
 	ID            string        `yaml:"id"`
 	Enabled       bool          `yaml:"enabled"`
 	Sequence      []string      `yaml:"sequence"`
+	Window        time.Duration `yaml:"window"`
+	MaxDepth      int           `yaml:"max_depth"`
+	MaxCandidates int           `yaml:"max_candidates"`
+}
+
+// CompositeRule chains multiple small rules in order.
+type CompositeRule struct {
+	ID            string        `yaml:"id"`
+	Enabled       bool          `yaml:"enabled"`
+	Parts         []string      `yaml:"parts"`
 	Window        time.Duration `yaml:"window"`
 	MaxDepth      int           `yaml:"max_depth"`
 	MaxCandidates int           `yaml:"max_candidates"`
@@ -77,6 +88,34 @@ func LoadRuleSet(path string) (*RuleSet, error) {
 				}
 			}
 			r.Sequence = clean
+		}
+	}
+
+	for i := range rs.Composites {
+		c := &rs.Composites[i]
+		if c.ID == "" {
+			c.ID = fmt.Sprintf("composite-%d", i+1)
+		}
+		if c.Window <= 0 {
+			if c.Window == 0 {
+				c.Window = rs.Defaults.Window
+			}
+		}
+		if c.MaxDepth == 0 {
+			c.MaxDepth = rs.Defaults.MaxDepth
+		}
+		if c.MaxCandidates <= 0 {
+			c.MaxCandidates = rs.Defaults.MaxCandidates
+		}
+		if len(c.Parts) > 0 {
+			clean := make([]string, 0, len(c.Parts))
+			for _, p := range c.Parts {
+				p = strings.TrimSpace(p)
+				if p != "" {
+					clean = append(clean, p)
+				}
+			}
+			c.Parts = clean
 		}
 	}
 	return &rs, nil
