@@ -36,6 +36,7 @@ func AnalyzeRuleSet(rows []*models.AdjacencyRow, rs *RuleSet, cfg Config) ([]Can
 	}
 	eventsByHost := buildRuleEventsByHost(rows)
 	edgesByHostSrc := buildEdgesByHostSrc(rows)
+	ruleCandidatesByHost := make(map[string]map[string][]CandidateSequence, 64)
 
 	candidates := make([]CandidateSequence, 0, 256)
 	findings := make([]Finding, 0, 128)
@@ -45,6 +46,14 @@ func AnalyzeRuleSet(rows []*models.AdjacencyRow, rs *RuleSet, cfg Config) ([]Can
 		}
 		ruleCandidates := prefilterRuleCandidates(eventsByHost, rule)
 		candidates = append(candidates, ruleCandidates...)
+		for _, cand := range ruleCandidates {
+			byRule := ruleCandidatesByHost[cand.Host]
+			if byRule == nil {
+				byRule = make(map[string][]CandidateSequence, 16)
+				ruleCandidatesByHost[cand.Host] = byRule
+			}
+			byRule[rule.ID] = append(byRule[rule.ID], cand)
+		}
 		for _, cand := range ruleCandidates {
 			if validateCandidateConnectivity(cand, edgesByHostSrc[cand.Host], rule.MaxDepth) {
 				findings = append(findings, Finding{
@@ -60,7 +69,83 @@ func AnalyzeRuleSet(rows []*models.AdjacencyRow, rs *RuleSet, cfg Config) ([]Can
 			}
 		}
 	}
+
+	compositeCandidates, compositeFindings := analyzeComposites(rs.Composites, ruleCandidatesByHost, edgesByHostSrc, cfg)
+	candidates = append(candidates, compositeCandidates...)
+	findings = append(findings, compositeFindings...)
+	if cfg.MaxFindings > 0 && len(findings) > cfg.MaxFindings {
+		findings = findings[:cfg.MaxFindings]
+	}
 	return candidates, findings
+}
+
+func analyzeComposites(composites []CompositeRule, ruleCandidatesByHost map[string]map[string][]CandidateSequence, edgesByHostSrc map[string]map[string][]edgeRef, cfg Config) ([]CandidateSequence, []Finding) {
+	if len(composites) == 0 {
+		return nil, nil
+	}
+	allCandidates := make([]CandidateSequence, 0, 128)
+	findings := make([]Finding, 0, 64)
+	seen := make(map[string]struct{}, 256)
+
+	for _, composite := range composites {
+		if !composite.Enabled || len(composite.Parts) < 2 {
+			continue
+		}
+		for host, byRule := range ruleCandidatesByHost {
+			lists := make([][]CandidateSequence, 0, len(composite.Parts))
+			missing := false
+			for _, part := range composite.Parts {
+				partList := byRule[part]
+				if len(partList) == 0 {
+					missing = true
+					break
+				}
+				sort.Slice(partList, func(i, j int) bool {
+					return candidateStartsBefore(partList[i], partList[j])
+				})
+				lists = append(lists, partList)
+			}
+			if missing {
+				continue
+			}
+
+			combos := composeCandidateChain(lists, composite.Window, composite.MaxCandidates)
+			for _, chain := range combos {
+				merged := mergeCandidateChain(chain)
+				cand := CandidateSequence{
+					RuleID:   composite.ID,
+					Host:     host,
+					StartTS:  merged[0].TS,
+					EndTS:    merged[len(merged)-1].TS,
+					Sequence: merged,
+				}
+				allCandidates = append(allCandidates, cand)
+
+				if !validateCandidateChainConnectivity(chain, edgesByHostSrc[host], composite.MaxDepth) {
+					continue
+				}
+
+				key := composite.ID + "|" + host + "|" + chainKey(chain)
+				if _, ok := seen[key]; ok {
+					continue
+				}
+				seen[key] = struct{}{}
+
+				findings = append(findings, Finding{
+					RuleID:       composite.ID,
+					Root:         merged[0].From,
+					MatchedNames: sequenceNames(merged),
+					Triggered:    merged[len(merged)-1],
+					Sequence:     merged,
+				})
+				if cfg.MaxFindings > 0 && len(findings) >= cfg.MaxFindings {
+					return allCandidates, findings
+				}
+			}
+		}
+	}
+
+	return allCandidates, findings
 }
 
 func buildRuleEventsByHost(rows []*models.AdjacencyRow) map[string][]ruleEvent {
@@ -216,6 +301,126 @@ func validateCandidateConnectivity(c CandidateSequence, edgesBySrc map[string][]
 	return true
 }
 
+func validateCandidateChainConnectivity(chain []CandidateSequence, edgesBySrc map[string][]edgeRef, maxDepth int) bool {
+	if len(chain) < 2 {
+		return false
+	}
+	if maxDepth <= 0 {
+		maxDepth = 64
+	}
+	for i := 0; i < len(chain)-1; i++ {
+		left := chain[i]
+		right := chain[i+1]
+		if len(left.Sequence) == 0 || len(right.Sequence) == 0 {
+			return false
+		}
+		leftLast := left.Sequence[len(left.Sequence)-1]
+		rightFirst := right.Sequence[0]
+		if leftLast.To == rightFirst.From {
+			continue
+		}
+		start := buildTimeKey(leftLast.TS, leftLast.RecordID)
+		end := buildTimeKey(rightFirst.TS, rightFirst.RecordID)
+		if !temporalReachable(edgesBySrc, leftLast.To, rightFirst.From, start, end, maxDepth) {
+			return false
+		}
+	}
+	return true
+}
+
+func composeCandidateChain(lists [][]CandidateSequence, window time.Duration, maxCandidates int) [][]CandidateSequence {
+	out := make([][]CandidateSequence, 0, 64)
+	if len(lists) < 2 {
+		return out
+	}
+
+	var walk func(idx int, current []CandidateSequence)
+	walk = func(idx int, current []CandidateSequence) {
+		if maxCandidates > 0 && len(out) >= maxCandidates {
+			return
+		}
+		if idx == len(lists) {
+			combo := make([]CandidateSequence, len(current))
+			copy(combo, current)
+			out = append(out, combo)
+			return
+		}
+
+		for _, cand := range lists[idx] {
+			if len(current) > 0 {
+				prev := current[len(current)-1]
+				if !timeKeyLE(candidateEndKey(prev), candidateStartKey(cand)) {
+					continue
+				}
+				if window > 0 {
+					start := candidateStartKey(current[0])
+					end := candidateEndKey(cand)
+					if end.ts.Sub(start.ts) > window {
+						continue
+					}
+				}
+			}
+			next := append(current, cand)
+			walk(idx+1, next)
+		}
+	}
+
+	walk(0, nil)
+	return out
+}
+
+func mergeCandidateChain(chain []CandidateSequence) []SequenceEdge {
+	out := make([]SequenceEdge, 0, len(chain)*2)
+	seen := make(map[string]struct{}, len(chain)*4)
+	for _, cand := range chain {
+		for _, edge := range cand.Sequence {
+			key := edge.From + "|" + edge.To + "|" + edge.Type + "|" + edge.RecordID
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			out = append(out, edge)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return timeKeyLE(buildTimeKey(out[i].TS, out[i].RecordID), buildTimeKey(out[j].TS, out[j].RecordID))
+	})
+	return out
+}
+
+func candidateStartKey(c CandidateSequence) timeKey {
+	if len(c.Sequence) == 0 {
+		return timeKey{}
+	}
+	first := c.Sequence[0]
+	return buildTimeKey(first.TS, first.RecordID)
+}
+
+func candidateEndKey(c CandidateSequence) timeKey {
+	if len(c.Sequence) == 0 {
+		return timeKey{}
+	}
+	last := c.Sequence[len(c.Sequence)-1]
+	return buildTimeKey(last.TS, last.RecordID)
+}
+
+func candidateStartsBefore(a, b CandidateSequence) bool {
+	return timeKeyLE(candidateStartKey(a), candidateStartKey(b))
+}
+
+func chainKey(chain []CandidateSequence) string {
+	parts := make([]string, 0, len(chain))
+	for _, cand := range chain {
+		if len(cand.Sequence) == 0 {
+			continue
+		}
+		first := cand.Sequence[0]
+		last := cand.Sequence[len(cand.Sequence)-1]
+		parts = append(parts, first.RecordID+":"+last.RecordID)
+	}
+	return strings.Join(parts, ",")
+}
+
 func temporalReachable(edgesBySrc map[string][]edgeRef, src, dst string, start, end timeKey, maxDepth int) bool {
 	if src == "" || dst == "" {
 		return false
@@ -237,7 +442,7 @@ func temporalReachable(edgesBySrc map[string][]edgeRef, src, dst string, start, 
 	for head < len(queue) {
 		cur := queue[head]
 		head++
-		if cur.depth >= maxDepth {
+		if maxDepth > 0 && cur.depth >= maxDepth {
 			continue
 		}
 		for _, er := range edgesBySrc[cur.node] {

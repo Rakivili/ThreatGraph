@@ -142,6 +142,8 @@ make
 - `--rules-file`：规则 YAML 文件（两阶段检测）
 - `--candidates-output`：候选序列输出路径（可选）
 
+规则文件支持 `composites`：可把多个小序列规则按时间顺序组合成一条更长攻击链，再做图连通验证。`composites.max_depth` 可设为 `-1` 表示不限制跳数。
+
 ## 可视化工具（Python）
 
 脚本位置：`tools/visualize_adjacency.py`
