@@ -67,32 +67,34 @@ func (p *RedisAdjacencyPipeline) Run(ctx context.Context) error {
 	msgCh := make(chan []byte, p.workers*4)
 	workCh := make(chan redisWorkItem, p.workers*4)
 
-	var wg sync.WaitGroup
+	var producerWG sync.WaitGroup
+	var writerWG sync.WaitGroup
 
-	wg.Add(1)
+	producerWG.Add(1)
 	go func() {
-		defer wg.Done()
+		defer producerWG.Done()
 		p.readLoop(ctx, msgCh)
 		close(msgCh)
 	}()
 
 	for i := 0; i < p.workers; i++ {
-		wg.Add(1)
+		producerWG.Add(1)
 		go func() {
-			defer wg.Done()
+			defer producerWG.Done()
 			p.workerLoop(msgCh, workCh)
 		}()
 	}
 
-	wg.Add(1)
+	writerWG.Add(1)
 	go func() {
-		defer wg.Done()
-		p.writeLoop(ctx, workCh)
+		defer writerWG.Done()
+		p.writeLoop(workCh)
 	}()
 
 	<-ctx.Done()
+	producerWG.Wait()
 	close(workCh)
-	wg.Wait()
+	writerWG.Wait()
 	return ctx.Err()
 }
 
@@ -154,7 +156,7 @@ func (p *RedisAdjacencyPipeline) workerLoop(in <-chan []byte, out chan<- redisWo
 	}
 }
 
-func (p *RedisAdjacencyPipeline) writeLoop(ctx context.Context, in <-chan redisWorkItem) {
+func (p *RedisAdjacencyPipeline) writeLoop(in <-chan redisWorkItem) {
 	ticker := time.NewTicker(p.flushInterval)
 	defer ticker.Stop()
 
@@ -164,14 +166,15 @@ func (p *RedisAdjacencyPipeline) writeLoop(ctx context.Context, in <-chan redisW
 
 	flush := func() {
 		if len(batchRows) > 0 {
-			for {
+			for attempt := 1; attempt <= 3; attempt++ {
 				if err := p.writer.WriteRows(batchRows); err != nil {
-					logger.Errorf("Failed to write adjacency rows: %v", err)
-					select {
-					case <-ctx.Done():
-						return
-					case <-time.After(1 * time.Second):
+					logger.Errorf("Failed to write adjacency rows (attempt %d/3): %v", attempt, err)
+					if attempt == 3 {
+						logger.Errorf("Dropping %d adjacency rows after retries", len(batchRows))
+						batchRows = nil
+						break
 					}
+					time.Sleep(1 * time.Second)
 					continue
 				}
 				batchRows = nil
@@ -179,14 +182,15 @@ func (p *RedisAdjacencyPipeline) writeLoop(ctx context.Context, in <-chan redisW
 			}
 		}
 		if p.ioaWriter != nil && len(batchIOAEvents) > 0 {
-			for {
+			for attempt := 1; attempt <= 3; attempt++ {
 				if err := p.ioaWriter.WriteEvents(batchIOAEvents); err != nil {
-					logger.Errorf("Failed to write IOA events: %v", err)
-					select {
-					case <-ctx.Done():
-						return
-					case <-time.After(1 * time.Second):
+					logger.Errorf("Failed to write IOA events (attempt %d/3): %v", attempt, err)
+					if attempt == 3 {
+						logger.Errorf("Dropping %d IOA events after retries", len(batchIOAEvents))
+						batchIOAEvents = nil
+						break
 					}
+					time.Sleep(1 * time.Second)
 					continue
 				}
 				batchIOAEvents = nil
@@ -194,14 +198,15 @@ func (p *RedisAdjacencyPipeline) writeLoop(ctx context.Context, in <-chan redisW
 			}
 		}
 		if p.alertWriter != nil && len(batchAlerts) > 0 {
-			for {
+			for attempt := 1; attempt <= 3; attempt++ {
 				if err := p.alertWriter.WriteAlerts(batchAlerts); err != nil {
-					logger.Errorf("Failed to write alerts: %v", err)
-					select {
-					case <-ctx.Done():
-						return
-					case <-time.After(1 * time.Second):
+					logger.Errorf("Failed to write alerts (attempt %d/3): %v", attempt, err)
+					if attempt == 3 {
+						logger.Errorf("Dropping %d alerts after retries", len(batchAlerts))
+						batchAlerts = nil
+						break
 					}
+					time.Sleep(1 * time.Second)
 					continue
 				}
 				batchAlerts = nil
@@ -212,9 +217,6 @@ func (p *RedisAdjacencyPipeline) writeLoop(ctx context.Context, in <-chan redisW
 
 	for {
 		select {
-		case <-ctx.Done():
-			flush()
-			return
 		case <-ticker.C:
 			flush()
 		case item, ok := <-in:

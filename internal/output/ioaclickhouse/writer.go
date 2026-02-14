@@ -31,6 +31,18 @@ type Writer struct {
 	client   *http.Client
 }
 
+type insertRow struct {
+	TS         string `json:"ts"`
+	Host       string `json:"host"`
+	AgentID    string `json:"agent_id,omitempty"`
+	RecordID   string `json:"record_id,omitempty"`
+	EventID    int    `json:"event_id,omitempty"`
+	EdgeType   string `json:"edge_type,omitempty"`
+	VertexID   string `json:"vertex_id,omitempty"`
+	AdjacentID string `json:"adjacent_id,omitempty"`
+	Name       string `json:"name"`
+}
+
 // NewWriter creates a ClickHouse HTTP writer.
 func NewWriter(cfg Config) (*Writer, error) {
 	if cfg.URL == "" {
@@ -78,7 +90,18 @@ func (w *Writer) WriteEvents(events []*models.IOAEvent) error {
 	var body bytes.Buffer
 	enc := json.NewEncoder(&body)
 	for _, event := range events {
-		if err := enc.Encode(event); err != nil {
+		row := insertRow{
+			TS:         event.Timestamp.UTC().Format("2006-01-02 15:04:05.000"),
+			Host:       event.Host,
+			AgentID:    event.AgentID,
+			RecordID:   event.RecordID,
+			EventID:    event.EventID,
+			EdgeType:   event.EdgeType,
+			VertexID:   event.VertexID,
+			AdjacentID: event.AdjacentID,
+			Name:       event.Name,
+		}
+		if err := enc.Encode(row); err != nil {
 			return fmt.Errorf("failed to marshal ioa event: %w", err)
 		}
 	}
