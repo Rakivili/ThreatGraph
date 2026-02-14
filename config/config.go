@@ -19,6 +19,7 @@ type ThreatGraphConfig struct {
 	Rules    RulesConfig    `yaml:"rules"`
 	Alerts   AlertsConfig   `yaml:"alerts"`
 	Output   OutputConfig   `yaml:"output"`
+	IOA      IOAConfig      `yaml:"ioa"`
 	Logging  LoggingConfig  `yaml:"logging"`
 }
 
@@ -71,6 +72,30 @@ type OutputConfig struct {
 	Mode string           `yaml:"mode"`
 	File FileOutputConfig `yaml:"file"`
 	HTTP HTTPOutputConfig `yaml:"http"`
+}
+
+// IOAConfig controls lightweight IOA event output for prefiltering.
+type IOAConfig struct {
+	Enabled bool            `yaml:"enabled"`
+	Output  IOAOutputConfig `yaml:"output"`
+}
+
+// IOAOutputConfig controls IOA event sink.
+type IOAOutputConfig struct {
+	Mode       string                 `yaml:"mode"` // file|clickhouse
+	File       FileOutputConfig       `yaml:"file"`
+	ClickHouse ClickHouseOutputConfig `yaml:"clickhouse"`
+}
+
+// ClickHouseOutputConfig config for ClickHouse HTTP JSONEachRow writes.
+type ClickHouseOutputConfig struct {
+	URL      string            `yaml:"url"`
+	Database string            `yaml:"database"`
+	Table    string            `yaml:"table"`
+	Username string            `yaml:"username"`
+	Password string            `yaml:"password"`
+	Timeout  time.Duration     `yaml:"timeout"`
+	Headers  map[string]string `yaml:"headers"`
 }
 
 // FileOutputConfig config for local JSON output.
