@@ -466,6 +466,8 @@
 
 	<RuleGroup name="" groupRelation="or">
 		<ImageLoad onmatch="exclude">
+			<!-- 排除所有以 .exe 结尾的 Image（加载方进程） -->
+			<Image condition="end with">.exe</Image>
 			<!-- 默认不上报：C:\Windows\ 目录下全部镜像加载 -->
 			<ImageLoaded condition="begin with">C:\Windows\</ImageLoaded>
 			<!-- 默认不上报：微软签名且签名合法 -->
@@ -483,17 +485,17 @@
 
 		<!--DATA: UtcTime, SourceProcessGuid, SourceProcessId, SourceImage, TargetProcessId, TargetImage, NewThreadId, StartAddress, StartModule, StartFunction-->
 	<RuleGroup name="" groupRelation="or">
-		<CreateRemoteThread onmatch="exclude">
-			<!--COMMENT: Exclude mostly-safe sources and log anything else.-->
-			<SourceImage condition="is">C:\Windows\system32\wbem\WmiPrvSE.exe</SourceImage>
-			<SourceImage condition="is">C:\Windows\system32\svchost.exe</SourceImage>
-			<SourceImage condition="is">C:\Windows\system32\wininit.exe</SourceImage>
-			<SourceImage condition="is">C:\Windows\system32\csrss.exe</SourceImage>
-			<SourceImage condition="is">C:\Windows\system32\services.exe</SourceImage>
-			<SourceImage condition="is">C:\Windows\system32\winlogon.exe</SourceImage>
-			<SourceImage condition="is">C:\Windows\system32\audiodg.exe</SourceImage>
-			<StartModule condition="is">C:\Windows\system32\kernel32.dll</StartModule>
-			<TargetImage condition="is">C:\Program Files (x86)\Google\Chrome\Application\chrome.exe</TargetImage>
+		<CreateRemoteThread onmatch="include">
+			<!-- 远程线程创建全部命中并带 RuleName，便于序列规则匹配 -->
+			<Rule name="CreateRemoteThread.SuspiciousSourcePath" groupRelation="or">
+				<SourceImage condition="begin with">C:\Users\</SourceImage>
+				<SourceImage condition="begin with">C:\ProgramData\</SourceImage>
+				<SourceImage condition="begin with">C:\Windows\Temp\</SourceImage>
+			</Rule>
+			<Rule name="CreateRemoteThread.Generic" groupRelation="or">
+				<SourceImage condition="contains">:\</SourceImage>
+				<TargetImage condition="contains">:\</TargetImage>
+			</Rule>
 		</CreateRemoteThread>
 	</RuleGroup>
 
