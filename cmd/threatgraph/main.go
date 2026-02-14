@@ -24,6 +24,8 @@ import (
 	"threatgraph/internal/output/adjacencyjson"
 	"threatgraph/internal/output/alerthttp"
 	"threatgraph/internal/output/alertjson"
+	"threatgraph/internal/output/ioaclickhouse"
+	"threatgraph/internal/output/ioajson"
 	"threatgraph/internal/pipeline"
 	"threatgraph/internal/rules"
 )
@@ -98,6 +100,19 @@ func applyDefaults(cfg *config.Config) {
 	}
 	if cfg.ThreatGraph.Output.File.Path == "" {
 		cfg.ThreatGraph.Output.File.Path = "output/adjacency.jsonl"
+	}
+
+	if cfg.ThreatGraph.IOA.Output.Mode == "" {
+		cfg.ThreatGraph.IOA.Output.Mode = "file"
+	}
+	if cfg.ThreatGraph.IOA.Output.File.Path == "" {
+		cfg.ThreatGraph.IOA.Output.File.Path = "output/ioa_events.jsonl"
+	}
+	if cfg.ThreatGraph.IOA.Output.ClickHouse.Database == "" {
+		cfg.ThreatGraph.IOA.Output.ClickHouse.Database = "threatgraph"
+	}
+	if cfg.ThreatGraph.IOA.Output.ClickHouse.Table == "" {
+		cfg.ThreatGraph.IOA.Output.ClickHouse.Table = "ioa_events"
 	}
 
 	if cfg.ThreatGraph.Logging.Level == "" {
@@ -205,11 +220,44 @@ func runProducer(args []string) {
 		log.Fatalf("Unknown output mode: %s", cfg.ThreatGraph.Output.Mode)
 	}
 
+	var ioaWriter pipeline.IOAWriter
+	if cfg.ThreatGraph.IOA.Enabled {
+		switch cfg.ThreatGraph.IOA.Output.Mode {
+		case "file":
+			w, err := ioajson.NewWriter(cfg.ThreatGraph.IOA.Output.File.Path)
+			if err != nil {
+				logger.Errorf("Failed to create IOA file writer: %v", err)
+				log.Fatalf("Failed to create IOA file writer: %v", err)
+			}
+			ioaWriter = w
+			logger.Infof("IOA output mode: file (%s)", cfg.ThreatGraph.IOA.Output.File.Path)
+		case "clickhouse":
+			w, err := ioaclickhouse.NewWriter(ioaclickhouse.Config{
+				URL:      cfg.ThreatGraph.IOA.Output.ClickHouse.URL,
+				Database: cfg.ThreatGraph.IOA.Output.ClickHouse.Database,
+				Table:    cfg.ThreatGraph.IOA.Output.ClickHouse.Table,
+				Username: cfg.ThreatGraph.IOA.Output.ClickHouse.Username,
+				Password: cfg.ThreatGraph.IOA.Output.ClickHouse.Password,
+				Timeout:  cfg.ThreatGraph.IOA.Output.ClickHouse.Timeout,
+				Headers:  cfg.ThreatGraph.IOA.Output.ClickHouse.Headers,
+			})
+			if err != nil {
+				logger.Errorf("Failed to create IOA ClickHouse writer: %v", err)
+				log.Fatalf("Failed to create IOA ClickHouse writer: %v", err)
+			}
+			ioaWriter = w
+			logger.Infof("IOA output mode: clickhouse (%s/%s.%s)", cfg.ThreatGraph.IOA.Output.ClickHouse.URL, cfg.ThreatGraph.IOA.Output.ClickHouse.Database, cfg.ThreatGraph.IOA.Output.ClickHouse.Table)
+		default:
+			log.Fatalf("Unknown IOA output mode: %s", cfg.ThreatGraph.IOA.Output.Mode)
+		}
+	}
+
 	pipe := pipeline.NewRedisAdjacencyPipeline(
 		consumer,
 		engine,
 		mapper,
 		adjWriter,
+		ioaWriter,
 		scorer,
 		alertWriter,
 		cfg.ThreatGraph.Pipeline.Workers,

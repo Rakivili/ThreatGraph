@@ -1,0 +1,55 @@
+threatgraph:
+  input:
+    redis:
+      addr: 127.0.0.1:6379
+      password: ""
+      db: 0
+      key: sysmon_events
+      block_timeout: 5s
+
+  pipeline:
+    workers: 8
+    batch_size: 1000
+    flush_interval: 2s
+
+  rules:
+    enabled: false
+    path: ""
+
+  alerts:
+    enabled: false
+    threshold: 8
+    window: 5m
+    max_rows: 50
+    cooldown: 2m
+    output:
+      mode: file
+      file:
+        path: output/alerts.jsonl
+
+  output:
+    mode: file
+    file:
+      path: output/adjacency.jsonl
+
+  # Lightweight IOA stream output for stage-1 sequence prefiltering.
+  ioa:
+    enabled: true
+    output:
+      mode: clickhouse
+      file:
+        path: output/ioa_events.jsonl
+      clickhouse:
+        url: http://127.0.0.1:8123
+        database: threatgraph
+        table: ioa_events
+        username: default
+        password: ""
+        timeout: 5s
+        headers: {}
+
+  logging:
+    enabled: true
+    level: info
+    file: ""
+    console: true

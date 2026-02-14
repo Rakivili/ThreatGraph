@@ -8,7 +8,8 @@ ThreatGraph 是一个云端图构建器。它从 Redis 队列消费 Sysmon 事�
 2) 解析 JSON -> 标准化事件（**仅使用 `winlog.event_data`**）
 3) IOA 标注钩子（当前为空）
 4) 映射为邻接表行（有向 + 带时间）
-5) 输出 JSONL 或 HTTP
+5) 输出邻接表（JSONL 或 HTTP）
+6) （可选）输出 IOA 时序事件（JSONL 或 ClickHouse）
 
 ## 图模型（有向）
 
@@ -110,7 +111,98 @@ make
 
 默认读取 `threatgraph.yml`（当前目录或可执行文件目录）。可传入路径参数指定配置文件：`./bin/threatgraph produce path/to/threatgraph.yml`。
 
-示例配置：`example/threatgraph.yml`
+示例配置：
+
+- 本地文件输出：`example/threatgraph.example.yml`
+- ClickHouse 输出：`example/threatgraph.clickhouse.example.yml`
+
+## 低成本 10w 终端模式
+
+推荐开启两阶段：
+
+1) `produce` 阶段输出轻量 IOA 时序事件（`name/ts/host/src/dst`）
+2) `analyze` 阶段先做序列候选，再做图连通验证
+
+这比直接全图遍历更省 CPU 和内存。
+
+### IOA 输出配置
+
+`threatgraph.yml` 中新增：
+
+```yaml
+threatgraph:
+  ioa:
+    enabled: true
+    output:
+      mode: file # file | clickhouse
+      file:
+        path: output/ioa_events.jsonl
+      clickhouse:
+        url: http://127.0.0.1:8123
+        database: threatgraph
+        table: ioa_events
+        username: default
+        password: ""
+        timeout: 5s
+```
+
+### ClickHouse（非 Docker）建库建表
+
+先确保 ClickHouse 服务已启动（HTTP 默认端口 `8123`）。
+
+方式 A：使用 `clickhouse-client`（推荐）
+
+```bash
+clickhouse-client --query "CREATE DATABASE IF NOT EXISTS threatgraph"
+
+clickhouse-client --query "
+CREATE TABLE IF NOT EXISTS threatgraph.ioa_events (
+  ts DateTime64(3),
+  host String,
+  agent_id String,
+  record_id String,
+  event_id UInt16,
+  edge_type String,
+  vertex_id String,
+  adjacent_id String,
+  name String
+)
+ENGINE = MergeTree
+PARTITION BY toDate(ts)
+ORDER BY (host, ts, name, record_id)
+TTL ts + INTERVAL 14 DAY
+"
+```
+
+方式 B：使用 HTTP API（`curl`）
+
+```bash
+curl -sS "http://127.0.0.1:8123/?query=CREATE%20DATABASE%20IF%20NOT%20EXISTS%20threatgraph"
+
+curl -sS "http://127.0.0.1:8123/" --data-binary @- <<'SQL'
+CREATE TABLE IF NOT EXISTS threatgraph.ioa_events (
+  ts DateTime64(3),
+  host String,
+  agent_id String,
+  record_id String,
+  event_id UInt16,
+  edge_type String,
+  vertex_id String,
+  adjacent_id String,
+  name String
+)
+ENGINE = MergeTree
+PARTITION BY toDate(ts)
+ORDER BY (host, ts, name, record_id)
+TTL ts + INTERVAL 14 DAY;
+SQL
+```
+
+建好后可用下面命令快速验证：
+
+```bash
+curl -sS "http://127.0.0.1:8123/?query=SELECT%20count()%20FROM%20threatgraph.ioa_events"
+```
 
 ## 邻接表消费与时序遍历
 
