@@ -9,8 +9,16 @@ rules:
     enabled: true
     sequence:
       - ProcessAccess.Shellcode.SuspiciousAccess
-      - CreateRemoteThread
+      - CreateRemoteThread.Generic
     window: 5m
+
+  - id: unsigned_dll_load_then_remote_thread
+    enabled: true
+    sequence:
+      - ImageLoad.Unsigned
+      - CreateRemoteThread.Generic
+    max_depth: 2
+    window: 1m
 
   - id: suspicious_tool_then_access
     enabled: true
