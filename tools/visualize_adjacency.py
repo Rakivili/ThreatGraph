@@ -31,6 +31,11 @@ def parse_args():
         help="Use only the Nth finding from finding JSONL (default: -1, all)",
     )
     parser.add_argument(
+        "--finding-input",
+        default="",
+        help="Findings JSONL to seed roots (e.g. output/ioa_findings.jsonl)",
+    )
+    parser.add_argument(
         "--dot",
         default="output/adjacency.dot",
         help="Path to output DOT file (default: output/adjacency.dot)",
@@ -493,6 +498,33 @@ def load_rows(path, match, limit, edge_types, allowed_kinds, input_kind, finding
         return load_rows_from_findings(path, match, limit, edge_types, allowed_kinds, finding_index)
 
     return load_rows_from_adjacency(path, match, limit, edge_types, allowed_kinds)
+
+
+def load_finding_roots(path, finding_index):
+    if not path:
+        return []
+    roots = []
+    finding_idx = -1
+    with open(path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(row, dict) or not isinstance(row.get("sequence"), list):
+                continue
+            finding_idx += 1
+            if finding_index >= 0 and finding_idx != finding_index:
+                continue
+            root = row.get("root")
+            if root:
+                roots.append(root)
+            if finding_index >= 0 and finding_idx == finding_index:
+                break
+    return roots
 
 
 def load_rows_from_findings(path, match, limit, edge_types, allowed_kinds, finding_index):
@@ -1741,6 +1773,9 @@ def main():
     if not os.path.exists(args.input):
         print("Input not found: {}".format(args.input))
         return 1
+    if args.finding_input and not os.path.exists(args.finding_input):
+        print("Finding input not found: {}".format(args.finding_input))
+        return 1
 
     edge_types = {t.strip() for t in args.edge_types.split(",") if t.strip()}
     through_types = {t.strip() for t in args.through_edge.split(",") if t.strip()}
@@ -1765,6 +1800,8 @@ def main():
     seeds = set()
     if args.focus:
         seeds.add(args.focus)
+    if args.finding_input:
+        seeds.update(load_finding_roots(args.finding_input, args.finding_index))
     if args.proc_name:
         name = args.proc_name.lower()
         for vertex_id in list(meta.keys()) + list(nodes):

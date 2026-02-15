@@ -27,9 +27,9 @@ func NewWriter(path string) (*Writer, error) {
 		}
 	}
 
-	f, err := os.Create(path)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create output file: %w", err)
+		return nil, fmt.Errorf("failed to open output file: %w", err)
 	}
 
 	logger.Infof("Adjacency JSON writer initialized: %s", path)
