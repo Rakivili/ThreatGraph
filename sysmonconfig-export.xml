@@ -449,33 +449,17 @@
 		<!--DATA: UtcTime, ProcessGuid, ProcessId, Image, ImageLoaded, Hashes, Signed, Signature, SignatureStatus-->
 	<RuleGroup name="" groupRelation="or">
 		<ImageLoad onmatch="include">
-			<!-- NOTE: include 规则用于分类标注，具体不上报范围在下面的 exclude 规则中控制 -->
-			<Rule name="ImageLoad.Unsigned" groupRelation="and">
-				<Signed condition="is">false</Signed>
-			</Rule>
-			<Rule name="ImageLoad.InvalidSignature" groupRelation="and">
-				<Signed condition="is">true</Signed>
-				<SignatureStatus condition="is not">Valid</SignatureStatus>
-			</Rule>
-			<Rule name="ImageLoad.ValidSignature" groupRelation="and">
-				<Signed condition="is">true</Signed>
-				<SignatureStatus condition="is">Valid</SignatureStatus>
-			</Rule>
+			<!-- 仅采集 DLL 加载，并统一打 name -->
+			<ImageLoaded name="ImageLoad.Unsigned" condition="end with">.dll</ImageLoaded>
 		</ImageLoad>
 	</RuleGroup>
 
 	<RuleGroup name="" groupRelation="or">
 		<ImageLoad onmatch="exclude">
-			<!-- 排除所有以 .exe 结尾的 Image（加载方进程） -->
-			<Image condition="end with">.exe</Image>
-			<!-- 默认不上报：C:\Windows\ 目录下全部镜像加载 -->
+			<!-- 排除 C:\Windows\ 下的镜像加载 -->
 			<ImageLoaded condition="begin with">C:\Windows\</ImageLoaded>
-			<!-- 默认不上报：微软签名且签名合法 -->
-			<Rule name="ImageLoad.Exclude.ValidMicrosoftSigned" groupRelation="and">
-				<Signed condition="is">true</Signed>
-				<SignatureStatus condition="is">Valid</SignatureStatus>
-				<Signature condition="contains any">Microsoft;Microsoft Corporation;Microsoft Windows</Signature>
-			</Rule>
+			<!-- 排除签名状态不是 Valid 的镜像 -->
+			<SignatureStatus condition="is not">Valid</SignatureStatus>
 		</ImageLoad>
 	</RuleGroup>
 
