@@ -458,8 +458,8 @@
 		<ImageLoad onmatch="exclude">
 			<!-- 排除 C:\Windows\ 下的镜像加载 -->
 			<ImageLoaded condition="begin with">C:\Windows\</ImageLoaded>
-			<!-- 排除签名状态不是 Valid 的镜像 -->
-			<SignatureStatus condition="is not">Valid</SignatureStatus>
+			<!-- 排除签名状态为 Valid 的镜像 -->
+			<SignatureStatus condition="is">Valid</SignatureStatus>
 		</ImageLoad>
 	</RuleGroup>
 
