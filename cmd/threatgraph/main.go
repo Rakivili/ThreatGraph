@@ -156,7 +156,26 @@ func runProducer(args []string) {
 	mapper := adjacency.NewMapper()
 	var engine rules.Engine
 	if cfg.ThreatGraph.Rules.Enabled {
-		logger.Infof("Rules enabled but no engine configured; IOA tagging disabled")
+		if strings.TrimSpace(cfg.ThreatGraph.Rules.Path) == "" {
+			logger.Warnf("Rules enabled but rules.path is empty; IOA tagging disabled")
+		} else {
+			sigmaEngine, stats, err := rules.NewSigmaEngine(cfg.ThreatGraph.Rules.Path)
+			if err != nil {
+				logger.Errorf("Failed to load Sigma rules from %s: %v", cfg.ThreatGraph.Rules.Path, err)
+				log.Fatalf("Failed to load Sigma rules: %v", err)
+			}
+			engine = sigmaEngine
+			logger.Infof("Sigma rules loaded: loaded=%d skipped_complex=%d skipped_datasource=%d skipped_invalid=%d files=%d",
+				stats.Loaded,
+				stats.SkippedComplex,
+				stats.SkippedDatasource,
+				stats.SkippedInvalid,
+				stats.TotalFiles,
+			)
+			if stats.Loaded == 0 {
+				logger.Warnf("No compatible Sigma rules loaded; IOA tagging is effectively disabled")
+			}
+		}
 	}
 
 	var scorer *alerts.Scorer

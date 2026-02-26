@@ -6,7 +6,7 @@ ThreatGraph 是一个云端图构建器。它从 Redis 队列消费 Sysmon 事�
 
 1) Redis list 队列（BLPOP）取消息
 2) 解析 JSON -> 标准化事件（**仅使用 `winlog.event_data`**）
-3) IOA 标注钩子（当前为空）
+3) Sigma 规则引擎给事件打 IOA 标签
 4) 映射为邻接表行（有向 + 带时间）
 5) 输出邻接表（JSONL 或 HTTP）
 6) （可选）输出 IOA 时序事件（JSONL 或 ClickHouse）
@@ -85,7 +85,7 @@ IOA 标签挂在**进程节点**上（ProcessVertex 的追加记录），核心�
 ## 设计要点
 
 - Redis list 消费（BLPOP）
-- IOA 引擎钩子（当前为空）
+- Sigma 规则驱动的 IOA 标注
 - 邻接表 append-only 输出（JSONL/HTTP）
 - 可选子图告警（IOA 密度评分）
 
@@ -108,6 +108,22 @@ threatgraph/
 make
 ./bin/threatgraph produce
 ```
+
+启用 Sigma 规则（单事件）示例：
+
+```yaml
+threatgraph:
+  rules:
+    enabled: true
+    path: ./rules/sigma
+```
+
+说明：启动时会预加载并校验规则，只加载“单事件 + 简单条件”规则；以下规则会被自动跳过：
+
+- 使用聚合（count/max/min/sum/avg）
+- 使用 timeframe 的相关规则
+- 复杂条件（如 `1 of ...` / `all of ...` / pattern 展开）
+- 非 Sysmon/Windows 数据源规则
 
 默认读取 `threatgraph.yml`（当前目录或可执行文件目录）。可传入路径参数指定配置文件：`./bin/threatgraph produce path/to/threatgraph.yml`。
 

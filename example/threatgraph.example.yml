@@ -14,7 +14,7 @@ threatgraph:
 
   rules:
     enabled: false
-    path: ""
+    path: "./rules/sigma"
 
   alerts:
     enabled: false
