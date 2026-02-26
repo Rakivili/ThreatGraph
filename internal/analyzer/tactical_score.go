@@ -10,10 +10,12 @@ import (
 
 // TacticalScore captures kill-chain sequence quality and risk weighting.
 type TacticalScore struct {
-	SequenceLength int     `json:"sequence_length"`
-	RiskProduct    float64 `json:"risk_product"`
-	RiskSum        float64 `json:"risk_sum"`
-	TacticCoverage int     `json:"tactic_coverage"`
+	SequenceLength     int      `json:"sequence_length"`
+	RiskProduct        float64  `json:"risk_product"`
+	RiskSum            float64  `json:"risk_sum"`
+	TacticCoverage     int      `json:"tactic_coverage"`
+	BestVertexIndexes  []int    `json:"best_vertex_indexes,omitempty"`
+	BestVertexRecordID []string `json:"best_vertex_record_ids,omitempty"`
 }
 
 // ScoredTPG combines a TPG with its tactical score.
@@ -53,12 +55,7 @@ func BuildScoredTPGs(iips []IIPGraph) []ScoredTPG {
 	for _, iip := range iips {
 		tpg := BuildTPG(iip)
 		score := ScoreTPG(tpg)
-		out = append(out, ScoredTPG{
-			Host:  tpg.Host,
-			Root:  tpg.Root,
-			Score: score,
-			TPG:   tpg,
-		})
+		out = append(out, ScoredTPG{Host: tpg.Host, Root: tpg.Root, Score: score, TPG: tpg})
 	}
 
 	sort.Slice(out, func(i, j int) bool {
@@ -79,81 +76,138 @@ func BuildScoredTPGs(iips []IIPGraph) []ScoredTPG {
 	return out
 }
 
-// ScoreTPG finds the longest kill-chain-consistent subsequence and scores it.
+// ScoreTPG scores TPG alerts with DAG DP using sequence edges.
+// Comparison is lexicographic: longer sequence first, then higher score.
 func ScoreTPG(tpg TPG) TacticalScore {
-	if len(tpg.Vertices) == 0 {
+	n := len(tpg.Vertices)
+	if n == 0 {
 		return TacticalScore{}
 	}
 
-	type seqItem struct {
-		rank int
-		risk float64
+	ranks := make([]int, n)
+	baseScore := make([]float64, n)
+	for i, v := range tpg.Vertices {
+		ranks[i], baseScore[i] = alertRankAndSingleScore(v)
 	}
 
-	items := make([]seqItem, 0, len(tpg.Vertices))
-	for _, v := range tpg.Vertices {
-		rank, risk := alertRankAndRisk(v)
-		if rank <= 0 || risk <= 0 {
+	adj := make([][]int, n)
+	for _, e := range tpg.SequenceEdges {
+		if e.From < 0 || e.To < 0 || e.From >= n || e.To >= n {
 			continue
 		}
-		items = append(items, seqItem{rank: rank, risk: risk})
+		adj[e.From] = append(adj[e.From], e.To)
 	}
-	if len(items) == 0 {
+	reach := buildReachability(adj)
+
+	dpLen := make([]int, n)
+	dpLog := make([]float64, n)
+	parent := make([]int, n)
+	for i := range parent {
+		parent[i] = -1
+		score := math.Log(max(baseScore[i], 1e-9))
+		dpLen[i] = 1
+		dpLog[i] = score
+		if ranks[i] == 0 {
+			dpLen[i] = 0
+			dpLog[i] = math.Inf(-1)
+		}
+	}
+
+	best := -1
+	for v := 0; v < n; v++ {
+		if ranks[v] == 0 {
+			continue
+		}
+		for u := 0; u < v; u++ {
+			if !reach[u][v] {
+				continue
+			}
+			if ranks[u] == 0 || dpLen[u] == 0 {
+				continue
+			}
+			if ranks[u] > ranks[v] {
+				continue
+			}
+			candLen := dpLen[u] + 1
+			candLog := dpLog[u] + math.Log(max(baseScore[v], 1e-9))
+			if candLen > dpLen[v] || (candLen == dpLen[v] && candLog > dpLog[v]) {
+				dpLen[v] = candLen
+				dpLog[v] = candLog
+				parent[v] = u
+			}
+		}
+
+		if best == -1 || dpLen[v] > dpLen[best] || (dpLen[v] == dpLen[best] && dpLog[v] > dpLog[best]) {
+			best = v
+		}
+	}
+
+	if best == -1 || dpLen[best] <= 0 {
 		return TacticalScore{}
 	}
 
-	dpLen := make([]int, len(items))
-	dpRiskLog := make([]float64, len(items))
-	parent := make([]int, len(items))
-	for i := range items {
-		dpLen[i] = 1
-		dpRiskLog[i] = math.Log(items[i].risk)
-		parent[i] = -1
+	path := make([]int, 0, dpLen[best])
+	for cur := best; cur >= 0; cur = parent[cur] {
+		path = append(path, cur)
+		if parent[cur] == -1 {
+			break
+		}
 	}
-
-	best := 0
-	for i := 0; i < len(items); i++ {
-		for j := 0; j < i; j++ {
-			if items[j].rank > items[i].rank {
-				continue
-			}
-			candLen := dpLen[j] + 1
-			candRisk := dpRiskLog[j] + math.Log(items[i].risk)
-			if candLen > dpLen[i] || (candLen == dpLen[i] && candRisk > dpRiskLog[i]) {
-				dpLen[i] = candLen
-				dpRiskLog[i] = candRisk
-				parent[i] = j
-			}
-		}
-		if dpLen[i] > dpLen[best] || (dpLen[i] == dpLen[best] && dpRiskLog[i] > dpRiskLog[best]) {
-			best = i
-		}
+	for i, j := 0, len(path)-1; i < j; i, j = i+1, j-1 {
+		path[i], path[j] = path[j], path[i]
 	}
 
 	usedTactics := map[int]struct{}{}
 	riskProduct := 1.0
 	riskSum := 0.0
-	for cur := best; cur >= 0; cur = parent[cur] {
-		riskProduct *= items[cur].risk
-		riskSum += items[cur].risk
-		usedTactics[items[cur].rank] = struct{}{}
+	recordIDs := make([]string, 0, len(path))
+	for _, idx := range path {
+		usedTactics[ranks[idx]] = struct{}{}
+		riskProduct *= baseScore[idx]
+		riskSum += baseScore[idx]
+		recordIDs = append(recordIDs, strings.TrimSpace(tpg.Vertices[idx].RecordID))
 	}
 
 	return TacticalScore{
-		SequenceLength: dpLen[best],
-		RiskProduct:    riskProduct,
-		RiskSum:        riskSum,
-		TacticCoverage: len(usedTactics),
+		SequenceLength:     dpLen[best],
+		RiskProduct:        riskProduct,
+		RiskSum:            riskSum,
+		TacticCoverage:     len(usedTactics),
+		BestVertexIndexes:  path,
+		BestVertexRecordID: recordIDs,
 	}
 }
 
-func alertRankAndRisk(ev AlertEvent) (int, float64) {
+func buildReachability(adj [][]int) [][]bool {
+	n := len(adj)
+	reach := make([][]bool, n)
+	for i := 0; i < n; i++ {
+		reach[i] = make([]bool, n)
+		queue := append([]int(nil), adj[i]...)
+		for _, v := range queue {
+			reach[i][v] = true
+		}
+		for head := 0; head < len(queue); head++ {
+			cur := queue[head]
+			for _, nxt := range adj[cur] {
+				if reach[i][nxt] {
+					continue
+				}
+				reach[i][nxt] = true
+				queue = append(queue, nxt)
+			}
+		}
+	}
+	return reach
+}
+
+func alertRankAndSingleScore(ev AlertEvent) (int, float64) {
 	for _, tag := range ev.IoaTags {
 		rank := tacticRank(tag.Tactic)
 		if rank <= 0 {
 			continue
 		}
-		return rank, tagRisk(tag)
+		return rank, singleAlertScore(tag)
 	}
 	return 0, 0
 }
@@ -168,17 +222,24 @@ func tacticRank(v string) int {
 	return tacticOrder[n]
 }
 
-func tagRisk(tag models.IoaTag) float64 {
+// singleAlertScore follows engineering fallback of TS = 2*severity + likelihood.
+// Likelihood falls back to severity when no explicit signal exists.
+func singleAlertScore(tag models.IoaTag) float64 {
 	severity := strings.ToLower(strings.TrimSpace(tag.Severity))
-	w := severityWeight[severity]
-	if w <= 0 {
-		w = 3
+	sev := severityWeight[severity]
+	if sev <= 0 {
+		sev = 3
 	}
-	if strings.TrimSpace(tag.Technique) != "" {
-		w += 1
+	likelihood := sev
+	if strings.TrimSpace(tag.Technique) == "" {
+		likelihood = max(1, sev-1)
 	}
-	if w < 1 {
-		w = 1
+	return (2 * sev) + likelihood
+}
+
+func max(a, b float64) float64 {
+	if a > b {
+		return a
 	}
-	return w
+	return b
 }

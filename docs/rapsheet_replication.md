@@ -55,7 +55,7 @@ ThreatGraph 采用与 RapSheet 对齐的分层思路：
 
 - 新增战术图构建模块，提供：
   - `CollectAlertEvents`：从 edge + IOA 标签提取 alert events
-  - `BuildIIPGraphs`：按 host + root 的实用近似构建 IIP 子图
+  - `BuildIIPGraphs`：按告警时间流执行“反向早期告警判定 + 前向告警可达裁剪”构建 IIP 子图
   - `BuildTPG`：构建 alert-event 顶点与时序 sequence edges
 
 对应代码：
@@ -66,7 +66,7 @@ ThreatGraph 采用与 RapSheet 对齐的分层思路：
 ### 3.4 Kill-chain 序列评分（已实现）
 
 - 基于 TPG 顶点（alert events）执行“最长有序子序列”评分。
-- 使用 tactic 顺序约束 + severity/technique 风险权重，输出排序分数。
+- 使用 sequence edge 上的 DAG DP（长度优先、分数次优）与 tactic 顺序约束输出排序分数。
 - `analyze` 可通过 `--tactical-output` 生成战术评分结果。
 
 对应代码：
@@ -79,7 +79,7 @@ ThreatGraph 采用与 RapSheet 对齐的分层思路：
 以下能力尚未完全对齐论文，需要继续推进：
 
 1. **跨主机 happens-before 不完整**：当前重点是同主机时序序关系，跨主机关联仍需补齐。
-2. **IIP 定义仍是工程近似**：目前按 host+root 分组，尚未完全复现论文中的形式化 IIP 推导。
+2. **IIP 仍有工程近似**：已加入时间约束反向判定，但尚未引入跨主机 connect/accept 的完整 happens-before 约束。
 3. **风险权重仍是工程近似**：当前用 severity/technique 权重，尚未完整接入 CAPEC 双指标体系。
 4. **skeleton graph 未实现**：尚未上线论文中的长期保留约简规则。
 

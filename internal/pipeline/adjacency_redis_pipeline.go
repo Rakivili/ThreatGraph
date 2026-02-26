@@ -6,7 +6,6 @@ import (
 	"sync"
 	"time"
 
-	"threatgraph/internal/alerts"
 	"threatgraph/internal/graph/adjacency"
 	inputredis "threatgraph/internal/input/redis"
 	"threatgraph/internal/logger"
@@ -23,8 +22,7 @@ type RedisAdjacencyPipeline struct {
 	writer        AdjacencyWriter
 	ioaWriter     IOAWriter
 	rawWriter     RawWriter
-	scorer        *alerts.Scorer
-	alertWriter   AlertWriter
+	stateWriter   VertexStateWriter
 	workers       int
 	batchSize     int
 	flushInterval time.Duration
@@ -38,7 +36,7 @@ type redisWorkItem struct {
 }
 
 // NewRedisAdjacencyPipeline creates a pipeline for Redis adjacency output.
-func NewRedisAdjacencyPipeline(consumer *inputredis.Consumer, engine rules.Engine, mapper *adjacency.Mapper, writer AdjacencyWriter, ioaWriter IOAWriter, rawWriter RawWriter, scorer *alerts.Scorer, alertWriter AlertWriter, workers, batchSize int, flushInterval time.Duration, rawBatchSize int, rawFlushInterval time.Duration) *RedisAdjacencyPipeline {
+func NewRedisAdjacencyPipeline(consumer *inputredis.Consumer, engine rules.Engine, mapper *adjacency.Mapper, writer AdjacencyWriter, ioaWriter IOAWriter, rawWriter RawWriter, stateWriter VertexStateWriter, workers, batchSize int, flushInterval time.Duration, rawBatchSize int, rawFlushInterval time.Duration) *RedisAdjacencyPipeline {
 	return &RedisAdjacencyPipeline{
 		consumer:      consumer,
 		engine:        engine,
@@ -46,8 +44,7 @@ func NewRedisAdjacencyPipeline(consumer *inputredis.Consumer, engine rules.Engin
 		writer:        writer,
 		ioaWriter:     ioaWriter,
 		rawWriter:     rawWriter,
-		scorer:        scorer,
-		alertWriter:   alertWriter,
+		stateWriter:   stateWriter,
 		workers:       workers,
 		batchSize:     batchSize,
 		flushInterval: flushInterval,
@@ -126,11 +123,6 @@ func (p *RedisAdjacencyPipeline) Run(ctx context.Context) error {
 
 // Close releases pipeline resources.
 func (p *RedisAdjacencyPipeline) Close() error {
-	if p.alertWriter != nil {
-		if err := p.alertWriter.Close(); err != nil {
-			logger.Errorf("Failed to close alert writer: %v", err)
-		}
-	}
 	if p.writer != nil {
 		if err := p.writer.Close(); err != nil {
 			logger.Errorf("Failed to close adjacency writer: %v", err)
@@ -144,6 +136,11 @@ func (p *RedisAdjacencyPipeline) Close() error {
 	if p.rawWriter != nil {
 		if err := p.rawWriter.Close(); err != nil {
 			logger.Errorf("Failed to close raw writer: %v", err)
+		}
+	}
+	if p.stateWriter != nil {
+		if err := p.stateWriter.Close(); err != nil {
+			logger.Errorf("Failed to close vertex-state writer: %v", err)
 		}
 	}
 	if p.consumer != nil {
@@ -241,9 +238,9 @@ func (p *RedisAdjacencyPipeline) writeLoop(in <-chan redisWorkItem) {
 
 	var batchRows []*models.AdjacencyRow
 	var batchIOAEvents []*models.IOAEvent
-	var batchAlerts []*models.Alert
 
 	flush := func() {
+		rowsForState := batchRows
 		if len(batchRows) > 0 {
 			for attempt := 1; attempt <= 3; attempt++ {
 				if err := p.writer.WriteRows(batchRows); err != nil {
@@ -276,19 +273,17 @@ func (p *RedisAdjacencyPipeline) writeLoop(in <-chan redisWorkItem) {
 				break
 			}
 		}
-		if p.alertWriter != nil && len(batchAlerts) > 0 {
+		if p.stateWriter != nil && len(rowsForState) > 0 {
 			for attempt := 1; attempt <= 3; attempt++ {
-				if err := p.alertWriter.WriteAlerts(batchAlerts); err != nil {
-					logger.Errorf("Failed to write alerts (attempt %d/3): %v", attempt, err)
+				if err := p.stateWriter.WriteRows(rowsForState); err != nil {
+					logger.Errorf("Failed to update vertex-state rows (attempt %d/3): %v", attempt, err)
 					if attempt == 3 {
-						logger.Errorf("Dropping %d alerts after retries", len(batchAlerts))
-						batchAlerts = nil
+						logger.Errorf("Skipping vertex-state update for %d rows after retries", len(rowsForState))
 						break
 					}
 					time.Sleep(1 * time.Second)
 					continue
 				}
-				batchAlerts = nil
 				break
 			}
 		}
@@ -305,12 +300,6 @@ func (p *RedisAdjacencyPipeline) writeLoop(in <-chan redisWorkItem) {
 			}
 			if len(item.rows) > 0 {
 				batchRows = append(batchRows, item.rows...)
-				if p.scorer != nil {
-					alertsOut := p.scorer.AddRows(item.rows)
-					if len(alertsOut) > 0 {
-						batchAlerts = append(batchAlerts, alertsOut...)
-					}
-				}
 			}
 			if len(item.ioaEvents) > 0 {
 				batchIOAEvents = append(batchIOAEvents, item.ioaEvents...)

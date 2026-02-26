@@ -17,10 +17,10 @@ type ThreatGraphConfig struct {
 	Input         InputConfig         `yaml:"input"`
 	Pipeline      PipelineConfig      `yaml:"pipeline"`
 	Rules         RulesConfig         `yaml:"rules"`
-	Alerts        AlertsConfig        `yaml:"alerts"`
 	Output        OutputConfig        `yaml:"output"`
 	IOA           IOAConfig           `yaml:"ioa"`
 	ReplayCapture ReplayCaptureConfig `yaml:"replay_capture"`
+	VertexState   VertexStateConfig   `yaml:"vertex_state"`
 	Logging       LoggingConfig       `yaml:"logging"`
 }
 
@@ -40,23 +40,6 @@ type PipelineConfig struct {
 type RulesConfig struct {
 	Enabled bool   `yaml:"enabled"`
 	Path    string `yaml:"path"`
-}
-
-// AlertsConfig controls subgraph alerting.
-type AlertsConfig struct {
-	Enabled   bool               `yaml:"enabled"`
-	Threshold int                `yaml:"threshold"`
-	Window    time.Duration      `yaml:"window"`
-	MaxRows   int                `yaml:"max_rows"`
-	Cooldown  time.Duration      `yaml:"cooldown"`
-	Output    AlertsOutputConfig `yaml:"output"`
-}
-
-// AlertsOutputConfig controls alert output.
-type AlertsOutputConfig struct {
-	Mode string           `yaml:"mode"`
-	File FileOutputConfig `yaml:"file"`
-	HTTP HTTPOutputConfig `yaml:"http"`
 }
 
 // RedisConfig controls Redis input.
@@ -94,6 +77,22 @@ type ReplayCaptureConfig struct {
 	File          FileOutputConfig `yaml:"file"`
 	BatchSize     int              `yaml:"batch_size"`
 	FlushInterval time.Duration    `yaml:"flush_interval"`
+}
+
+// VertexStateConfig controls Redis-backed vertex state indexing for IIP analysis.
+type VertexStateConfig struct {
+	Enabled      bool                   `yaml:"enabled"`
+	Redis        VertexStateRedisConfig `yaml:"redis"`
+	KeyPrefix    string                 `yaml:"key_prefix"`
+	ScanInterval time.Duration          `yaml:"scan_interval"`
+	Lookback     time.Duration          `yaml:"lookback"`
+}
+
+// VertexStateRedisConfig controls Redis connection for vertex-state storage.
+type VertexStateRedisConfig struct {
+	Addr     string `yaml:"addr"`
+	Password string `yaml:"password"`
+	DB       int    `yaml:"db"`
 }
 
 // ClickHouseOutputConfig config for ClickHouse HTTP JSONEachRow writes.
