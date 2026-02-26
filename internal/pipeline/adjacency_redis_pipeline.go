@@ -22,7 +22,6 @@ type RedisAdjacencyPipeline struct {
 	writer        AdjacencyWriter
 	ioaWriter     IOAWriter
 	rawWriter     RawWriter
-	stateWriter   VertexStateWriter
 	workers       int
 	batchSize     int
 	flushInterval time.Duration
@@ -36,7 +35,7 @@ type redisWorkItem struct {
 }
 
 // NewRedisAdjacencyPipeline creates a pipeline for Redis adjacency output.
-func NewRedisAdjacencyPipeline(consumer *inputredis.Consumer, engine rules.Engine, mapper *adjacency.Mapper, writer AdjacencyWriter, ioaWriter IOAWriter, rawWriter RawWriter, stateWriter VertexStateWriter, workers, batchSize int, flushInterval time.Duration, rawBatchSize int, rawFlushInterval time.Duration) *RedisAdjacencyPipeline {
+func NewRedisAdjacencyPipeline(consumer *inputredis.Consumer, engine rules.Engine, mapper *adjacency.Mapper, writer AdjacencyWriter, ioaWriter IOAWriter, rawWriter RawWriter, workers, batchSize int, flushInterval time.Duration, rawBatchSize int, rawFlushInterval time.Duration) *RedisAdjacencyPipeline {
 	return &RedisAdjacencyPipeline{
 		consumer:      consumer,
 		engine:        engine,
@@ -44,7 +43,6 @@ func NewRedisAdjacencyPipeline(consumer *inputredis.Consumer, engine rules.Engin
 		writer:        writer,
 		ioaWriter:     ioaWriter,
 		rawWriter:     rawWriter,
-		stateWriter:   stateWriter,
 		workers:       workers,
 		batchSize:     batchSize,
 		flushInterval: flushInterval,
@@ -136,11 +134,6 @@ func (p *RedisAdjacencyPipeline) Close() error {
 	if p.rawWriter != nil {
 		if err := p.rawWriter.Close(); err != nil {
 			logger.Errorf("Failed to close raw writer: %v", err)
-		}
-	}
-	if p.stateWriter != nil {
-		if err := p.stateWriter.Close(); err != nil {
-			logger.Errorf("Failed to close vertex-state writer: %v", err)
 		}
 	}
 	if p.consumer != nil {
@@ -240,7 +233,6 @@ func (p *RedisAdjacencyPipeline) writeLoop(in <-chan redisWorkItem) {
 	var batchIOAEvents []*models.IOAEvent
 
 	flush := func() {
-		rowsForState := batchRows
 		if len(batchRows) > 0 {
 			for attempt := 1; attempt <= 3; attempt++ {
 				if err := p.writer.WriteRows(batchRows); err != nil {
@@ -270,20 +262,6 @@ func (p *RedisAdjacencyPipeline) writeLoop(in <-chan redisWorkItem) {
 					continue
 				}
 				batchIOAEvents = nil
-				break
-			}
-		}
-		if p.stateWriter != nil && len(rowsForState) > 0 {
-			for attempt := 1; attempt <= 3; attempt++ {
-				if err := p.stateWriter.WriteRows(rowsForState); err != nil {
-					logger.Errorf("Failed to update vertex-state rows (attempt %d/3): %v", attempt, err)
-					if attempt == 3 {
-						logger.Errorf("Skipping vertex-state update for %d rows after retries", len(rowsForState))
-						break
-					}
-					time.Sleep(1 * time.Second)
-					continue
-				}
 				break
 			}
 		}

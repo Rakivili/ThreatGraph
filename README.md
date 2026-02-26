@@ -1,17 +1,17 @@
 # ThreatGraph
 
-ThreatGraph 是一个面向 Sysmon 的图安全分析引擎，采用双进程职责拆分：
+ThreatGraph 是一个面向 Sysmon 的图安全分析引擎，采用双进程架构：
 
-- `produce`：并发消费日志，规则打标，写原始邻接图与状态索引
-- `analyze`：基于原始图做 `IIP -> TPG -> Killchain 评分 -> Incident`
+- `produce`：并发消费日志、规则打标、写入原始邻接图与状态索引
+- `analyze`：基于原始图执行 `IIP -> TPG -> Killchain 评分 -> Incident`
 
 论文复刻说明：`docs/rapsheet_replication.md`
 
 ## 运行模型
 
-### Process 1: produce
+### 进程 1：produce
 
-`produce` 负责实时数据入口和基础构图，不做最终 incident 判定。
+`produce` 负责实时数据入口与基础构图，不做最终 incident 判定。
 
 数据流：
 
@@ -22,17 +22,19 @@ ThreatGraph 是一个面向 Sysmon 的图安全分析引擎，采用双进程职
 5) 输出邻接表（JSONL 或 HTTP）
 6) 可选输出 IOA 事件（JSONL 或 ClickHouse）
 7) 可选落盘原始消息（重放用）
-8) 可选更新 Redis `vertex_state`（给 analyze 增量分析用）
 
-### Process 2: analyze
+### 进程 2：analyze
 
-`analyze` 统一执行分析链路：
+`analyze` 统一执行分析主链路：
 
-1) 从邻接表读取图数据（可按 state-mode 做 host/time window 裁剪）
+1) 从邻接表读取图数据（通常按 IOA 时序库给出的 host/time window 预裁剪）
 2) 构建 IIP 子图（时间约束反向判定 + `can_reach_alert` 裁剪）
 3) 从 IIP 子图构建 TPG（时间链 + 同路径因果补边）
 4) 在 TPG 上做 DAG DP 评分（长度优先、分数次优）
 5) 生成 incident 输出
+
+IIP 回溯的核心加速来自 `analyze` 运行时从原始边派生的反向邻接索引。
+事实来源始终是 append-only 邻接表。
 
 ## 图模型
 
@@ -102,21 +104,19 @@ threatgraph:
   --incident-output output/incidents.jsonl
 ```
 
-### 周期增量分析（state-mode）
+### 周期增量分析（IOA 时序库驱动）
 
 ```bash
-./bin/threatgraph analyze --state-mode \
+./bin/threatgraph analyze \
   --input output/adjacency.jsonl \
   --output output/iip_graphs.jsonl \
   --tactical-output output/tactical_scored_tpg.jsonl \
-  --incident-output output/incidents.jsonl \
-  --state-redis-addr 127.0.0.1:6379 \
-  --state-key-prefix threatgraph:vertex_state \
-  --poll-interval 30s \
-  --lookback 5m
+  --incident-output output/incidents.jsonl
 ```
 
 注意：`analyze` 运行时至少需要指定 `--tactical-output` 或 `--incident-output` 之一。
+
+说明：推荐由 IOA 时序库驱动分析窗口（host/time），再把对应邻接数据输入 `analyze`。
 
 常用参数：
 
@@ -124,9 +124,6 @@ threatgraph:
 - `--tactical-output`：TPG + 评分输出
 - `--incident-output`：incident 输出
 - `--incident-min-seq`：incident 最小序列长度阈值（默认 `2`）
-- `--state-mode`：启用 Redis 顶点状态轮询
-- `--state-redis-addr` / `--state-redis-db` / `--state-key-prefix`
-- `--poll-interval` / `--lookback` / `--once`
 
 ## 关键配置片段
 
@@ -154,20 +151,10 @@ threatgraph:
     flush_interval: 2s
 ```
 
-### vertex_state（analyze 增量入口）
+### 分析窗口输入（推荐）
 
-```yaml
-threatgraph:
-  vertex_state:
-    enabled: true
-    redis:
-      addr: 127.0.0.1:6379
-      password: ""
-      db: 0
-    key_prefix: threatgraph:vertex_state
-    scan_interval: 30s
-    lookback: 5m
-```
+推荐由 IOA 时序库提供 `host + time window`，再导出对应邻接数据给 `analyze`。
+这样无需额外调度索引，且与 IIP 语义一致。
 
 ## ClickHouse 建表（IOA）
 

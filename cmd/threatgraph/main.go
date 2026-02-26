@@ -26,7 +26,6 @@ import (
 	"threatgraph/internal/output/rawjson"
 	"threatgraph/internal/pipeline"
 	"threatgraph/internal/rules"
-	"threatgraph/internal/vertexstate"
 )
 
 func findConfigFile(configArg string) string {
@@ -103,19 +102,6 @@ func applyDefaults(cfg *config.Config) {
 	}
 	if cfg.ThreatGraph.ReplayCapture.FlushInterval <= 0 {
 		cfg.ThreatGraph.ReplayCapture.FlushInterval = cfg.ThreatGraph.Pipeline.FlushInterval
-	}
-
-	if cfg.ThreatGraph.VertexState.Redis.Addr == "" {
-		cfg.ThreatGraph.VertexState.Redis.Addr = cfg.ThreatGraph.Input.Redis.Addr
-	}
-	if cfg.ThreatGraph.VertexState.KeyPrefix == "" {
-		cfg.ThreatGraph.VertexState.KeyPrefix = "threatgraph:vertex_state"
-	}
-	if cfg.ThreatGraph.VertexState.ScanInterval <= 0 {
-		cfg.ThreatGraph.VertexState.ScanInterval = 30 * time.Second
-	}
-	if cfg.ThreatGraph.VertexState.Lookback <= 0 {
-		cfg.ThreatGraph.VertexState.Lookback = 5 * time.Minute
 	}
 
 	if cfg.ThreatGraph.Logging.Level == "" {
@@ -250,22 +236,6 @@ func runProducer(args []string) {
 		logger.Infof("Raw replay capture enabled: %s", cfg.ThreatGraph.ReplayCapture.File.Path)
 	}
 
-	var stateWriter pipeline.VertexStateWriter
-	if cfg.ThreatGraph.VertexState.Enabled {
-		store, err := vertexstate.NewRedisStore(vertexstate.RedisConfig{
-			Addr:      cfg.ThreatGraph.VertexState.Redis.Addr,
-			Password:  cfg.ThreatGraph.VertexState.Redis.Password,
-			DB:        cfg.ThreatGraph.VertexState.Redis.DB,
-			KeyPrefix: cfg.ThreatGraph.VertexState.KeyPrefix,
-		})
-		if err != nil {
-			logger.Errorf("Failed to create vertex-state Redis store: %v", err)
-			log.Fatalf("Failed to create vertex-state Redis store: %v", err)
-		}
-		stateWriter = store
-		logger.Infof("Vertex-state index enabled: redis=%s prefix=%s", cfg.ThreatGraph.VertexState.Redis.Addr, cfg.ThreatGraph.VertexState.KeyPrefix)
-	}
-
 	pipe := pipeline.NewRedisAdjacencyPipeline(
 		consumer,
 		engine,
@@ -273,7 +243,6 @@ func runProducer(args []string) {
 		adjWriter,
 		ioaWriter,
 		rawWriter,
-		stateWriter,
 		cfg.ThreatGraph.Pipeline.Workers,
 		cfg.ThreatGraph.Pipeline.BatchSize,
 		cfg.ThreatGraph.Pipeline.FlushInterval,
@@ -312,91 +281,12 @@ func runAnalyzer(args []string) int {
 	tacticalOutput := fs.String("tactical-output", "", "Optional tactical scored TPG JSONL output path")
 	incidentOutput := fs.String("incident-output", "", "Optional incident JSONL output path")
 	incidentMinSeq := fs.Int("incident-min-seq", 2, "Minimum sequence length for incident output")
-	stateMode := fs.Bool("state-mode", false, "Run periodic analysis using Redis vertex-state candidates")
-	stateRedisAddr := fs.String("state-redis-addr", "127.0.0.1:6379", "Redis address for vertex-state mode")
-	stateRedisPassword := fs.String("state-redis-password", "", "Redis password for vertex-state mode")
-	stateRedisDB := fs.Int("state-redis-db", 0, "Redis DB for vertex-state mode")
-	stateKeyPrefix := fs.String("state-key-prefix", "threatgraph:vertex_state", "Redis key prefix for vertex-state mode")
-	pollInterval := fs.Duration("poll-interval", 30*time.Second, "Polling interval for --state-mode")
-	lookback := fs.Duration("lookback", 5*time.Minute, "Lookback window for --state-mode")
-	once := fs.Bool("once", false, "Run a single polling cycle in --state-mode")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	if strings.TrimSpace(*tacticalOutput) == "" && strings.TrimSpace(*incidentOutput) == "" {
 		fmt.Fprintf(os.Stderr, "analyze requires at least one of --tactical-output or --incident-output\n")
 		return 2
-	}
-
-	if *stateMode {
-		store, err := vertexstate.NewRedisStore(vertexstate.RedisConfig{
-			Addr:      *stateRedisAddr,
-			Password:  *stateRedisPassword,
-			DB:        *stateRedisDB,
-			KeyPrefix: *stateKeyPrefix,
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to connect vertex-state redis: %v\n", err)
-			return 1
-		}
-		defer store.Close()
-
-		nextSince := time.Now().UTC().Add(-*lookback)
-		for {
-			pollStart := time.Now().UTC()
-			states, err := store.FetchDirtySince(nextSince, 5000)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "failed to fetch vertex-state updates: %v\n", err)
-				return 1
-			}
-			candidates := vertexstate.BuildIIPCandidates(states)
-
-			hosts := make(map[string]struct{}, len(candidates))
-			sinceTS := pollStart.Add(-*lookback)
-			for _, c := range candidates {
-				hosts[c.Host] = struct{}{}
-				if !c.FirstIOATimestamp.IsZero() && c.FirstIOATimestamp.Before(sinceTS) {
-					sinceTS = c.FirstIOATimestamp
-				}
-			}
-
-			if len(hosts) > 0 {
-				rows, err := analyzer.LoadRowsJSONL(*input)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "failed to load adjacency rows in state-mode: %v\n", err)
-					return 1
-				}
-				filteredRows := analyzer.FilterRowsByHostAndTime(rows, hosts, sinceTS)
-				iips := analyzer.BuildIIPGraphs(filteredRows)
-				scored := analyzer.BuildScoredTPGs(iips)
-
-				if err := writeJSONLines(*output, iips); err != nil {
-					fmt.Fprintf(os.Stderr, "failed to write iip output in state-mode: %v\n", err)
-					return 1
-				}
-				if strings.TrimSpace(*tacticalOutput) != "" {
-					if err := writeJSONLines(*tacticalOutput, scored); err != nil {
-						fmt.Fprintf(os.Stderr, "failed to write tactical output in state-mode: %v\n", err)
-						return 1
-					}
-				}
-				if strings.TrimSpace(*incidentOutput) != "" {
-					incidents := analyzer.BuildIncidents(scored, *incidentMinSeq)
-					if err := writeJSONLines(*incidentOutput, incidents); err != nil {
-						fmt.Fprintf(os.Stderr, "failed to write incidents in state-mode: %v\n", err)
-						return 1
-					}
-				}
-			}
-
-			fmt.Printf("state-mode vertices=%d iip_candidates=%d iip_output=%s since=%s\n", len(states), len(candidates), *output, nextSince.Format(time.RFC3339))
-
-			nextSince = pollStart
-			if *once {
-				return 0
-			}
-			time.Sleep(*pollInterval)
-		}
 	}
 
 	rows, err := analyzer.LoadRowsJSONL(*input)

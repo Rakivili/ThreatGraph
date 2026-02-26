@@ -43,16 +43,6 @@ threatgraph:
     batch_size: 1000
     flush_interval: 2s
 
-  vertex_state:
-    enabled: true
-    redis:
-      addr: 127.0.0.1:6379
-      password: ""
-      db: 0
-    key_prefix: threatgraph:vertex_state
-    scan_interval: 30s
-    lookback: 5m
-
   logging:
     enabled: true
     level: info
