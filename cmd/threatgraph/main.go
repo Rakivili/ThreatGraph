@@ -26,6 +26,7 @@ import (
 	"threatgraph/internal/output/alertjson"
 	"threatgraph/internal/output/ioaclickhouse"
 	"threatgraph/internal/output/ioajson"
+	"threatgraph/internal/output/rawjson"
 	"threatgraph/internal/pipeline"
 	"threatgraph/internal/rules"
 )
@@ -113,6 +114,16 @@ func applyDefaults(cfg *config.Config) {
 	}
 	if cfg.ThreatGraph.IOA.Output.ClickHouse.Table == "" {
 		cfg.ThreatGraph.IOA.Output.ClickHouse.Table = "ioa_events"
+	}
+
+	if cfg.ThreatGraph.ReplayCapture.File.Path == "" {
+		cfg.ThreatGraph.ReplayCapture.File.Path = "output/raw_events.jsonl"
+	}
+	if cfg.ThreatGraph.ReplayCapture.BatchSize <= 0 {
+		cfg.ThreatGraph.ReplayCapture.BatchSize = cfg.ThreatGraph.Pipeline.BatchSize
+	}
+	if cfg.ThreatGraph.ReplayCapture.FlushInterval <= 0 {
+		cfg.ThreatGraph.ReplayCapture.FlushInterval = cfg.ThreatGraph.Pipeline.FlushInterval
 	}
 
 	if cfg.ThreatGraph.Logging.Level == "" {
@@ -271,17 +282,31 @@ func runProducer(args []string) {
 		}
 	}
 
+	var rawWriter pipeline.RawWriter
+	if cfg.ThreatGraph.ReplayCapture.Enabled {
+		w, err := rawjson.NewWriter(cfg.ThreatGraph.ReplayCapture.File.Path)
+		if err != nil {
+			logger.Errorf("Failed to create raw replay writer: %v", err)
+			log.Fatalf("Failed to create raw replay writer: %v", err)
+		}
+		rawWriter = w
+		logger.Infof("Raw replay capture enabled: %s", cfg.ThreatGraph.ReplayCapture.File.Path)
+	}
+
 	pipe := pipeline.NewRedisAdjacencyPipeline(
 		consumer,
 		engine,
 		mapper,
 		adjWriter,
 		ioaWriter,
+		rawWriter,
 		scorer,
 		alertWriter,
 		cfg.ThreatGraph.Pipeline.Workers,
 		cfg.ThreatGraph.Pipeline.BatchSize,
 		cfg.ThreatGraph.Pipeline.FlushInterval,
+		cfg.ThreatGraph.ReplayCapture.BatchSize,
+		cfg.ThreatGraph.ReplayCapture.FlushInterval,
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -312,6 +337,7 @@ func runAnalyzer(args []string) int {
 	fs := flag.NewFlagSet("analyze", flag.ContinueOnError)
 	input := fs.String("input", "output/adjacency.jsonl", "Adjacency JSONL input path")
 	output := fs.String("output", "output/ioa_findings.jsonl", "Findings JSONL output path")
+	tacticalOutput := fs.String("tactical-output", "", "Optional tactical scored TPG JSONL output path")
 	candidatesOutput := fs.String("candidates-output", "", "Optional stage-1 candidate JSONL output path")
 	rulesFile := fs.String("rules-file", "", "YAML file that defines sequence rules")
 	maxDepth := fs.Int("max-depth", 64, "Maximum traversal depth from each root")
@@ -328,6 +354,17 @@ func runAnalyzer(args []string) int {
 	}
 
 	cfg := analyzer.Config{MaxDepth: *maxDepth, MaxFindings: *maxFindings}
+	tacticalCount := 0
+	if strings.TrimSpace(*tacticalOutput) != "" {
+		iips := analyzer.BuildIIPGraphs(rows)
+		scored := analyzer.BuildScoredTPGs(iips)
+		if err := writeJSONLines(*tacticalOutput, scored); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to write tactical output: %v\n", err)
+			return 1
+		}
+		tacticalCount = len(scored)
+	}
+
 	if strings.TrimSpace(*rulesFile) != "" {
 		rs, err := analyzer.LoadRuleSet(*rulesFile)
 		if err != nil {
@@ -345,7 +382,11 @@ func runAnalyzer(args []string) int {
 			fmt.Fprintf(os.Stderr, "failed to write findings: %v\n", err)
 			return 1
 		}
-		fmt.Printf("analyzed rows=%d candidates=%d findings=%d output=%s\n", len(rows), len(candidates), len(findings), *output)
+		if tacticalCount > 0 {
+			fmt.Printf("analyzed rows=%d candidates=%d findings=%d tactical=%d output=%s tactical_output=%s\n", len(rows), len(candidates), len(findings), tacticalCount, *output, *tacticalOutput)
+		} else {
+			fmt.Printf("analyzed rows=%d candidates=%d findings=%d output=%s\n", len(rows), len(candidates), len(findings), *output)
+		}
 		return 0
 	}
 
@@ -361,7 +402,11 @@ func runAnalyzer(args []string) int {
 		return 1
 	}
 
-	fmt.Printf("analyzed rows=%d findings=%d output=%s\n", len(rows), len(findings), *output)
+	if tacticalCount > 0 {
+		fmt.Printf("analyzed rows=%d findings=%d tactical=%d output=%s tactical_output=%s\n", len(rows), len(findings), tacticalCount, *output, *tacticalOutput)
+	} else {
+		fmt.Printf("analyzed rows=%d findings=%d output=%s\n", len(rows), len(findings), *output)
+	}
 	return 0
 }
 

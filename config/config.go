@@ -14,13 +14,14 @@ type Config struct {
 
 // ThreatGraphConfig is the project configuration.
 type ThreatGraphConfig struct {
-	Input    InputConfig    `yaml:"input"`
-	Pipeline PipelineConfig `yaml:"pipeline"`
-	Rules    RulesConfig    `yaml:"rules"`
-	Alerts   AlertsConfig   `yaml:"alerts"`
-	Output   OutputConfig   `yaml:"output"`
-	IOA      IOAConfig      `yaml:"ioa"`
-	Logging  LoggingConfig  `yaml:"logging"`
+	Input         InputConfig         `yaml:"input"`
+	Pipeline      PipelineConfig      `yaml:"pipeline"`
+	Rules         RulesConfig         `yaml:"rules"`
+	Alerts        AlertsConfig        `yaml:"alerts"`
+	Output        OutputConfig        `yaml:"output"`
+	IOA           IOAConfig           `yaml:"ioa"`
+	ReplayCapture ReplayCaptureConfig `yaml:"replay_capture"`
+	Logging       LoggingConfig       `yaml:"logging"`
 }
 
 // InputConfig controls the input reader.
@@ -85,6 +86,14 @@ type IOAOutputConfig struct {
 	Mode       string                 `yaml:"mode"` // file|clickhouse
 	File       FileOutputConfig       `yaml:"file"`
 	ClickHouse ClickHouseOutputConfig `yaml:"clickhouse"`
+}
+
+// ReplayCaptureConfig controls raw message capture for replay tests.
+type ReplayCaptureConfig struct {
+	Enabled       bool             `yaml:"enabled"`
+	File          FileOutputConfig `yaml:"file"`
+	BatchSize     int              `yaml:"batch_size"`
+	FlushInterval time.Duration    `yaml:"flush_interval"`
 }
 
 // ClickHouseOutputConfig config for ClickHouse HTTP JSONEachRow writes.

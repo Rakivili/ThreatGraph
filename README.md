@@ -2,6 +2,8 @@
 
 ThreatGraph 是一个云端图构建器。它从 Redis 队列消费 Sysmon 事件（Winlogbeat -> Logstash），将事件转换为可追加写入（append-only）的邻接表行，便于存储与检测。
 
+论文复刻说明文档：`docs/rapsheet_replication.md`
+
 ## 数据流
 
 1) Redis list 队列（BLPOP）取消息
@@ -10,6 +12,7 @@ ThreatGraph 是一个云端图构建器。它从 Redis 队列消费 Sysmon 事�
 4) 映射为邻接表行（有向 + 带时间）
 5) 输出邻接表（JSONL 或 HTTP）
 6) （可选）输出 IOA 时序事件（JSONL 或 ClickHouse）
+7) （可选）落盘原始队列消息用于重放测试
 
 ## 图模型（有向）
 
@@ -72,22 +75,25 @@ ThreatGraph 是一个云端图构建器。它从 Redis 队列消费 Sysmon 事�
 
 > 说明：未列出的事件 **不生成边**。
 
-## 检测逻辑
+## 检测逻辑（当前方向）
 
-IOA 标签挂在**进程节点**上（ProcessVertex 的追加记录），核心检测模型为：
+IOA 标签仅挂在**边**上（edge），未生成边的事件不会产生 IOA 标签。
 
-- 从根进程出发遍历有向图
-- 以 `ts` 为序（用 `record_id` 作为同刻度的 tie-break）
-- 在“时间一致路径”上匹配 IOA 标签序列（以节点序列为主）
+当前推荐方案（用于大规模环境）不是全图遍历，而是：
 
-这相当于 **DAG 上的标签路径匹配**，并带时间约束。可选的“告警评分”会对时间窗内的 IOA 密度进行聚合。
+- 在线维护 `vertex_state`（按 `host + vertex_id`）
+- 状态里维护 `earliest_upstream_alert_ts`、`ioa_count` 等可增量更新字段
+- 周期性任务只处理新增告警相关顶点，从原始图中产出 IIP 子图
+
+这是一种“状态索引 + 局部回溯”的工程实现，用于避免全量遍历图。
 
 ## 设计要点
 
 - Redis list 消费（BLPOP）
 - Sigma 规则驱动的 IOA 标注
 - 邻接表 append-only 输出（JSONL/HTTP）
-- 可选子图告警（IOA 密度评分）
+- 顶点状态索引（用于 IIP 裁剪）
+- 周期性 IIP 子图产出
 
 ## 项目结构
 
@@ -139,6 +145,8 @@ threatgraph:
 1) `produce` 阶段输出轻量 IOA 时序事件（`name/ts/host/src/dst`）
 2) `analyze` 阶段先做序列候选，再做图连通验证
 
+可选地，`analyze` 可以输出战术评分结果（IIP/TPG + kill-chain 序列评分）用于优先级排序。
+
 这比直接全图遍历更省 CPU 和内存。
 
 ### IOA 输出配置
@@ -161,6 +169,26 @@ threatgraph:
         password: ""
         timeout: 5s
 ```
+
+### 原始消息重放落盘配置
+
+如果你要做基于历史 Sysmon JSON 的重放测试，可开启原始消息捕获：
+
+```yaml
+threatgraph:
+  replay_capture:
+    enabled: true
+    file:
+      path: output/raw_events.jsonl
+    batch_size: 1000
+    flush_interval: 2s
+```
+
+说明：
+
+- 写入内容是从消息队列取出的原始 JSON（一行一条）
+- 该文件可直接作为后续 replay 输入
+- 默认使用追加写入，便于长期采样与回放
 
 ### ClickHouse（非 Docker）建库建表
 
@@ -220,20 +248,39 @@ SQL
 curl -sS "http://127.0.0.1:8123/?query=SELECT%20count()%20FROM%20threatgraph.ioa_events"
 ```
 
-## 邻接表消费与时序遍历
+## IIP 产出（推荐）
 
-`analyze` 模式支持低成本两阶段检测：
+生产环境推荐流程：
 
-1) 先在时序事件流中按规则序列产出候选（不做全图遍历）
-2) 再在图上做时间一致连通验证（`edge_time` 非递减，`record_id` 同刻度 tie-break）
+1) `produce` 持续写入 append-only 邻接边
+2) 同步维护顶点状态表（`vertex_state`）
+3) 周期任务按“新增告警相关顶点”产出 IIP 子图
 
-支持两种方式：
+其中 IIP 判定依赖 `vertex_state` 的最早上游告警时间索引，避免对原始图做全量回溯。
 
-- 默认：注入相关边检出（路径上存在 `RemoteThreadEdge` 或 `ProcessAccessEdge`）
-- 序列匹配：按边的 `name`（来自事件字段，如 `RuleName`）进行有序匹配
+建议状态字段：
+
+- `host`
+- `vertex_id`
+- `earliest_upstream_alert_ts`
+- `ioa_count`
+- `updated_at`
+
+## 离线 analyze（实验/过渡）
+
+`analyze` 仍保留，主要用于离线实验与回放验证，不建议作为 10w 端规模的主路径。
+
+能力包括：
+
+- 两阶段候选 + 连通验证
+- 基于 IIP/TPG 的战术评分输出（`--tactical-output`）
+- 按边 `name` 的有序序列匹配
 
 ```bash
 ./bin/threatgraph analyze --input output/adjacency.jsonl --output output/ioa_findings.jsonl
+
+# 输出战术评分结果（TPG 排序，实验）
+./bin/threatgraph analyze --input output/adjacency.jsonl --output output/ioa_findings.jsonl --tactical-output output/tactical_scored_tpg.jsonl
 
 # 按边 name 做序列匹配（示例）
 ./bin/threatgraph analyze --input output/adjacency.jsonl --output output/ioa_findings.jsonl --name-seq "SuspiciousTool,NetworkConnect.SuspiciousPath"
@@ -249,6 +296,7 @@ curl -sS "http://127.0.0.1:8123/?query=SELECT%20count()%20FROM%20threatgraph.ioa
 - `--name-seq`：按顺序匹配边 name 的逗号序列（例如 `A,B,C`）
 - `--rules-file`：规则 YAML 文件（两阶段检测）
 - `--candidates-output`：候选序列输出路径（可选）
+- `--tactical-output`：输出 IIP/TPG 战术评分 JSONL（可选）
 
 规则文件支持 `composites`：可把多个小序列规则按时间顺序组合成一条更长攻击链，再做图连通验证。`composites.max_depth` 可设为 `-1` 表示不限制跳数。
 
