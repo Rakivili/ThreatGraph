@@ -15,20 +15,18 @@ import (
 	"time"
 
 	"threatgraph/config"
-	"threatgraph/internal/alerts"
 	"threatgraph/internal/analyzer"
 	"threatgraph/internal/graph/adjacency"
 	inputredis "threatgraph/internal/input/redis"
 	"threatgraph/internal/logger"
 	"threatgraph/internal/output/adjacencyhttp"
 	"threatgraph/internal/output/adjacencyjson"
-	"threatgraph/internal/output/alerthttp"
-	"threatgraph/internal/output/alertjson"
 	"threatgraph/internal/output/ioaclickhouse"
 	"threatgraph/internal/output/ioajson"
 	"threatgraph/internal/output/rawjson"
 	"threatgraph/internal/pipeline"
 	"threatgraph/internal/rules"
+	"threatgraph/internal/vertexstate"
 )
 
 func findConfigFile(configArg string) string {
@@ -77,25 +75,6 @@ func applyDefaults(cfg *config.Config) {
 		cfg.ThreatGraph.Pipeline.FlushInterval = 2 * time.Second
 	}
 
-	if cfg.ThreatGraph.Alerts.Window <= 0 {
-		cfg.ThreatGraph.Alerts.Window = 5 * time.Minute
-	}
-	if cfg.ThreatGraph.Alerts.Threshold <= 0 {
-		cfg.ThreatGraph.Alerts.Threshold = 8
-	}
-	if cfg.ThreatGraph.Alerts.MaxRows <= 0 {
-		cfg.ThreatGraph.Alerts.MaxRows = 50
-	}
-	if cfg.ThreatGraph.Alerts.Cooldown <= 0 {
-		cfg.ThreatGraph.Alerts.Cooldown = 2 * time.Minute
-	}
-	if cfg.ThreatGraph.Alerts.Output.Mode == "" {
-		cfg.ThreatGraph.Alerts.Output.Mode = "file"
-	}
-	if cfg.ThreatGraph.Alerts.Output.File.Path == "" {
-		cfg.ThreatGraph.Alerts.Output.File.Path = "output/alerts.jsonl"
-	}
-
 	if cfg.ThreatGraph.Output.Mode == "" {
 		cfg.ThreatGraph.Output.Mode = "file"
 	}
@@ -124,6 +103,19 @@ func applyDefaults(cfg *config.Config) {
 	}
 	if cfg.ThreatGraph.ReplayCapture.FlushInterval <= 0 {
 		cfg.ThreatGraph.ReplayCapture.FlushInterval = cfg.ThreatGraph.Pipeline.FlushInterval
+	}
+
+	if cfg.ThreatGraph.VertexState.Redis.Addr == "" {
+		cfg.ThreatGraph.VertexState.Redis.Addr = cfg.ThreatGraph.Input.Redis.Addr
+	}
+	if cfg.ThreatGraph.VertexState.KeyPrefix == "" {
+		cfg.ThreatGraph.VertexState.KeyPrefix = "threatgraph:vertex_state"
+	}
+	if cfg.ThreatGraph.VertexState.ScanInterval <= 0 {
+		cfg.ThreatGraph.VertexState.ScanInterval = 30 * time.Second
+	}
+	if cfg.ThreatGraph.VertexState.Lookback <= 0 {
+		cfg.ThreatGraph.VertexState.Lookback = 5 * time.Minute
 	}
 
 	if cfg.ThreatGraph.Logging.Level == "" {
@@ -186,41 +178,6 @@ func runProducer(args []string) {
 			if stats.Loaded == 0 {
 				logger.Warnf("No compatible Sigma rules loaded; IOA tagging is effectively disabled")
 			}
-		}
-	}
-
-	var scorer *alerts.Scorer
-	var alertWriter pipeline.AlertWriter
-	if cfg.ThreatGraph.Alerts.Enabled {
-		scorer = alerts.NewScorer(alerts.Config{
-			Window:    cfg.ThreatGraph.Alerts.Window,
-			Threshold: cfg.ThreatGraph.Alerts.Threshold,
-			MaxRows:   cfg.ThreatGraph.Alerts.MaxRows,
-			Cooldown:  cfg.ThreatGraph.Alerts.Cooldown,
-		})
-		switch cfg.ThreatGraph.Alerts.Output.Mode {
-		case "file":
-			w, err := alertjson.NewWriter(cfg.ThreatGraph.Alerts.Output.File.Path)
-			if err != nil {
-				logger.Errorf("Failed to create alert file writer: %v", err)
-				log.Fatalf("Failed to create alert file writer: %v", err)
-			}
-			alertWriter = w
-			logger.Infof("Alert output mode: file (%s)", cfg.ThreatGraph.Alerts.Output.File.Path)
-		case "http":
-			w, err := alerthttp.NewWriter(alerthttp.Config{
-				URL:     cfg.ThreatGraph.Alerts.Output.HTTP.URL,
-				Timeout: cfg.ThreatGraph.Alerts.Output.HTTP.Timeout,
-				Headers: cfg.ThreatGraph.Alerts.Output.HTTP.Headers,
-			})
-			if err != nil {
-				logger.Errorf("Failed to create alert HTTP writer: %v", err)
-				log.Fatalf("Failed to create alert HTTP writer: %v", err)
-			}
-			alertWriter = w
-			logger.Infof("Alert output mode: http (%s)", cfg.ThreatGraph.Alerts.Output.HTTP.URL)
-		default:
-			log.Fatalf("Unknown alert output mode: %s", cfg.ThreatGraph.Alerts.Output.Mode)
 		}
 	}
 
@@ -293,6 +250,22 @@ func runProducer(args []string) {
 		logger.Infof("Raw replay capture enabled: %s", cfg.ThreatGraph.ReplayCapture.File.Path)
 	}
 
+	var stateWriter pipeline.VertexStateWriter
+	if cfg.ThreatGraph.VertexState.Enabled {
+		store, err := vertexstate.NewRedisStore(vertexstate.RedisConfig{
+			Addr:      cfg.ThreatGraph.VertexState.Redis.Addr,
+			Password:  cfg.ThreatGraph.VertexState.Redis.Password,
+			DB:        cfg.ThreatGraph.VertexState.Redis.DB,
+			KeyPrefix: cfg.ThreatGraph.VertexState.KeyPrefix,
+		})
+		if err != nil {
+			logger.Errorf("Failed to create vertex-state Redis store: %v", err)
+			log.Fatalf("Failed to create vertex-state Redis store: %v", err)
+		}
+		stateWriter = store
+		logger.Infof("Vertex-state index enabled: redis=%s prefix=%s", cfg.ThreatGraph.VertexState.Redis.Addr, cfg.ThreatGraph.VertexState.KeyPrefix)
+	}
+
 	pipe := pipeline.NewRedisAdjacencyPipeline(
 		consumer,
 		engine,
@@ -300,8 +273,7 @@ func runProducer(args []string) {
 		adjWriter,
 		ioaWriter,
 		rawWriter,
-		scorer,
-		alertWriter,
+		stateWriter,
 		cfg.ThreatGraph.Pipeline.Workers,
 		cfg.ThreatGraph.Pipeline.BatchSize,
 		cfg.ThreatGraph.Pipeline.FlushInterval,
@@ -336,15 +308,95 @@ func runProducer(args []string) {
 func runAnalyzer(args []string) int {
 	fs := flag.NewFlagSet("analyze", flag.ContinueOnError)
 	input := fs.String("input", "output/adjacency.jsonl", "Adjacency JSONL input path")
-	output := fs.String("output", "output/ioa_findings.jsonl", "Findings JSONL output path")
+	output := fs.String("output", "output/iip_graphs.jsonl", "IIP graph JSONL output path")
 	tacticalOutput := fs.String("tactical-output", "", "Optional tactical scored TPG JSONL output path")
-	candidatesOutput := fs.String("candidates-output", "", "Optional stage-1 candidate JSONL output path")
-	rulesFile := fs.String("rules-file", "", "YAML file that defines sequence rules")
-	maxDepth := fs.Int("max-depth", 64, "Maximum traversal depth from each root")
-	maxFindings := fs.Int("max-findings", 10000, "Maximum number of findings to emit")
-	nameSeq := fs.String("name-seq", "", "Comma-separated edge name sequence (for example: stepA,stepB,stepC)")
+	incidentOutput := fs.String("incident-output", "", "Optional incident JSONL output path")
+	incidentMinSeq := fs.Int("incident-min-seq", 2, "Minimum sequence length for incident output")
+	stateMode := fs.Bool("state-mode", false, "Run periodic analysis using Redis vertex-state candidates")
+	stateRedisAddr := fs.String("state-redis-addr", "127.0.0.1:6379", "Redis address for vertex-state mode")
+	stateRedisPassword := fs.String("state-redis-password", "", "Redis password for vertex-state mode")
+	stateRedisDB := fs.Int("state-redis-db", 0, "Redis DB for vertex-state mode")
+	stateKeyPrefix := fs.String("state-key-prefix", "threatgraph:vertex_state", "Redis key prefix for vertex-state mode")
+	pollInterval := fs.Duration("poll-interval", 30*time.Second, "Polling interval for --state-mode")
+	lookback := fs.Duration("lookback", 5*time.Minute, "Lookback window for --state-mode")
+	once := fs.Bool("once", false, "Run a single polling cycle in --state-mode")
 	if err := fs.Parse(args); err != nil {
 		return 2
+	}
+	if strings.TrimSpace(*tacticalOutput) == "" && strings.TrimSpace(*incidentOutput) == "" {
+		fmt.Fprintf(os.Stderr, "analyze requires at least one of --tactical-output or --incident-output\n")
+		return 2
+	}
+
+	if *stateMode {
+		store, err := vertexstate.NewRedisStore(vertexstate.RedisConfig{
+			Addr:      *stateRedisAddr,
+			Password:  *stateRedisPassword,
+			DB:        *stateRedisDB,
+			KeyPrefix: *stateKeyPrefix,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to connect vertex-state redis: %v\n", err)
+			return 1
+		}
+		defer store.Close()
+
+		nextSince := time.Now().UTC().Add(-*lookback)
+		for {
+			pollStart := time.Now().UTC()
+			states, err := store.FetchDirtySince(nextSince, 5000)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "failed to fetch vertex-state updates: %v\n", err)
+				return 1
+			}
+			candidates := vertexstate.BuildIIPCandidates(states)
+
+			hosts := make(map[string]struct{}, len(candidates))
+			sinceTS := pollStart.Add(-*lookback)
+			for _, c := range candidates {
+				hosts[c.Host] = struct{}{}
+				if !c.FirstIOATimestamp.IsZero() && c.FirstIOATimestamp.Before(sinceTS) {
+					sinceTS = c.FirstIOATimestamp
+				}
+			}
+
+			if len(hosts) > 0 {
+				rows, err := analyzer.LoadRowsJSONL(*input)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "failed to load adjacency rows in state-mode: %v\n", err)
+					return 1
+				}
+				filteredRows := analyzer.FilterRowsByHostAndTime(rows, hosts, sinceTS)
+				iips := analyzer.BuildIIPGraphs(filteredRows)
+				scored := analyzer.BuildScoredTPGs(iips)
+
+				if err := writeJSONLines(*output, iips); err != nil {
+					fmt.Fprintf(os.Stderr, "failed to write iip output in state-mode: %v\n", err)
+					return 1
+				}
+				if strings.TrimSpace(*tacticalOutput) != "" {
+					if err := writeJSONLines(*tacticalOutput, scored); err != nil {
+						fmt.Fprintf(os.Stderr, "failed to write tactical output in state-mode: %v\n", err)
+						return 1
+					}
+				}
+				if strings.TrimSpace(*incidentOutput) != "" {
+					incidents := analyzer.BuildIncidents(scored, *incidentMinSeq)
+					if err := writeJSONLines(*incidentOutput, incidents); err != nil {
+						fmt.Fprintf(os.Stderr, "failed to write incidents in state-mode: %v\n", err)
+						return 1
+					}
+				}
+			}
+
+			fmt.Printf("state-mode vertices=%d iip_candidates=%d iip_output=%s since=%s\n", len(states), len(candidates), *output, nextSince.Format(time.RFC3339))
+
+			nextSince = pollStart
+			if *once {
+				return 0
+			}
+			time.Sleep(*pollInterval)
+		}
 	}
 
 	rows, err := analyzer.LoadRowsJSONL(*input)
@@ -352,61 +404,30 @@ func runAnalyzer(args []string) int {
 		fmt.Fprintf(os.Stderr, "failed to load adjacency rows: %v\n", err)
 		return 1
 	}
+	iips := analyzer.BuildIIPGraphs(rows)
+	scored := analyzer.BuildScoredTPGs(iips)
 
-	cfg := analyzer.Config{MaxDepth: *maxDepth, MaxFindings: *maxFindings}
-	tacticalCount := 0
+	if err := writeJSONLines(*output, iips); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to write iip output: %v\n", err)
+		return 1
+	}
 	if strings.TrimSpace(*tacticalOutput) != "" {
-		iips := analyzer.BuildIIPGraphs(rows)
-		scored := analyzer.BuildScoredTPGs(iips)
 		if err := writeJSONLines(*tacticalOutput, scored); err != nil {
 			fmt.Fprintf(os.Stderr, "failed to write tactical output: %v\n", err)
 			return 1
 		}
-		tacticalCount = len(scored)
 	}
-
-	if strings.TrimSpace(*rulesFile) != "" {
-		rs, err := analyzer.LoadRuleSet(*rulesFile)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to load rules file: %v\n", err)
+	if strings.TrimSpace(*incidentOutput) != "" {
+		incidents := analyzer.BuildIncidents(scored, *incidentMinSeq)
+		if err := writeJSONLines(*incidentOutput, incidents); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to write incidents: %v\n", err)
 			return 1
 		}
-		candidates, findings := analyzer.AnalyzeRuleSet(rows, rs, cfg)
-		if strings.TrimSpace(*candidatesOutput) != "" {
-			if err := writeJSONLines(*candidatesOutput, candidates); err != nil {
-				fmt.Fprintf(os.Stderr, "failed to write candidates: %v\n", err)
-				return 1
-			}
-		}
-		if err := writeJSONLines(*output, findings); err != nil {
-			fmt.Fprintf(os.Stderr, "failed to write findings: %v\n", err)
-			return 1
-		}
-		if tacticalCount > 0 {
-			fmt.Printf("analyzed rows=%d candidates=%d findings=%d tactical=%d output=%s tactical_output=%s\n", len(rows), len(candidates), len(findings), tacticalCount, *output, *tacticalOutput)
-		} else {
-			fmt.Printf("analyzed rows=%d candidates=%d findings=%d output=%s\n", len(rows), len(candidates), len(findings), *output)
-		}
+		fmt.Printf("analyzed rows=%d iips=%d incidents=%d iip_output=%s\n", len(rows), len(iips), len(incidents), *output)
 		return 0
 	}
 
-	var findings []analyzer.Finding
-	if strings.TrimSpace(*nameSeq) != "" {
-		findings = analyzer.DetectNamedSequencePaths(rows, parseNameSequence(*nameSeq), cfg)
-	} else {
-		findings = analyzer.DetectRemoteThreadPaths(rows, cfg)
-	}
-
-	if err := writeJSONLines(*output, findings); err != nil {
-		fmt.Fprintf(os.Stderr, "failed to write findings: %v\n", err)
-		return 1
-	}
-
-	if tacticalCount > 0 {
-		fmt.Printf("analyzed rows=%d findings=%d tactical=%d output=%s tactical_output=%s\n", len(rows), len(findings), tacticalCount, *output, *tacticalOutput)
-	} else {
-		fmt.Printf("analyzed rows=%d findings=%d output=%s\n", len(rows), len(findings), *output)
-	}
+	fmt.Printf("analyzed rows=%d iips=%d iip_output=%s\n", len(rows), len(iips), *output)
 	return 0
 }
 
@@ -435,18 +456,6 @@ func writeJSONLines[T any](path string, rows []T) error {
 		return fmt.Errorf("flush output: %w", err)
 	}
 	return nil
-}
-
-func parseNameSequence(raw string) []string {
-	parts := strings.Split(raw, ",")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		v := strings.TrimSpace(p)
-		if v != "" {
-			out = append(out, v)
-		}
-	}
-	return out
 }
 
 func main() {

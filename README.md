@@ -13,6 +13,7 @@ ThreatGraph 是一个云端图构建器。它从 Redis 队列消费 Sysmon 事�
 5) 输出邻接表（JSONL 或 HTTP）
 6) （可选）输出 IOA 时序事件（JSONL 或 ClickHouse）
 7) （可选）落盘原始队列消息用于重放测试
+8) （可选）更新 Redis 顶点状态索引（供 analyze 周期性产出 IIP 候选）
 
 ## 图模型（有向）
 
@@ -82,7 +83,7 @@ IOA 标签仅挂在**边**上（edge），未生成边的事件不会产生 IOA 
 当前推荐方案（用于大规模环境）不是全图遍历，而是：
 
 - 在线维护 `vertex_state`（按 `host + vertex_id`）
-- 状态里维护 `earliest_upstream_alert_ts`、`ioa_count` 等可增量更新字段
+- 状态里维护 `first_ioa_ts/last_ioa_ts`、`ioa_count` 等可增量更新字段
 - 周期性任务只处理新增告警相关顶点，从原始图中产出 IIP 子图
 
 这是一种“状态索引 + 局部回溯”的工程实现，用于避免全量遍历图。
@@ -140,14 +141,23 @@ threatgraph:
 
 ## 低成本 10w 终端模式
 
-推荐开启两阶段：
+推荐固定为双进程：
 
-1) `produce` 阶段输出轻量 IOA 时序事件（`name/ts/host/src/dst`）
-2) `analyze` 阶段先做序列候选，再做图连通验证
+1) `produce`：并发消费原始日志，规则匹配后写入邻接表 + IOA + 顶点状态索引
+2) `analyze`：周期性读取邻接表与顶点状态，执行 IIP -> TPG -> Killchain 评分 -> incident
 
-可选地，`analyze` 可以输出战术评分结果（IIP/TPG + kill-chain 序列评分）用于优先级排序。
+当前 IIP 生成流程（`BuildIIPGraphs`）为：
 
-这比直接全图遍历更省 CPU 和内存。
+- 按告警边时间顺序处理
+- 对告警源顶点执行时间约束反向判定（仅看更早事件）
+- 从 IIP 根做前向展开，并通过 `can_reach_alert` 预标记裁剪无关路径
+
+TPG 与评分实现要点：
+
+- TPG 顶点来自 IIP 子图中的告警边
+- sequence edge 同时包含同机时间链与同路径因果补边
+- 评分采用基于 sequence edge 的 DAG DP，比较准则为“长度优先、分数次优”
+- 输出包含最佳序列顶点索引与 record_id，便于 incident 解释
 
 ### IOA 输出配置
 
@@ -252,53 +262,68 @@ curl -sS "http://127.0.0.1:8123/?query=SELECT%20count()%20FROM%20threatgraph.ioa
 
 生产环境推荐流程：
 
-1) `produce` 持续写入 append-only 邻接边
-2) 同步维护顶点状态表（`vertex_state`）
-3) 周期任务按“新增告警相关顶点”产出 IIP 子图
+1) `produce` 持续写入 append-only 邻接边并更新 `vertex_state`
+2) `analyze --state-mode` 周期读取 `vertex_state` 的增量更新
+3) 用候选 host/time window 过滤原始图并生成 IIP 子图
+4) 从 IIP 子图生成 TPG，执行评分并输出 incident
 
-其中 IIP 判定依赖 `vertex_state` 的最早上游告警时间索引，避免对原始图做全量回溯。
+其中 IIP 判定依赖时间约束反向判定 + `can_reach_alert` 裁剪，避免全图遍历。
 
 建议状态字段：
 
 - `host`
 - `vertex_id`
-- `earliest_upstream_alert_ts`
+- `first_ioa_ts`
+- `last_ioa_ts`
 - `ioa_count`
 - `updated_at`
 
-## 离线 analyze（实验/过渡）
+示例配置（produce 阶段开启顶点状态索引）：
 
-`analyze` 仍保留，主要用于离线实验与回放验证，不建议作为 10w 端规模的主路径。
+```yaml
+threatgraph:
+  vertex_state:
+    enabled: true
+    redis:
+      addr: 127.0.0.1:6379
+      password: ""
+      db: 0
+    key_prefix: threatgraph:vertex_state
+    scan_interval: 30s
+    lookback: 5m
+```
 
-能力包括：
+说明：`produce` 只负责构造原始图、IOA 和顶点状态索引；IIP/TPG/评分全部在 `analyze` 执行。
 
-- 两阶段候选 + 连通验证
-- 基于 IIP/TPG 的战术评分输出（`--tactical-output`）
-- 按边 `name` 的有序序列匹配
+## Analyze 模式
+
+`analyze` 统一执行 IIP->TPG->评分链路。
+
+支持两种运行方式：
+
+- 一次性离线分析（直接读取邻接表文件）
+- 周期性分析（`--state-mode`，结合 Redis 顶点状态增量）
+
+说明：`analyze` 运行时至少需要指定 `--tactical-output` 或 `--incident-output` 之一。
 
 ```bash
-./bin/threatgraph analyze --input output/adjacency.jsonl --output output/ioa_findings.jsonl
+./bin/threatgraph analyze --input output/adjacency.jsonl --output output/iip_graphs.jsonl --tactical-output output/tactical_scored_tpg.jsonl --incident-output output/incidents.jsonl
 
-# 输出战术评分结果（TPG 排序，实验）
-./bin/threatgraph analyze --input output/adjacency.jsonl --output output/ioa_findings.jsonl --tactical-output output/tactical_scored_tpg.jsonl
-
-# 按边 name 做序列匹配（示例）
-./bin/threatgraph analyze --input output/adjacency.jsonl --output output/ioa_findings.jsonl --name-seq "SuspiciousTool,NetworkConnect.SuspiciousPath"
-
-# 使用规则文件做两阶段（候选+连通验证）检测
-./bin/threatgraph analyze --input output/adjacency.jsonl --rules-file example/sequence_rules.yml --candidates-output output/ioa_candidates.jsonl --output output/ioa_findings.jsonl
+# 周期性（state-mode）分析：每轮读取增量候选，生成 IIP/TPG/incident
+./bin/threatgraph analyze --state-mode --input output/adjacency.jsonl --output output/iip_graphs.jsonl --tactical-output output/tactical_scored_tpg.jsonl --incident-output output/incidents.jsonl --incident-min-seq 2 --poll-interval 30s
 ```
 
 可选参数：
 
-- `--max-depth`：每个根进程的最大遍历深度（默认 `64`）
-- `--max-findings`：最多输出命中条数（默认 `10000`）
-- `--name-seq`：按顺序匹配边 name 的逗号序列（例如 `A,B,C`）
-- `--rules-file`：规则 YAML 文件（两阶段检测）
-- `--candidates-output`：候选序列输出路径（可选）
+- `--output`：IIP graph JSONL 输出路径
 - `--tactical-output`：输出 IIP/TPG 战术评分 JSONL（可选）
-
-规则文件支持 `composites`：可把多个小序列规则按时间顺序组合成一条更长攻击链，再做图连通验证。`composites.max_depth` 可设为 `-1` 表示不限制跳数。
+- `--incident-output`：输出 incident JSONL（可选）
+- `--incident-min-seq`：incident 最小战术序列长度阈值（默认 `2`）
+- `--state-mode`：启用 Redis 顶点状态轮询模式
+- `--state-redis-addr` / `--state-redis-db` / `--state-key-prefix`：state-mode Redis 连接与键前缀
+- `--poll-interval`：`--state-mode` 轮询间隔
+- `--lookback`：`--state-mode` 回看窗口
+- `--once`：`--state-mode` 只执行一次轮询
 
 ## 可视化工具（Python）
 
@@ -308,9 +333,6 @@ curl -sS "http://127.0.0.1:8123/?query=SELECT%20count()%20FROM%20threatgraph.ioa
 
 ```
 python tools/visualize_adjacency.py --input output/adjacency.jsonl --render simple-svg --layout tree --rankdir TB --proc-name TelegramInstaller.exe
-
-# 绘制 analyze 输出的已验证子图（finding JSONL）
-python tools/visualize_adjacency.py --input output/ioa_findings.jsonl --input-kind finding --finding-index 0 --render simple-svg --image output/finding_0.svg --layout tree --rankdir TB
 ```
 
 常见参数：

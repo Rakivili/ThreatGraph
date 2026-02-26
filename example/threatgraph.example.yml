@@ -16,17 +16,6 @@ threatgraph:
     enabled: false
     path: "./rules/sigma"
 
-  alerts:
-    enabled: false
-    threshold: 8
-    window: 5m
-    max_rows: 50
-    cooldown: 2m
-    output:
-      mode: file
-      file:
-        path: output/alerts.jsonl
-
   output:
     mode: file
     file:
@@ -53,6 +42,16 @@ threatgraph:
       path: output/raw_events.jsonl
     batch_size: 1000
     flush_interval: 2s
+
+  vertex_state:
+    enabled: true
+    redis:
+      addr: 127.0.0.1:6379
+      password: ""
+      db: 0
+    key_prefix: threatgraph:vertex_state
+    scan_interval: 30s
+    lookback: 5m
 
   logging:
     enabled: true

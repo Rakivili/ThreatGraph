@@ -71,14 +71,35 @@ func TestBuildIIPGraphsGroupsAndFiltersEdges(t *testing.T) {
 	if _, ok := edgeIDs["2"]; !ok {
 		t.Fatalf("expected alert edge record 2 to be included")
 	}
-	if _, ok := edgeIDs["3"]; !ok {
-		t.Fatalf("expected causal path edge record 3 to be included")
+	if _, ok := edgeIDs["3"]; ok {
+		t.Fatalf("did not expect post-alert edge record 3 without downstream alert")
 	}
 	if _, ok := edgeIDs["1"]; ok {
 		t.Fatalf("did not expect pre-IIP edge record 1")
 	}
 	if _, ok := edgeIDs["4"]; ok {
 		t.Fatalf("did not expect unrelated edge record 4")
+	}
+}
+
+func TestBuildIIPGraphsSkipsLaterAlertWhenEarlierAlertExistsInBackwardTrace(t *testing.T) {
+	t0 := time.Date(2026, 2, 1, 10, 0, 0, 0, time.UTC)
+	t1 := t0.Add(1 * time.Minute)
+
+	rows := []*models.AdjacencyRow{
+		{Timestamp: t0, RecordType: "edge", Type: "ProcessAccessEdge", VertexID: "proc:p1", AdjacentID: "proc:p2", Hostname: "host-a", RecordID: "1", IoaTags: []models.IoaTag{{Name: "A", Technique: "T1001"}}},
+		{Timestamp: t1, RecordType: "edge", Type: "CreateProcessEdge", VertexID: "proc:p2", AdjacentID: "proc:p3", Hostname: "host-a", RecordID: "2", IoaTags: []models.IoaTag{{Name: "B", Technique: "T1002"}}},
+	}
+
+	graphs := BuildIIPGraphs(rows)
+	if len(graphs) != 1 {
+		t.Fatalf("expected 1 graph, got %d", len(graphs))
+	}
+	if graphs[0].Root != "proc:p1" {
+		t.Fatalf("expected earliest root proc:p1, got %s", graphs[0].Root)
+	}
+	if len(graphs[0].AlertEvents) != 2 {
+		t.Fatalf("expected both alerts to be grouped into first IIP graph, got %d", len(graphs[0].AlertEvents))
 	}
 }
 
@@ -115,6 +136,36 @@ func TestBuildTPGDeduplicatesTechniqueNamePerSourceAndOrdersByTime(t *testing.T)
 	}
 }
 
+func TestBuildTPGAddsCausalSequenceEdgesFromIIPPaths(t *testing.T) {
+	t0 := time.Date(2026, 2, 1, 10, 0, 0, 0, time.UTC)
+	t1 := t0.Add(1 * time.Minute)
+	t2 := t0.Add(2 * time.Minute)
+
+	iip := IIPGraph{
+		Host: "host-a",
+		Root: "proc:a",
+		AlertEvents: []AlertEvent{
+			{Host: "host-a", From: "proc:a", To: "proc:b", TS: t0, RecordID: "1", IoaTags: []models.IoaTag{{Technique: "T1000", Name: "A"}}},
+			{Host: "host-a", From: "proc:c", To: "proc:d", TS: t2, RecordID: "3", IoaTags: []models.IoaTag{{Technique: "T2000", Name: "B"}}},
+		},
+		Edges: []*models.AdjacencyRow{
+			{Timestamp: t1, RecordType: "edge", VertexID: "proc:b", AdjacentID: "proc:c", Type: "CreateProcessEdge", RecordID: "2", Hostname: "host-a"},
+		},
+	}
+
+	tpg := BuildTPG(iip)
+	foundCausal := false
+	for _, e := range tpg.SequenceEdges {
+		if e.From == 0 && e.To == 1 {
+			foundCausal = true
+			break
+		}
+	}
+	if !foundCausal {
+		t.Fatalf("expected causal sequence edge 0->1")
+	}
+}
+
 func TestScoreTPGPrefersLongestKillChainOrderedSubsequence(t *testing.T) {
 	t0 := time.Date(2026, 2, 2, 10, 0, 0, 0, time.UTC)
 	t1 := t0.Add(1 * time.Minute)
@@ -130,6 +181,7 @@ func TestScoreTPGPrefersLongestKillChainOrderedSubsequence(t *testing.T) {
 			{TS: t2, RecordID: "3", IoaTags: []models.IoaTag{{Tactic: "initial-access", Severity: "critical", Technique: "T1190"}}},
 			{TS: t3, RecordID: "4", IoaTags: []models.IoaTag{{Tactic: "lateral-movement", Severity: "high", Technique: "T1021"}}},
 		},
+		SequenceEdges: []TPGSequenceEdge{{From: 0, To: 1}, {From: 1, To: 2}, {From: 2, To: 3}},
 	}
 
 	score := ScoreTPG(tpg)
@@ -141,6 +193,9 @@ func TestScoreTPGPrefersLongestKillChainOrderedSubsequence(t *testing.T) {
 	}
 	if score.RiskProduct <= 0 || score.RiskSum <= 0 {
 		t.Fatalf("expected positive risk values, got product=%f sum=%f", score.RiskProduct, score.RiskSum)
+	}
+	if len(score.BestVertexIndexes) != 3 {
+		t.Fatalf("expected best path length 3, got %d", len(score.BestVertexIndexes))
 	}
 }
 
@@ -170,5 +225,44 @@ func TestBuildScoredTPGsSortsByLengthThenRisk(t *testing.T) {
 	}
 	if scored[0].Host != "h1" {
 		t.Fatalf("expected h1 first due to longer sequence, got %s", scored[0].Host)
+	}
+}
+
+func TestBuildIncidentsFiltersBySequenceLength(t *testing.T) {
+	t0 := time.Date(2026, 2, 4, 10, 0, 0, 0, time.UTC)
+	scored := []ScoredTPG{
+		{
+			Host: "h1",
+			Root: "proc:a",
+			Score: TacticalScore{
+				SequenceLength: 3,
+				RiskProduct:    64,
+				RiskSum:        12,
+				TacticCoverage: 3,
+			},
+			TPG: TPG{Vertices: []AlertEvent{{TS: t0}, {TS: t0.Add(1 * time.Minute)}}},
+		},
+		{
+			Host: "h2",
+			Root: "proc:b",
+			Score: TacticalScore{
+				SequenceLength: 1,
+				RiskProduct:    4,
+				RiskSum:        4,
+				TacticCoverage: 1,
+			},
+			TPG: TPG{Vertices: []AlertEvent{{TS: t0}}},
+		},
+	}
+
+	incidents := BuildIncidents(scored, 2)
+	if len(incidents) != 1 {
+		t.Fatalf("expected 1 incident, got %d", len(incidents))
+	}
+	if incidents[0].Host != "h1" {
+		t.Fatalf("expected host h1, got %s", incidents[0].Host)
+	}
+	if incidents[0].Severity != "high" && incidents[0].Severity != "critical" {
+		t.Fatalf("expected high/critical severity, got %s", incidents[0].Severity)
 	}
 }
