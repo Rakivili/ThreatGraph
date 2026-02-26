@@ -47,6 +47,13 @@ threatgraph:
         timeout: 5s
         headers: {}
 
+  replay_capture:
+    enabled: false
+    file:
+      path: output/raw_events.jsonl
+    batch_size: 1000
+    flush_interval: 2s
+
   logging:
     enabled: true
     level: info

@@ -22,11 +22,14 @@ type RedisAdjacencyPipeline struct {
 	mapper        *adjacency.Mapper
 	writer        AdjacencyWriter
 	ioaWriter     IOAWriter
+	rawWriter     RawWriter
 	scorer        *alerts.Scorer
 	alertWriter   AlertWriter
 	workers       int
 	batchSize     int
 	flushInterval time.Duration
+	rawBatchSize  int
+	rawFlushIntvl time.Duration
 }
 
 type redisWorkItem struct {
@@ -35,18 +38,21 @@ type redisWorkItem struct {
 }
 
 // NewRedisAdjacencyPipeline creates a pipeline for Redis adjacency output.
-func NewRedisAdjacencyPipeline(consumer *inputredis.Consumer, engine rules.Engine, mapper *adjacency.Mapper, writer AdjacencyWriter, ioaWriter IOAWriter, scorer *alerts.Scorer, alertWriter AlertWriter, workers, batchSize int, flushInterval time.Duration) *RedisAdjacencyPipeline {
+func NewRedisAdjacencyPipeline(consumer *inputredis.Consumer, engine rules.Engine, mapper *adjacency.Mapper, writer AdjacencyWriter, ioaWriter IOAWriter, rawWriter RawWriter, scorer *alerts.Scorer, alertWriter AlertWriter, workers, batchSize int, flushInterval time.Duration, rawBatchSize int, rawFlushInterval time.Duration) *RedisAdjacencyPipeline {
 	return &RedisAdjacencyPipeline{
 		consumer:      consumer,
 		engine:        engine,
 		mapper:        mapper,
 		writer:        writer,
 		ioaWriter:     ioaWriter,
+		rawWriter:     rawWriter,
 		scorer:        scorer,
 		alertWriter:   alertWriter,
 		workers:       workers,
 		batchSize:     batchSize,
 		flushInterval: flushInterval,
+		rawBatchSize:  rawBatchSize,
+		rawFlushIntvl: rawFlushInterval,
 	}
 }
 
@@ -63,9 +69,19 @@ func (p *RedisAdjacencyPipeline) Run(ctx context.Context) error {
 	if p.flushInterval <= 0 {
 		p.flushInterval = 2 * time.Second
 	}
+	if p.rawBatchSize <= 0 {
+		p.rawBatchSize = p.batchSize
+	}
+	if p.rawFlushIntvl <= 0 {
+		p.rawFlushIntvl = p.flushInterval
+	}
 
 	msgCh := make(chan []byte, p.workers*4)
 	workCh := make(chan redisWorkItem, p.workers*4)
+	var rawCh chan []byte
+	if p.rawWriter != nil {
+		rawCh = make(chan []byte, p.workers*8)
+	}
 
 	var producerWG sync.WaitGroup
 	var writerWG sync.WaitGroup
@@ -73,8 +89,11 @@ func (p *RedisAdjacencyPipeline) Run(ctx context.Context) error {
 	producerWG.Add(1)
 	go func() {
 		defer producerWG.Done()
-		p.readLoop(ctx, msgCh)
+		p.readLoop(ctx, msgCh, rawCh)
 		close(msgCh)
+		if rawCh != nil {
+			close(rawCh)
+		}
 	}()
 
 	for i := 0; i < p.workers; i++ {
@@ -90,6 +109,13 @@ func (p *RedisAdjacencyPipeline) Run(ctx context.Context) error {
 		defer writerWG.Done()
 		p.writeLoop(workCh)
 	}()
+	if rawCh != nil {
+		writerWG.Add(1)
+		go func() {
+			defer writerWG.Done()
+			p.rawWriteLoop(rawCh)
+		}()
+	}
 
 	<-ctx.Done()
 	producerWG.Wait()
@@ -115,13 +141,18 @@ func (p *RedisAdjacencyPipeline) Close() error {
 			logger.Errorf("Failed to close IOA writer: %v", err)
 		}
 	}
+	if p.rawWriter != nil {
+		if err := p.rawWriter.Close(); err != nil {
+			logger.Errorf("Failed to close raw writer: %v", err)
+		}
+	}
 	if p.consumer != nil {
 		return p.consumer.Close()
 	}
 	return nil
 }
 
-func (p *RedisAdjacencyPipeline) readLoop(ctx context.Context, out chan<- []byte) {
+func (p *RedisAdjacencyPipeline) readLoop(ctx context.Context, out chan<- []byte, rawOut chan<- []byte) {
 	for {
 		payload, err := p.consumer.Pop(ctx)
 		if err != nil {
@@ -135,7 +166,55 @@ func (p *RedisAdjacencyPipeline) readLoop(ctx context.Context, out chan<- []byte
 		if payload == nil {
 			continue
 		}
+		if rawOut != nil {
+			rawOut <- payload
+		}
 		out <- payload
+	}
+}
+
+func (p *RedisAdjacencyPipeline) rawWriteLoop(in <-chan []byte) {
+	ticker := time.NewTicker(p.rawFlushIntvl)
+	defer ticker.Stop()
+
+	batch := make([][]byte, 0, p.rawBatchSize)
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		for attempt := 1; attempt <= 3; attempt++ {
+			if err := p.rawWriter.WriteRawMessages(batch); err != nil {
+				logger.Errorf("Failed to write raw messages (attempt %d/3): %v", attempt, err)
+				if attempt == 3 {
+					logger.Errorf("Dropping %d raw messages after retries", len(batch))
+					batch = batch[:0]
+					break
+				}
+				time.Sleep(1 * time.Second)
+				continue
+			}
+			batch = batch[:0]
+			break
+		}
+	}
+
+	for {
+		select {
+		case <-ticker.C:
+			flush()
+		case payload, ok := <-in:
+			if !ok {
+				flush()
+				return
+			}
+			if payload == nil {
+				continue
+			}
+			batch = append(batch, payload)
+			if len(batch) >= p.rawBatchSize {
+				flush()
+			}
+		}
 	}
 }
 
@@ -276,6 +355,12 @@ func extractIOAEvents(rows []*models.AdjacencyRow) []*models.IOAEvent {
 
 func rowNames(row *models.AdjacencyRow) []string {
 	values := make([]string, 0, 4)
+	for _, tag := range row.IoaTags {
+		if n := strings.TrimSpace(tag.Name); n != "" {
+			values = append(values, n)
+		}
+	}
+
 	appendName := func(v interface{}) {
 		s, ok := v.(string)
 		if !ok {

@@ -51,33 +51,25 @@ func (m *Mapper) Map(event *models.Event) []*models.AdjacencyRow {
 	}
 
 	if len(event.IoaTags) > 0 {
-		if event.EventID == 1 {
-			for _, row := range rows {
-				if row != nil && row.RecordType == recordVertex && row.Type == "ProcessVertex" {
-					row.IoaTags = event.IoaTags
-					break
-				}
-			}
-		} else {
-			if ioaRow := m.processIoaVertex(event); ioaRow != nil {
-				rows = append(rows, ioaRow)
-			}
-		}
+		rows = attachIOATags(rows, event.IoaTags)
 	}
 
 	return rows
 }
 
-func (m *Mapper) processIoaVertex(event *models.Event) *models.AdjacencyRow {
-	procID, ok := processIDFromEvent(event)
-	if !ok {
-		return nil
+func attachIOATags(rows []*models.AdjacencyRow, tags []models.IoaTag) []*models.AdjacencyRow {
+	if len(rows) == 0 || len(tags) == 0 {
+		return rows
 	}
-	row := vertexRow("ProcessVertex", procID, event, map[string]interface{}{
-		"ioa_event_id": event.EventID,
-	})
-	row.IoaTags = event.IoaTags
-	return row
+
+	for _, row := range rows {
+		if row == nil || row.RecordType != recordEdge {
+			continue
+		}
+		row.IoaTags = append([]models.IoaTag(nil), tags...)
+	}
+
+	return rows
 }
 
 func (m *Mapper) mapProcessCreate(event *models.Event) []*models.AdjacencyRow {
