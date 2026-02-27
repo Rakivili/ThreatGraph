@@ -36,7 +36,6 @@ threatgraph:
 ## 与 analyze 兼容性
 
 - `analyze` 的 IIP/TPG 主链路按当前实现仅依赖 edge 行与 `ioa_tags`。
-- `adjacency-analyzer` 的 `name-seq` 已兼容优先读取 `ioa_tags.name`。
 
 ## 上线前检查
 
