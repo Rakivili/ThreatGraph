@@ -451,6 +451,11 @@ func edgeNames(row *models.AdjacencyRow) []string {
 		return nil
 	}
 	values := make([]string, 0, 4)
+	for _, tag := range row.IoaTags {
+		if n := strings.TrimSpace(tag.Name); n != "" {
+			values = append(values, n)
+		}
+	}
 	appendIfString := func(v interface{}) {
 		s, ok := v.(string)
 		if !ok {

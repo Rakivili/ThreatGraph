@@ -12,6 +12,10 @@ threatgraph:
     batch_size: 1000
     flush_interval: 2s
 
+  graph:
+    write_vertex_rows: false
+    include_edge_data: false
+
   rules:
     enabled: false
     path: "./rules/sigma"

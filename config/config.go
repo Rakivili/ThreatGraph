@@ -16,11 +16,18 @@ type Config struct {
 type ThreatGraphConfig struct {
 	Input         InputConfig         `yaml:"input"`
 	Pipeline      PipelineConfig      `yaml:"pipeline"`
+	Graph         GraphConfig         `yaml:"graph"`
 	Rules         RulesConfig         `yaml:"rules"`
 	Output        OutputConfig        `yaml:"output"`
 	IOA           IOAConfig           `yaml:"ioa"`
 	ReplayCapture ReplayCaptureConfig `yaml:"replay_capture"`
 	Logging       LoggingConfig       `yaml:"logging"`
+}
+
+// GraphConfig controls raw adjacency graph emission.
+type GraphConfig struct {
+	WriteVertexRows bool `yaml:"write_vertex_rows"`
+	IncludeEdgeData bool `yaml:"include_edge_data"`
 }
 
 // InputConfig controls the input reader.

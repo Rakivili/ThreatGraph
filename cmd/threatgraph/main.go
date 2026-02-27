@@ -142,7 +142,10 @@ func runProducer(args []string) {
 		log.Fatalf("Failed to create Redis consumer: %v", err)
 	}
 
-	mapper := adjacency.NewMapper()
+	mapper := adjacency.NewMapper(adjacency.MapperOptions{
+		WriteVertexRows: cfg.ThreatGraph.Graph.WriteVertexRows,
+		IncludeEdgeData: cfg.ThreatGraph.Graph.IncludeEdgeData,
+	})
 	var engine rules.Engine
 	if cfg.ThreatGraph.Rules.Enabled {
 		if strings.TrimSpace(cfg.ThreatGraph.Rules.Path) == "" {
