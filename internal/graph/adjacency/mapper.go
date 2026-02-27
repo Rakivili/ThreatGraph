@@ -14,11 +14,23 @@ const (
 )
 
 // Mapper converts events into adjacency rows.
-type Mapper struct{}
+type Mapper struct {
+	writeVertexRows bool
+	includeEdgeData bool
+}
+
+// MapperOptions controls mapper output size and fidelity.
+type MapperOptions struct {
+	WriteVertexRows bool
+	IncludeEdgeData bool
+}
 
 // NewMapper creates a mapper.
-func NewMapper() *Mapper {
-	return &Mapper{}
+func NewMapper(opts MapperOptions) *Mapper {
+	return &Mapper{
+		writeVertexRows: opts.WriteVertexRows,
+		includeEdgeData: opts.IncludeEdgeData,
+	}
 }
 
 // Map converts a single event into adjacency rows.
@@ -81,27 +93,20 @@ func (m *Mapper) mapProcessCreate(event *models.Event) []*models.AdjacencyRow {
 	host := pickHost(event)
 	procID := processVertexID(host, procGuid)
 
-	rows := []*models.AdjacencyRow{
-		vertexRow("ProcessVertex", procID, event, map[string]interface{}{
-			"image":           event.Field("Image"),
-			"command_line":    event.Field("CommandLine"),
-			"parent_guid":     event.Field("ParentProcessGuid"),
-			"parent_image":    event.Field("ParentImage"),
-			"user":            event.Field("User"),
-			"integrity_level": event.Field("IntegrityLevel"),
-			"hashes":          event.Field("Hashes"),
-			"product":         event.Field("Product"),
-		}),
+	rows := make([]*models.AdjacencyRow, 0, 3)
+
+	if m.writeVertexRows {
+		rows = append(rows, vertexRow("ProcessVertex", procID, event, nil))
 	}
 
 	if parentGuid := event.Field("ParentProcessGuid"); parentGuid != "" {
 		parentID := processVertexID(host, parentGuid)
-		rows = append(rows, edgeRow("ParentOfEdge", parentID, procID, event, nil))
+		rows = append(rows, edgeRow("ParentOfEdge", parentID, procID, event, nil, m.includeEdgeData))
 	}
 
 	if image := event.Field("Image"); image != "" {
 		pathID := filePathVertexID(host, image)
-		rows = append(rows, edgeRow("ImageOfEdge", pathID, procID, event, nil))
+		rows = append(rows, edgeRow("ImageOfEdge", pathID, procID, event, nil, m.includeEdgeData))
 	}
 
 	return rows
@@ -120,12 +125,11 @@ func (m *Mapper) mapFileCreate(event *models.Event) []*models.AdjacencyRow {
 
 	host := pickHost(event)
 	pathID := filePathVertexID(host, target)
-	rows := []*models.AdjacencyRow{
-		vertexRow("FilePathVertex", pathID, event, map[string]interface{}{
-			"path": target,
-		}),
-		edgeRow("CreatedFileEdge", procID, pathID, event, nil),
+	rows := make([]*models.AdjacencyRow, 0, 2)
+	if m.writeVertexRows {
+		rows = append(rows, vertexRow("FilePathVertex", pathID, event, nil))
 	}
+	rows = append(rows, edgeRow("CreatedFileEdge", procID, pathID, event, nil, m.includeEdgeData))
 
 	return rows
 }
@@ -143,7 +147,7 @@ func (m *Mapper) mapImageLoad(event *models.Event) []*models.AdjacencyRow {
 	pathID := filePathVertexID(host, imageLoaded)
 
 	return []*models.AdjacencyRow{
-		edgeRow("ImageLoadEdge", pathID, procID, event, nil),
+		edgeRow("ImageLoadEdge", pathID, procID, event, nil, m.includeEdgeData),
 	}
 }
 
@@ -158,13 +162,11 @@ func (m *Mapper) mapNetworkConnect(event *models.Event) []*models.AdjacencyRow {
 		return nil
 	}
 	netID := networkVertexID(ip, port)
-	rows := []*models.AdjacencyRow{
-		vertexRow("NetworkVertex", netID, event, map[string]interface{}{
-			"ip":   ip,
-			"port": port,
-		}),
-		edgeRow("ConnectEdge", procID, netID, event, nil),
+	rows := make([]*models.AdjacencyRow, 0, 2)
+	if m.writeVertexRows {
+		rows = append(rows, vertexRow("NetworkVertex", netID, event, nil))
 	}
+	rows = append(rows, edgeRow("ConnectEdge", procID, netID, event, nil, m.includeEdgeData))
 	return rows
 }
 
@@ -178,12 +180,11 @@ func (m *Mapper) mapDNSQuery(event *models.Event) []*models.AdjacencyRow {
 		return nil
 	}
 	domainID := domainVertexID(name)
-	rows := []*models.AdjacencyRow{
-		vertexRow("DomainVertex", domainID, event, map[string]interface{}{
-			"domain": name,
-		}),
-		edgeRow("DNSQueryEdge", procID, domainID, event, nil),
+	rows := make([]*models.AdjacencyRow, 0, 2)
+	if m.writeVertexRows {
+		rows = append(rows, vertexRow("DomainVertex", domainID, event, nil))
 	}
+	rows = append(rows, edgeRow("DNSQueryEdge", procID, domainID, event, nil, m.includeEdgeData))
 	return rows
 }
 
@@ -196,7 +197,7 @@ func (m *Mapper) mapRemoteThread(event *models.Event) []*models.AdjacencyRow {
 		return nil
 	}
 	return []*models.AdjacencyRow{
-		edgeRow("RemoteThreadEdge", sourceID, targetID, event, nil),
+		edgeRow("RemoteThreadEdge", sourceID, targetID, event, nil, m.includeEdgeData),
 	}
 }
 
@@ -209,7 +210,7 @@ func (m *Mapper) mapProcessAccess(event *models.Event) []*models.AdjacencyRow {
 		return nil
 	}
 	return []*models.AdjacencyRow{
-		edgeRow("ProcessAccessEdge", sourceID, targetID, event, nil),
+		edgeRow("ProcessAccessEdge", sourceID, targetID, event, nil, m.includeEdgeData),
 	}
 }
 
@@ -217,8 +218,8 @@ func vertexRow(rowType, vertexID string, event *models.Event, data map[string]in
 	return baseRow(event, recordVertex, rowType, vertexID, "", data)
 }
 
-func edgeRow(rowType, vertexID, adjacentID string, event *models.Event, data map[string]interface{}) *models.AdjacencyRow {
-	if data == nil {
+func edgeRow(rowType, vertexID, adjacentID string, event *models.Event, data map[string]interface{}, includeEdgeData bool) *models.AdjacencyRow {
+	if includeEdgeData && data == nil {
 		data = map[string]interface{}{
 			"fields": event.Fields,
 		}
@@ -227,9 +228,6 @@ func edgeRow(rowType, vertexID, adjacentID string, event *models.Event, data map
 }
 
 func baseRow(event *models.Event, recordType, rowType, vertexID, adjacentID string, data map[string]interface{}) *models.AdjacencyRow {
-	if data == nil {
-		data = map[string]interface{}{}
-	}
 	return &models.AdjacencyRow{
 		Timestamp:  event.Timestamp,
 		RecordType: recordType,

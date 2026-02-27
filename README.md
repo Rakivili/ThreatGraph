@@ -7,6 +7,8 @@ ThreatGraph 是一个面向 Sysmon 的图安全分析引擎，采用双进程架
 
 论文复刻说明：`docs/rapsheet_replication.md`
 
+Produce 压缩清单：`docs/produce_min_metadata_checklist.md`
+
 ## 运行模型
 
 ### 进程 1：produce
@@ -148,8 +150,21 @@ threatgraph:
     file:
       path: output/raw_events.jsonl
     batch_size: 1000
-    flush_interval: 2s
+  flush_interval: 2s
 ```
+
+### 低成本原始图模式（推荐）
+
+```yaml
+threatgraph:
+  graph:
+    write_vertex_rows: false
+    include_edge_data: false
+```
+
+- `write_vertex_rows=false`：只输出边行，顶点由 `vertex_id/adjacent_id` 隐式表示。
+- `include_edge_data=false`：不在边上写入完整 Sysmon 字段，显著降低落盘体积。
+- 建议保留 Sigma 的 `ioa_tags`（边级）用于后续 `analyze` 的 IIP/TPG 构建与评分。
 
 ### 分析窗口输入（推荐）
 
