@@ -5,6 +5,34 @@ ThreatGraph 是一个面向 Sysmon 的图安全分析引擎，采用双进程架
 - `produce`：并发消费日志、规则打标、写入原始邻接图
 - `analyze`：基于原始图执行 `IIP -> TPG -> Killchain 评分 -> Incident`
 
+## 项目介绍
+
+ThreatGraph 的设计参考了 RapSheet 论文中的分析思路，并结合实际工程场景实现为可持续运行的检测系统。
+
+核心能力：
+
+- 以 Sysmon 事件构建时序图
+- 基于 IOA 证据提取 IIP，并进一步构建 TPG
+- 对攻击阶段链路进行评分，输出可追溯的 incident
+
+## 检测思路
+
+ThreatGraph 采用“规则命中 + 图时序分析”联合判断：
+
+- 规则层：Sigma 命中用于标记 IOA 证据边
+- 图层：在时间约束和可达关系下还原攻击路径
+- 输出层：以 root、关键 IOA、TPG 序列为核心给出 incident 结果
+
+核心原则：
+
+- 证据优先：先保留规则命中证据，再做图级关联与裁剪
+- 时序约束：仅保留满足时间一致性的传播路径
+- 因果约束：关注可达关系与阶段衔接，避免孤立事件误判
+- 可解释性优先：Incident 必须能回溯到 root、关键 IOA 与关键路径
+- 工程可运行：在吞吐与存储受限场景下，优先保证持续分析能力
+
+简而言之：规则回答“看到了什么”，图分析回答“这些行为是否构成同一条攻击链”。
+
 论文复刻说明：`docs/rapsheet_replication.md`
 
 Produce 压缩清单：`docs/produce_min_metadata_checklist.md`
