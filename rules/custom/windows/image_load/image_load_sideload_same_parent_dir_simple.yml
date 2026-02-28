@@ -1,0 +1,49 @@
+title: Potential DLL Sideloading - Process And Module In Same Writable Root
+id: d6f3f07f-f6a4-4c9b-9fc7-f5a8c8b2d8b1
+status: experimental
+description: >-
+  Detects Sysmon ImageLoad events where the process image and loaded module are
+  both located in the same writable root path (for example Users, ProgramData,
+  Temp), and the loaded module is unsigned or has an invalid signature.
+  This is a simple approximation for DLL sideloading.
+references:
+  - https://attack.mitre.org/techniques/T1574/001/
+author: ThreatGraph
+date: 2026-02-27
+tags:
+  - attack.defense-evasion
+  - attack.t1574.001
+logsource:
+  product: windows
+  service: sysmon
+detection:
+  sel_users:
+    Image|startswith: 'C:\Users\'
+    ImageLoaded|startswith: 'C:\Users\'
+  sel_programdata:
+    Image|startswith: 'C:\ProgramData\'
+    ImageLoaded|startswith: 'C:\ProgramData\'
+  sel_temp:
+    Image|contains:
+      - '\AppData\Local\Temp\'
+      - '\Windows\Temp\'
+    ImageLoaded|contains:
+      - '\AppData\Local\Temp\'
+      - '\Windows\Temp\'
+  filter_signed_os_modules:
+    ImageLoaded|startswith:
+      - 'C:\Windows\System32\'
+      - 'C:\Windows\SysWOW64\'
+  sel_unsigned:
+    Signed: 'false'
+  sel_bad_sigstatus:
+    SignatureStatus|contains:
+      - 'Invalid'
+      - 'Untrusted'
+      - 'Unsigned'
+      - 'NotSigned'
+  condition: (sel_users or sel_programdata or sel_temp) and (sel_unsigned or sel_bad_sigstatus) and not filter_signed_os_modules
+falsepositives:
+  - Portable applications running from user profile directories
+  - Legitimate software self-updaters extracting and loading temporary modules
+level: medium
