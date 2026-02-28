@@ -41,6 +41,11 @@ def parse_args():
         help="Path to output DOT file (default: output/adjacency.dot)",
     )
     parser.add_argument(
+        "--json-out",
+        default="",
+        help="Optional path to write structured subgraph JSON",
+    )
+    parser.add_argument(
         "--render",
         choices=["none", "svg", "png", "simple-svg"],
         default="none",
@@ -167,6 +172,11 @@ def parse_args():
         default=2000,
         help="Max edges to include (default: 2000, 0 for no limit)",
     )
+    parser.add_argument(
+        "--start-ts",
+        default="",
+        help="Lower bound timestamp (ISO8601). Keep only edges at/after this time.",
+    )
     return parser.parse_args()
 
 
@@ -269,6 +279,29 @@ def edge_label_text(edge_type):
     return edge_type or "edge"
 
 
+def ioa_label_text(row):
+    tags = row.get("ioa_tags") if isinstance(row, dict) else None
+    if not isinstance(tags, list) or not tags:
+        return ""
+    names = []
+    for tag in tags:
+        if not isinstance(tag, dict):
+            continue
+        name = str(tag.get("name") or "").strip()
+        if name:
+            names.append(name)
+    if not names:
+        return ""
+    seen = []
+    seen_set = set()
+    for name in names:
+        if name in seen_set:
+            continue
+        seen_set.add(name)
+        seen.append(name)
+    return " | ".join(seen)
+
+
 def parse_ts(row):
     ts = row.get("ts") if isinstance(row, dict) else None
     if ts is None:
@@ -347,6 +380,28 @@ def edge_sort_key(row):
     ts = parse_ts(row)
     rid = parse_record_id(row)
     return (ts is None, ts or 0, rid is None, rid or 0)
+
+
+def parse_iso_to_epoch(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def filter_edges_from_start_time(edges, start_ts):
+    if start_ts is None:
+        return edges
+    filtered = []
+    for row in edges:
+        ts = parse_ts(row)
+        if ts is None:
+            continue
+        if ts >= start_ts:
+            filtered.append(row)
+    return filtered
 
 
 def should_update_forward(old_time, new_time):
@@ -632,6 +687,7 @@ def load_rows_from_adjacency(path, match, limit, edge_types, allowed_kinds):
 
             maybe_fill_proc_meta(meta, vertex_id, row)
             maybe_fill_proc_meta(meta, adjacent_id, row)
+            maybe_fill_proc_meta_from_image_edge(meta, row)
 
             if should_skip_file_edge(vertex_id, adjacent_id, meta):
                 continue
@@ -776,6 +832,10 @@ def maybe_fill_proc_meta(meta, vertex_id, row):
         return
     existing = meta.get(vertex_id)
     existing_data = existing.get("data", {}) if existing else {}
+    if not isinstance(existing_data, dict):
+        existing_data = {}
+    if existing is not None and "data" not in existing:
+        existing["data"] = existing_data
     has_image = bool(existing_data.get("image") or existing_data.get("Image"))
     has_cmd = bool(existing_data.get("command_line") or existing_data.get("CommandLine"))
     row_data = row.get("data", {}) if isinstance(row, dict) else {}
@@ -803,6 +863,48 @@ def maybe_fill_proc_meta(meta, vertex_id, row):
         existing_data["image"] = image
     if cmdline and not has_cmd:
         existing_data["command_line"] = cmdline
+
+
+def maybe_fill_proc_meta_from_image_edge(meta, row):
+    if not isinstance(row, dict):
+        return
+    if (row.get("type") or "") != "ImageOfEdge":
+        return
+
+    src = row.get("vertex_id")
+    dst = row.get("adjacent_id")
+    if vertex_kind(src) != "path" or vertex_kind(dst) != "proc":
+        return
+
+    image = extract_path_from_path_vertex_id(src)
+    if not image:
+        return
+
+    existing = meta.get(dst)
+    if not existing:
+        meta[dst] = {
+            "record_type": "vertex",
+            "vertex_id": dst,
+            "data": {"image": image},
+        }
+        return
+
+    data = existing.get("data", {}) if isinstance(existing, dict) else {}
+    if not isinstance(data, dict):
+        data = {}
+    if isinstance(existing, dict) and "data" not in existing:
+        existing["data"] = data
+    if not (data.get("image") or data.get("Image")):
+        data["image"] = image
+
+
+def extract_path_from_path_vertex_id(vertex_id):
+    if not isinstance(vertex_id, str) or not vertex_id.startswith("path:"):
+        return ""
+    parts = vertex_id.split(":", 2)
+    if len(parts) < 3:
+        return ""
+    return parts[2]
 
 
 def write_dot(path, nodes, edges, meta):
@@ -836,6 +938,9 @@ def write_dot(path, nodes, edges, meta):
             label = edge_label_text(edge_type)
             if event_id is not None:
                 label = "{} ({})".format(label, event_id)
+            ioa_text = ioa_label_text(row)
+            if ioa_text:
+                label = "{}\\nIOA".format(label)
             color = edge_color(edge_type)
             handle.write(
                 "  {} -> {} [label=\"{}\", color=\"{}\"];\n".format(
@@ -844,6 +949,40 @@ def write_dot(path, nodes, edges, meta):
             )
 
         handle.write("}\n")
+
+
+def write_subgraph_json(path, nodes, edges, meta, seeds):
+    node_items = []
+    for vertex_id in sorted(nodes):
+        node_items.append(
+            {
+                "id": vertex_id,
+                "kind": vertex_kind(vertex_id),
+                "label": build_label(vertex_id, meta.get(vertex_id)),
+            }
+        )
+
+    edge_items = []
+    for row in edges:
+        edge_items.append(
+            {
+                "from": row.get("vertex_id"),
+                "to": row.get("adjacent_id"),
+                "type": row.get("type") or "edge",
+                "ts": row.get("ts"),
+                "record_id": row.get("record_id"),
+                "ioa_tags": row.get("ioa_tags") or [],
+            }
+        )
+
+    payload = {
+        "seeds": sorted(list(seeds)) if seeds else [],
+        "nodes": node_items,
+        "edges": edge_items,
+    }
+
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False)
 
 
 def write_simple_svg(path, nodes, edges, meta, layout, iterations, seed, layer_edges, rankdir, layer_gap, node_gap, edge_label, legend_enabled, max_size, node_padding, seeds, edge_curve, tree_edge_keys):
@@ -911,6 +1050,19 @@ def write_simple_svg(path, nodes, edges, meta, layout, iterations, seed, layer_e
         handle.write("</marker>\n")
         handle.write("</defs>\n")
 
+        node_boxes = {}
+        for vertex_id in nodes:
+            x, y = positions[vertex_id]
+            box_w, box_h = sizes[vertex_id]
+            node_boxes[vertex_id] = (
+                x - box_w / 2 - node_padding,
+                y - box_h / 2 - node_padding,
+                x + box_w / 2 + node_padding,
+                y + box_h / 2 + node_padding,
+            )
+
+        routed_edge_samples = []
+
         # edges
         for row in edges:
             src = row.get("vertex_id")
@@ -923,9 +1075,14 @@ def write_simple_svg(path, nodes, edges, meta, layout, iterations, seed, layer_e
             color = edge_color(edge_type)
             event_id = row.get("event_id")
             label_text = edge_label_text(edge_type)
+            ioa_text = ioa_label_text(row)
+            if ioa_text:
+                label_text = "{} | IOA".format(label_text)
             label_hover = label_text
             if event_id is not None:
                 label_hover = "{} ({})".format(label_text, event_id)
+            if ioa_text:
+                label_hover = "{}\\nIOA: {}".format(label_hover, ioa_text)
             write_edge(
                 handle,
                 x1,
@@ -941,6 +1098,10 @@ def write_simple_svg(path, nodes, edges, meta, layout, iterations, seed, layer_e
                 node_padding,
                 edge_curve,
                 layout,
+                src,
+                dst,
+                node_boxes,
+                routed_edge_samples,
             )
 
         # nodes
@@ -1157,6 +1318,8 @@ def layout_tree(nodes, edges, seeds, rankdir, layer_gap, node_gap, tree_edge_key
     for layer in layers:
         layer.sort(key=lambda n: (node_time.get(n) is None, node_time.get(n) or 0, n))
 
+    layers = reorder_layers_to_reduce_crossings(layers, adjacency)
+
     max_nodes = max(len(layer) for layer in layers) if layers else 1
     width = max(600.0, node_gap * max_nodes + 200)
     height = max(400.0, layer_gap * (max_level + 1) + 200)
@@ -1180,6 +1343,58 @@ def layout_tree(nodes, edges, seeds, rankdir, layer_gap, node_gap, tree_edge_key
         width, height = height, width
 
     return positions, width, height
+
+
+def reorder_layers_to_reduce_crossings(layers, adjacency):
+    if not layers:
+        return layers
+
+    layer_of = {}
+    for idx, layer in enumerate(layers):
+        for node in layer:
+            layer_of[node] = idx
+
+    parents = {}
+    children = {}
+    for src, entries in adjacency.items():
+        src_layer = layer_of.get(src)
+        if src_layer is None:
+            continue
+        for dst, _ in entries:
+            dst_layer = layer_of.get(dst)
+            if dst_layer is None:
+                continue
+            if dst_layer <= src_layer:
+                continue
+            parents.setdefault(dst, []).append(src)
+            children.setdefault(src, []).append(dst)
+
+    for _ in range(6):
+        for li in range(1, len(layers)):
+            prev_pos = {n: i for i, n in enumerate(layers[li - 1])}
+            current_pos = {n: i for i, n in enumerate(layers[li])}
+
+            def up_key(node):
+                ps = [prev_pos[p] for p in parents.get(node, []) if p in prev_pos]
+                if not ps:
+                    return (10**9, current_pos[node], node)
+                return (sum(ps) / len(ps), current_pos[node], node)
+
+            layers[li].sort(key=up_key)
+
+        for li in range(len(layers) - 2, -1, -1):
+            next_pos = {n: i for i, n in enumerate(layers[li + 1])}
+            current_pos = {n: i for i, n in enumerate(layers[li])}
+
+            def down_key(node):
+                cs = [next_pos[c] for c in children.get(node, []) if c in next_pos]
+                if not cs:
+                    return (10**9, current_pos[node], node)
+                return (sum(cs) / len(cs), current_pos[node], node)
+
+            layers[li].sort(key=down_key)
+
+    return layers
 
 
 def layout_layered(nodes, edges, layer_edges, rankdir, layer_gap, node_gap):
@@ -1437,10 +1652,22 @@ def escape_xml(text):
     )
 
 
-def write_edge(handle, x1, y1, x2, y2, color, label_text, label_hover, label_mode, size1, size2, padding, curve, layout):
+def write_edge(handle, x1, y1, x2, y2, color, label_text, label_hover, label_mode, size1, size2, padding, curve, layout, src_node, dst_node, node_boxes, routed_edge_samples):
     sx, sy = shrink_point(x1, y1, x2, y2, size1, padding)
     tx, ty = shrink_point(x2, y2, x1, y1, size2, padding)
-    path = build_edge_path(sx, sy, tx, ty, curve, layout)
+    path, samples = build_edge_path_with_avoidance(
+        sx,
+        sy,
+        tx,
+        ty,
+        curve,
+        layout,
+        src_node,
+        dst_node,
+        node_boxes,
+        routed_edge_samples,
+    )
+    routed_edge_samples.append(samples)
     if label_mode in ("hover", "text") and label_hover:
         handle.write(
             "<path d='{}' fill='none' stroke='{}' stroke-width='1.2' stroke-opacity='0.7' marker-end='url(#arrow)'>\n".format(
@@ -1525,6 +1752,114 @@ def build_curve_path(x1, y1, x2, y2, curve):
     return "M {:.1f},{:.1f} C {:.1f},{:.1f} {:.1f},{:.1f} {:.1f},{:.1f}".format(
         x1, y1, c1x, c1y, c2x, c2y, x2, y2
     )
+
+
+def curve_control_points(x1, y1, x2, y2, curve):
+    if curve <= 0:
+        return x1, y1, x2, y2
+    dx = x2 - x1
+    dy = y2 - y1
+    length = math.hypot(dx, dy)
+    if length == 0:
+        return x1, y1, x2, y2
+    abs_dx = abs(dx)
+    abs_dy = abs(dy)
+    if abs_dy >= abs_dx:
+        offset = min(abs_dy * 0.5, curve)
+        sign = 1 if dy >= 0 else -1
+        c1x, c1y = x1, y1 + sign * offset
+        c2x, c2y = x2, y2 - sign * offset
+    else:
+        offset = min(abs_dx * 0.5, curve)
+        sign = 1 if dx >= 0 else -1
+        c1x, c1y = x1 + sign * offset, y1
+        c2x, c2y = x2 - sign * offset, y2
+    return c1x, c1y, c2x, c2y
+
+
+def cubic_point(x1, y1, c1x, c1y, c2x, c2y, x2, y2, t):
+    u = 1.0 - t
+    tt = t * t
+    uu = u * u
+    uuu = uu * u
+    ttt = tt * t
+    x = uuu * x1 + 3 * uu * t * c1x + 3 * u * tt * c2x + ttt * x2
+    y = uuu * y1 + 3 * uu * t * c1y + 3 * u * tt * c2y + ttt * y2
+    return x, y
+
+
+def sample_cubic(x1, y1, c1x, c1y, c2x, c2y, x2, y2, steps=18):
+    points = []
+    for i in range(steps + 1):
+        t = i / float(steps)
+        points.append(cubic_point(x1, y1, c1x, c1y, c2x, c2y, x2, y2, t))
+    return points
+
+
+def point_in_box(x, y, box):
+    x0, y0, x1, y1 = box
+    return x0 <= x <= x1 and y0 <= y <= y1
+
+
+def min_distance_to_samples(points, other_points):
+    best = None
+    for x, y in points:
+        for ox, oy in other_points:
+            d = math.hypot(x - ox, y - oy)
+            if best is None or d < best:
+                best = d
+    return best if best is not None else 1e9
+
+
+def path_penalty(points, src_node, dst_node, node_boxes, routed_edge_samples):
+    penalty = 0.0
+    for node_id, box in node_boxes.items():
+        if node_id == src_node or node_id == dst_node:
+            continue
+        for x, y in points:
+            if point_in_box(x, y, box):
+                penalty += 500.0
+                break
+
+    for other in routed_edge_samples:
+        d = min_distance_to_samples(points, other)
+        if d < 14:
+            penalty += (14 - d) * 60.0
+
+    return penalty
+
+
+def build_edge_path_with_avoidance(x1, y1, x2, y2, curve, layout, src_node, dst_node, node_boxes, routed_edge_samples):
+    if layout == "tree":
+        path = build_tree_curve_path(x1, y1, x2, y2)
+        c1x, c1y, c2x, c2y = curve_control_points(x1, y1, x2, y2, max(40.0, abs(y2 - y1) * 0.4))
+        return path, sample_cubic(x1, y1, c1x, c1y, c2x, c2y, x2, y2)
+
+    if curve <= 0:
+        path = "M {:.1f},{:.1f} L {:.1f},{:.1f}".format(x1, y1, x2, y2)
+        return path, [(x1, y1), (x2, y2)]
+
+    factors = [1.0, -1.0, 1.6, -1.6, 2.3, -2.3, 3.0, -3.0]
+    best = None
+    for f in factors:
+        cc = abs(curve) * abs(f)
+        c1x, c1y, c2x, c2y = curve_control_points(x1, y1, x2, y2, cc)
+        if f < 0:
+            c1x, c1y = x1 + (x1 - c1x), y1 + (y1 - c1y)
+            c2x, c2y = x2 + (x2 - c2x), y2 + (y2 - c2y)
+        points = sample_cubic(x1, y1, c1x, c1y, c2x, c2y, x2, y2)
+        penalty = path_penalty(points, src_node, dst_node, node_boxes, routed_edge_samples)
+        if best is None or penalty < best[0]:
+            path = "M {:.1f},{:.1f} C {:.1f},{:.1f} {:.1f},{:.1f} {:.1f},{:.1f}".format(
+                x1, y1, c1x, c1y, c2x, c2y, x2, y2
+            )
+            best = (penalty, path, points)
+
+    if best is None:
+        path = build_curve_path(x1, y1, x2, y2, curve)
+        c1x, c1y, c2x, c2y = curve_control_points(x1, y1, x2, y2, curve)
+        return path, sample_cubic(x1, y1, c1x, c1y, c2x, c2y, x2, y2)
+    return best[1], best[2]
 
 
 def build_edge_path(x1, y1, x2, y2, curve, layout):
@@ -1706,6 +2041,77 @@ def build_subgraph(edges, seeds):
     return nodes, selected_edges, tree_edge_keys
 
 
+def edge_has_ioa(row):
+    tags = row.get("ioa_tags") if isinstance(row, dict) else None
+    return isinstance(tags, list) and len(tags) > 0
+
+
+def prune_paths_without_ioa(edges, tree_edge_keys=None):
+    if tree_edge_keys is None:
+        tree_edge_keys = set()
+
+    ioa_edges = [row for row in edges if edge_has_ioa(row)]
+    if not ioa_edges:
+        return set(), [], set(), 0
+
+    edges_by_src = {}
+    edges_by_dst = {}
+    edge_map = {}
+    for row in edges:
+        src = row.get("vertex_id")
+        dst = row.get("adjacent_id")
+        if not src or not dst:
+            continue
+        key = edge_key(row)
+        edge_map[key] = row
+        edges_by_src.setdefault(src, []).append(row)
+        edges_by_dst.setdefault(dst, []).append(row)
+
+    keep_keys = {edge_key(row) for row in ioa_edges}
+    queue = [row.get("vertex_id") for row in ioa_edges if row.get("vertex_id")]
+    seen_nodes = set(queue)
+    while queue:
+        node = queue.pop(0)
+        for prev in edges_by_dst.get(node, []):
+            pkey = edge_key(prev)
+            keep_keys.add(pkey)
+            prev_src = prev.get("vertex_id")
+            if prev_src and prev_src not in seen_nodes:
+                seen_nodes.add(prev_src)
+                queue.append(prev_src)
+
+    queue = [row.get("adjacent_id") for row in ioa_edges if row.get("adjacent_id")]
+    seen_nodes = set(queue)
+    while queue:
+        node = queue.pop(0)
+        for nxt in edges_by_src.get(node, []):
+            nkey = edge_key(nxt)
+            keep_keys.add(nkey)
+            nxt_dst = nxt.get("adjacent_id")
+            if nxt_dst and nxt_dst not in seen_nodes:
+                seen_nodes.add(nxt_dst)
+                queue.append(nxt_dst)
+
+    selected_edges = []
+    selected_nodes = set()
+    seen = set()
+    for row in edges:
+        key = edge_key(row)
+        if key not in keep_keys or key in seen:
+            continue
+        seen.add(key)
+        selected_edges.append(row)
+        src = row.get("vertex_id")
+        dst = row.get("adjacent_id")
+        if src:
+            selected_nodes.add(src)
+        if dst:
+            selected_nodes.add(dst)
+
+    selected_tree_keys = {k for k in tree_edge_keys if k in keep_keys}
+    return selected_nodes, selected_edges, selected_tree_keys, len(ioa_edges)
+
+
 def render(dot_path, fmt, image_path, nodes, edges, meta, layout, iterations, seed, layer_edges, rankdir, layer_gap, node_gap, edge_label, legend_enabled, max_size, node_padding, seeds, edge_curve, tree_edge_keys):
     if fmt == "none":
         return
@@ -1797,6 +2203,16 @@ def main():
         print("No edges found for the given filters.")
         return 1
 
+    start_ts = parse_iso_to_epoch(args.start_ts)
+    if args.start_ts and start_ts is None:
+        print("Invalid --start-ts: {}".format(args.start_ts))
+        return 2
+    if start_ts is not None:
+        edges = filter_edges_from_start_time(edges, start_ts)
+        if not edges:
+            print("No edges remain after start-ts filter.")
+            return 1
+
     seeds = set()
     if args.focus:
         seeds.add(args.focus)
@@ -1817,9 +2233,20 @@ def main():
             print("No edges found after subgraph expansion.")
             return 1
 
+    nodes, edges, tree_edge_keys, ioa_count = prune_paths_without_ioa(edges, tree_edge_keys)
+    if not edges:
+        print("No edges remain after IOA path pruning.")
+        return 1
+    print("IOA path pruning kept {} edge(s) with {} IOA seed edge(s).".format(len(edges), ioa_count))
+
     os.makedirs(os.path.dirname(args.dot) or ".", exist_ok=True)
     write_dot(args.dot, nodes, edges, meta)
     print("DOT written to {}".format(args.dot))
+
+    if args.json_out:
+        os.makedirs(os.path.dirname(args.json_out) or ".", exist_ok=True)
+        write_subgraph_json(args.json_out, nodes, edges, meta, seeds)
+        print("JSON written to {}".format(args.json_out))
 
     if args.render != "none":
         try:
