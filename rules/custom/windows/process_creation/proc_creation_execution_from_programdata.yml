@@ -1,0 +1,33 @@
+title: Process Executed From ProgramData Directory
+id: 5a56f9f9-c5f7-4570-a95a-a4b8b3073528
+status: experimental
+description: Detects executable/script process creation from C:\ProgramData.
+author: ThreatGraph
+date: 2026-02-27
+references:
+  - https://attack.mitre.org/techniques/T1547/
+tags:
+  - attack.execution
+  - attack.persistence
+  - attack.t1036
+logsource:
+  product: windows
+  service: sysmon
+  category: process_creation
+detection:
+  sel_path:
+    Image|startswith: 'C:\ProgramData\'
+    Image|endswith:
+      - '.exe'
+      - '.com'
+      - '.bat'
+      - '.cmd'
+      - '.ps1'
+  filter_common_vendor:
+    Image|contains:
+      - '\Package Cache\'
+      - '\Microsoft\Windows Defender\'
+  condition: sel_path and not filter_common_vendor
+falsepositives:
+  - Legitimate software installers and updaters under ProgramData
+level: medium

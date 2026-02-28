@@ -1,0 +1,43 @@
+title: Task Scheduler Spawned Process From Writable Path
+id: 1c2f5f7e-8a3a-4f7e-9d89-2a6c5f9db7d1
+status: experimental
+description: Detects process creation where Task Scheduler-related parents launch binaries from writable user paths.
+author: ThreatGraph
+date: 2026-02-27
+references:
+  - https://attack.mitre.org/techniques/T1053/005/
+tags:
+  - attack.execution
+  - attack.persistence
+  - attack.t1053.005
+logsource:
+  product: windows
+  service: sysmon
+  category: process_creation
+detection:
+  sel_parent_task:
+    ParentImage|endswith:
+      - '\taskeng.exe'
+      - '\taskhostw.exe'
+      - '\taskhost.exe'
+  sel_parent_svchost_schedule:
+    ParentImage|endswith: '\svchost.exe'
+    ParentCommandLine|contains: 'Schedule'
+  sel_child_writable:
+    Image|startswith:
+      - 'C:\Users\Public\'
+      - 'C:\ProgramData\'
+    Image|endswith:
+      - '.exe'
+      - '.com'
+      - '.bat'
+      - '.cmd'
+      - '.ps1'
+  sel_child_temp:
+    Image|contains:
+      - '\AppData\Local\Temp\'
+      - '\Windows\Temp\'
+  condition: (sel_parent_task or sel_parent_svchost_schedule) and (sel_child_writable or sel_child_temp)
+falsepositives:
+  - Legitimate enterprise software updater tasks running from ProgramData
+level: high

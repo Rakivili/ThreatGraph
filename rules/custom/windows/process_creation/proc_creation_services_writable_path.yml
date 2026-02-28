@@ -1,0 +1,37 @@
+title: Services.exe Spawned Process From Writable Path
+id: 9a9eb3c1-c2d9-4626-a7a1-f0b6776c31f3
+status: experimental
+description: Detects process creation where services.exe launches binaries from writable directories.
+author: ThreatGraph
+date: 2026-02-27
+references:
+  - https://attack.mitre.org/techniques/T1543/003/
+tags:
+  - attack.persistence
+  - attack.privilege-escalation
+  - attack.t1543.003
+logsource:
+  product: windows
+  service: sysmon
+  category: process_creation
+detection:
+  sel_parent:
+    ParentImage|endswith: '\services.exe'
+  sel_child_writable:
+    Image|startswith:
+      - 'C:\Users\Public\'
+      - 'C:\ProgramData\'
+    Image|endswith:
+      - '.exe'
+      - '.com'
+      - '.bat'
+      - '.cmd'
+      - '.ps1'
+  sel_child_temp:
+    Image|contains:
+      - '\AppData\Local\Temp\'
+      - '\Windows\Temp\'
+  condition: sel_parent and (sel_child_writable or sel_child_temp)
+falsepositives:
+  - Software installers or agents temporarily registering/updating a service
+level: high

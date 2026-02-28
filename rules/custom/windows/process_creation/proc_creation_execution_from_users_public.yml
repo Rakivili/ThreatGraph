@@ -1,0 +1,29 @@
+title: Process Executed From Users Public Directory
+id: f28c58e0-a8bc-4d15-b771-a4d4f5be95fb
+status: experimental
+description: Detects executable/script process creation from C:\Users\Public.
+author: ThreatGraph
+date: 2026-02-27
+references:
+  - https://attack.mitre.org/techniques/T1036/
+tags:
+  - attack.execution
+  - attack.defense-evasion
+  - attack.t1036
+logsource:
+  product: windows
+  service: sysmon
+  category: process_creation
+detection:
+  sel_path:
+    Image|startswith: 'C:\Users\Public\'
+    Image|endswith:
+      - '.exe'
+      - '.com'
+      - '.bat'
+      - '.cmd'
+      - '.ps1'
+  condition: sel_path
+falsepositives:
+  - Internal scripts intentionally staged in C:\Users\Public
+level: medium

@@ -1,0 +1,36 @@
+title: Network Connection From Writable Special Directory Process
+id: c9f2b6a4-88df-4fbe-89a1-6fb8d7d65b83
+status: experimental
+description: Detects network connections initiated by processes running from writable special directories.
+author: ThreatGraph
+date: 2026-02-27
+references:
+  - https://attack.mitre.org/techniques/T1071/
+  - https://attack.mitre.org/techniques/T1105/
+tags:
+  - attack.command-and-control
+  - attack.t1071
+  - attack.t1105
+logsource:
+  product: windows
+  service: sysmon
+  category: network_connection
+detection:
+  sel_writable_roots:
+    Image|startswith:
+      - 'C:\Users\Public\'
+      - 'C:\ProgramData\'
+  sel_temp_roots:
+    Image|contains:
+      - '\AppData\Local\Temp\'
+      - '\Windows\Temp\'
+  filter_browsers:
+    Image|endswith:
+      - '\chrome.exe'
+      - '\msedge.exe'
+      - '\firefox.exe'
+  condition: (sel_writable_roots or sel_temp_roots) and not filter_browsers
+falsepositives:
+  - Legitimate installers and updaters using temporary directories
+  - Enterprise management tools deployed under ProgramData
+level: medium
