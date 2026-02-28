@@ -30,6 +30,9 @@ type compiledSigmaRule struct {
 	rule  sigma.Rule
 	eval  *sigmaevaluator.RuleEvaluator
 	label models.IoaTag
+	// Optional Sysmon EventID prefilter inferred from rule metadata/path.
+	// When empty, the rule is evaluated for all incoming events.
+	eventIDs map[int]struct{}
 }
 
 // SigmaEngine evaluates Sigma rules against individual Sysmon events.
@@ -97,9 +100,10 @@ func NewSigmaEngine(path string) (*SigmaEngine, SigmaLoadStats, error) {
 		}
 
 		compiled = append(compiled, compiledSigmaRule{
-			rule:  rule,
-			eval:  sigmaevaluator.ForRule(rule),
-			label: ioaTagFromRule(rule),
+			rule:     rule,
+			eval:     sigmaevaluator.ForRule(rule),
+			label:    ioaTagFromRule(rule),
+			eventIDs: inferSysmonEventIDs(rule, ruleFile),
 		})
 		stats.Loaded++
 	}
@@ -116,6 +120,11 @@ func (e *SigmaEngine) Apply(event *models.Event) []models.IoaTag {
 	eventMap := sigmaEventFrom(event)
 	out := make([]models.IoaTag, 0, 4)
 	for _, rule := range e.rules {
+		if len(rule.eventIDs) > 0 {
+			if _, ok := rule.eventIDs[event.EventID]; !ok {
+				continue
+			}
+		}
 		res, err := rule.eval.Matches(e.ctx, eventMap)
 		if err != nil {
 			continue
@@ -276,4 +285,52 @@ func parseAttackTags(tags []string) (string, string) {
 	}
 
 	return tactic, technique
+}
+
+func inferSysmonEventIDs(rule sigma.Rule, ruleFile string) map[int]struct{} {
+	category := strings.ToLower(strings.TrimSpace(rule.Logsource.Category))
+	if category != "" {
+		if ids := categoryToSysmonEventIDs(category); len(ids) > 0 {
+			return ids
+		}
+	}
+
+	// Fall back to path-based inference for repositories that organize rules by
+	// category directories (for example windows/image_load/... ).
+	lowerPath := strings.ToLower(filepath.ToSlash(ruleFile))
+	for key := range sysmonCategoryEventMap {
+		needle := "/" + key + "/"
+		if strings.Contains(lowerPath, needle) {
+			if ids := categoryToSysmonEventIDs(key); len(ids) > 0 {
+				return ids
+			}
+		}
+	}
+
+	return nil
+}
+
+var sysmonCategoryEventMap = map[string][]int{
+	"process_creation":     {1},
+	"network_connection":   {3},
+	"driver_load":          {6},
+	"image_load":           {7},
+	"create_remote_thread": {8},
+	"process_access":       {10},
+	"file_create":          {11},
+	"file_event":           {11},
+	"file":                 {11},
+	"dns_query":            {22},
+}
+
+func categoryToSysmonEventIDs(category string) map[int]struct{} {
+	vals, ok := sysmonCategoryEventMap[strings.ToLower(strings.TrimSpace(category))]
+	if !ok || len(vals) == 0 {
+		return nil
+	}
+	out := make(map[int]struct{}, len(vals))
+	for _, v := range vals {
+		out[v] = struct{}{}
+	}
+	return out
 }

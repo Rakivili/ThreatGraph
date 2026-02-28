@@ -96,16 +96,33 @@ func (m *Mapper) mapProcessCreate(event *models.Event) []*models.AdjacencyRow {
 	rows := make([]*models.AdjacencyRow, 0, 3)
 
 	if m.writeVertexRows {
-		rows = append(rows, vertexRow("ProcessVertex", procID, event, nil))
+		rows = append(rows, vertexRow("ProcessVertex", procID, event, map[string]interface{}{
+			"image":               event.Field("Image"),
+			"process_path":        event.Field("Image"),
+			"command_line":        event.Field("CommandLine"),
+			"parent_image":        event.Field("ParentImage"),
+			"parent_process_path": event.Field("ParentImage"),
+			"parent_command_line": event.Field("ParentCommandLine"),
+		}))
 	}
 
 	if parentGuid := event.Field("ParentProcessGuid"); parentGuid != "" {
 		parentID := processVertexID(host, parentGuid)
+		if m.writeVertexRows {
+			rows = append(rows, vertexRow("ProcessVertex", parentID, event, map[string]interface{}{
+				"image":        event.Field("ParentImage"),
+				"process_path": event.Field("ParentImage"),
+				"command_line": event.Field("ParentCommandLine"),
+			}))
+		}
 		rows = append(rows, edgeRow("ParentOfEdge", parentID, procID, event, nil, m.includeEdgeData))
 	}
 
 	if image := event.Field("Image"); image != "" {
 		pathID := filePathVertexID(host, image)
+		if m.writeVertexRows {
+			rows = append(rows, vertexRow("FilePathVertex", pathID, event, nil))
+		}
 		rows = append(rows, edgeRow("ImageOfEdge", pathID, procID, event, nil, m.includeEdgeData))
 	}
 
@@ -127,6 +144,7 @@ func (m *Mapper) mapFileCreate(event *models.Event) []*models.AdjacencyRow {
 	pathID := filePathVertexID(host, target)
 	rows := make([]*models.AdjacencyRow, 0, 2)
 	if m.writeVertexRows {
+		rows = append(rows, vertexRow("ProcessVertex", procID, event, processVertexData(event)))
 		rows = append(rows, vertexRow("FilePathVertex", pathID, event, nil))
 	}
 	rows = append(rows, edgeRow("CreatedFileEdge", procID, pathID, event, nil, m.includeEdgeData))
@@ -146,9 +164,13 @@ func (m *Mapper) mapImageLoad(event *models.Event) []*models.AdjacencyRow {
 	host := pickHost(event)
 	pathID := filePathVertexID(host, imageLoaded)
 
-	return []*models.AdjacencyRow{
-		edgeRow("ImageLoadEdge", pathID, procID, event, nil, m.includeEdgeData),
+	rows := make([]*models.AdjacencyRow, 0, 3)
+	if m.writeVertexRows {
+		rows = append(rows, vertexRow("ProcessVertex", procID, event, processVertexData(event)))
+		rows = append(rows, vertexRow("FilePathVertex", pathID, event, nil))
 	}
+	rows = append(rows, edgeRow("ImageLoadEdge", pathID, procID, event, nil, m.includeEdgeData))
+	return rows
 }
 
 func (m *Mapper) mapNetworkConnect(event *models.Event) []*models.AdjacencyRow {
@@ -164,6 +186,7 @@ func (m *Mapper) mapNetworkConnect(event *models.Event) []*models.AdjacencyRow {
 	netID := networkVertexID(ip, port)
 	rows := make([]*models.AdjacencyRow, 0, 2)
 	if m.writeVertexRows {
+		rows = append(rows, vertexRow("ProcessVertex", procID, event, processVertexData(event)))
 		rows = append(rows, vertexRow("NetworkVertex", netID, event, nil))
 	}
 	rows = append(rows, edgeRow("ConnectEdge", procID, netID, event, nil, m.includeEdgeData))
@@ -182,6 +205,7 @@ func (m *Mapper) mapDNSQuery(event *models.Event) []*models.AdjacencyRow {
 	domainID := domainVertexID(name)
 	rows := make([]*models.AdjacencyRow, 0, 2)
 	if m.writeVertexRows {
+		rows = append(rows, vertexRow("ProcessVertex", procID, event, processVertexData(event)))
 		rows = append(rows, vertexRow("DomainVertex", domainID, event, nil))
 	}
 	rows = append(rows, edgeRow("DNSQueryEdge", procID, domainID, event, nil, m.includeEdgeData))
@@ -196,9 +220,13 @@ func (m *Mapper) mapRemoteThread(event *models.Event) []*models.AdjacencyRow {
 	if sourceID == "" || targetID == "" {
 		return nil
 	}
-	return []*models.AdjacencyRow{
-		edgeRow("RemoteThreadEdge", sourceID, targetID, event, nil, m.includeEdgeData),
+	rows := make([]*models.AdjacencyRow, 0, 3)
+	if m.writeVertexRows {
+		rows = append(rows, vertexRow("ProcessVertex", sourceID, event, processVertexDataFromFields(event, "SourceImage", "SourceCommandLine", "")))
+		rows = append(rows, vertexRow("ProcessVertex", targetID, event, processVertexDataFromFields(event, "TargetImage", "TargetCommandLine", "")))
 	}
+	rows = append(rows, edgeRow("RemoteThreadEdge", sourceID, targetID, event, nil, m.includeEdgeData))
+	return rows
 }
 
 func (m *Mapper) mapProcessAccess(event *models.Event) []*models.AdjacencyRow {
@@ -209,9 +237,13 @@ func (m *Mapper) mapProcessAccess(event *models.Event) []*models.AdjacencyRow {
 	if sourceID == "" || targetID == "" {
 		return nil
 	}
-	return []*models.AdjacencyRow{
-		edgeRow("ProcessAccessEdge", sourceID, targetID, event, nil, m.includeEdgeData),
+	rows := make([]*models.AdjacencyRow, 0, 3)
+	if m.writeVertexRows {
+		rows = append(rows, vertexRow("ProcessVertex", sourceID, event, processVertexDataFromFields(event, "SourceImage", "SourceCommandLine", "")))
+		rows = append(rows, vertexRow("ProcessVertex", targetID, event, processVertexDataFromFields(event, "TargetImage", "TargetCommandLine", "")))
 	}
+	rows = append(rows, edgeRow("ProcessAccessEdge", sourceID, targetID, event, nil, m.includeEdgeData))
+	return rows
 }
 
 func vertexRow(rowType, vertexID string, event *models.Event, data map[string]interface{}) *models.AdjacencyRow {
@@ -317,4 +349,32 @@ func firstField(event *models.Event, names ...string) string {
 		}
 	}
 	return ""
+}
+
+func processVertexData(event *models.Event) map[string]interface{} {
+	return processVertexDataFromFields(event, "Image", "CommandLine", "ParentImage")
+}
+
+func processVertexDataFromFields(event *models.Event, imageField, commandLineField, parentImageField string) map[string]interface{} {
+	image := strings.TrimSpace(event.Field(imageField))
+	commandLine := strings.TrimSpace(event.Field(commandLineField))
+	parentImage := strings.TrimSpace(event.Field(parentImageField))
+
+	if image == "" && commandLine == "" && parentImage == "" {
+		return nil
+	}
+
+	data := map[string]interface{}{}
+	if image != "" {
+		data["image"] = image
+		data["process_path"] = image
+	}
+	if commandLine != "" {
+		data["command_line"] = commandLine
+	}
+	if parentImage != "" {
+		data["parent_image"] = parentImage
+		data["parent_process_path"] = parentImage
+	}
+	return data
 }

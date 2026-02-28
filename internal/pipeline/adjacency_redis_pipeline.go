@@ -321,34 +321,13 @@ func extractIOAEvents(rows []*models.AdjacencyRow) []*models.IOAEvent {
 }
 
 func rowNames(row *models.AdjacencyRow) []string {
+	// IOA time-series rows must reflect Sigma engine hits only.
+	// Do not fall back to edge/data field names to avoid mixed sources.
 	values := make([]string, 0, 4)
 	for _, tag := range row.IoaTags {
 		if n := strings.TrimSpace(tag.Name); n != "" {
 			values = append(values, n)
 		}
-	}
-
-	appendName := func(v interface{}) {
-		s, ok := v.(string)
-		if !ok {
-			return
-		}
-		for _, n := range splitNameParts(s) {
-			n = strings.TrimSpace(n)
-			if n != "" && n != "-" {
-				values = append(values, n)
-			}
-		}
-	}
-
-	appendName(row.Data["name"])
-	appendName(row.Data["rule_name"])
-	appendName(row.Data["ruleName"])
-
-	if fields, ok := row.Data["fields"].(map[string]interface{}); ok {
-		appendName(fields["RuleName"])
-		appendName(fields["rule_name"])
-		appendName(fields["name"])
 	}
 
 	if len(values) == 0 {
@@ -362,42 +341,6 @@ func rowNames(row *models.AdjacencyRow) []string {
 		}
 		uniq[n] = struct{}{}
 		out = append(out, n)
-	}
-	return out
-}
-
-func splitNameParts(v string) []string {
-	v = strings.TrimSpace(v)
-	if v == "" {
-		return nil
-	}
-	parts := strings.FieldsFunc(v, func(r rune) bool {
-		switch r {
-		case ';', '|':
-			return true
-		default:
-			return false
-		}
-	})
-	if len(parts) == 0 {
-		parts = []string{v}
-	}
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p == "" {
-			continue
-		}
-		if strings.Contains(p, "=") {
-			kv := strings.SplitN(p, "=", 2)
-			key := strings.ToLower(strings.TrimSpace(kv[0]))
-			value := strings.TrimSpace(kv[1])
-			if value != "" && (key == "name" || key == "rulename" || key == "rule_name") {
-				out = append(out, value)
-				continue
-			}
-		}
-		out = append(out, p)
 	}
 	return out
 }
