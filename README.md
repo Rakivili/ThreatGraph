@@ -2,7 +2,7 @@
 
 ThreatGraph 是一个面向 Sysmon 的图安全分析引擎，采用双进程架构：
 
-- `produce`：并发消费日志、规则打标、写入原始邻接图与状态索引
+- `produce`：并发消费日志、规则打标、写入原始邻接图
 - `analyze`：基于原始图执行 `IIP -> TPG -> Killchain 评分 -> Incident`
 
 论文复刻说明：`docs/rapsheet_replication.md`
@@ -54,21 +54,38 @@ IIP 回溯的核心加速来自 `analyze` 运行时从原始边派生的反向�
 ```bash
 make
 
-# 进程1：实时构图
-./bin/threatgraph produce
+# 进程1：实时构图（读取指定配置）
+./bin/threatgraph produce threatgraph.yml
 
-# 进程2：离线/一次性分析
+# 进程2：一次性分析
 ./bin/threatgraph analyze \
-  --input output/adjacency.jsonl \
-  --output output/iip_graphs.jsonl \
-  --tactical-output output/tactical_scored_tpg.jsonl \
-  --incident-output output/incidents.jsonl
+  --input output/adjacency.min.jsonl \
+  --output output/iip_graphs.latest.jsonl \
+  --tactical-output output/scored_tpg.latest.jsonl \
+  --incident-output output/incidents.latest.min2.jsonl \
+  --incident-min-seq 2
 ```
 
-`produce` 默认读取 `threatgraph.yml`（当前目录或可执行文件目录），也可显式传入配置路径：
+`produce` 使用子命令模式，推荐显式传入配置路径：
 
 ```bash
 ./bin/threatgraph produce path/to/threatgraph.yml
+```
+
+### 常驻 analyze（推荐）
+
+```bash
+while true; do
+  if [ -s output/adjacency.min.jsonl ]; then
+    ./bin/threatgraph analyze \
+      --input output/adjacency.min.jsonl \
+      --output output/iip_graphs.latest.jsonl \
+      --tactical-output output/scored_tpg.latest.jsonl \
+      --incident-output output/incidents.latest.min2.jsonl \
+      --incident-min-seq 2
+  fi
+  sleep 5
+done
 ```
 
 示例配置：
@@ -91,7 +108,7 @@ threatgraph:
 
 - 聚合（count/max/min/sum/avg）
 - timeframe 相关
-- 复杂条件（如 `1 of` / `all of` / pattern 扩展）
+- 复杂条件（超出 `and/or/not + 简单标识符` 的表达式）
 - 非 windows/sysmon 数据源
 
 ## Analyze 用法
@@ -100,20 +117,22 @@ threatgraph:
 
 ```bash
 ./bin/threatgraph analyze \
-  --input output/adjacency.jsonl \
-  --output output/iip_graphs.jsonl \
-  --tactical-output output/tactical_scored_tpg.jsonl \
-  --incident-output output/incidents.jsonl
+  --input output/adjacency.min.jsonl \
+  --output output/iip_graphs.latest.jsonl \
+  --tactical-output output/scored_tpg.latest.jsonl \
+  --incident-output output/incidents.latest.min2.jsonl \
+  --incident-min-seq 2
 ```
 
 ### 周期增量分析（IOA 时序库驱动）
 
 ```bash
 ./bin/threatgraph analyze \
-  --input output/adjacency.jsonl \
-  --output output/iip_graphs.jsonl \
-  --tactical-output output/tactical_scored_tpg.jsonl \
-  --incident-output output/incidents.jsonl
+  --input output/adjacency.min.jsonl \
+  --output output/iip_graphs.latest.jsonl \
+  --tactical-output output/scored_tpg.latest.jsonl \
+  --incident-output output/incidents.latest.min2.jsonl \
+  --incident-min-seq 2
 ```
 
 注意：`analyze` 运行时至少需要指定 `--tactical-output` 或 `--incident-output` 之一。
@@ -158,11 +177,11 @@ threatgraph:
 ```yaml
 threatgraph:
   graph:
-    write_vertex_rows: false
+    write_vertex_rows: true
     include_edge_data: false
 ```
 
-- `write_vertex_rows=false`：只输出边行，顶点由 `vertex_id/adjacent_id` 隐式表示。
+- `write_vertex_rows=true`：保留顶点基础元信息（用于 incident root 与子图详情展示）。
 - `include_edge_data=false`：不在边上写入完整 Sysmon 字段，显著降低落盘体积。
 - 建议保留 Sigma 的 `ioa_tags`（边级）用于后续 `analyze` 的 IIP/TPG 构建与评分。
 
@@ -201,9 +220,30 @@ TTL ts + INTERVAL 14 DAY
 
 ```bash
 python tools/visualize_adjacency.py \
-  --input output/adjacency.jsonl \
+  --input output/adjacency.min.jsonl \
   --render simple-svg \
   --layout tree \
   --rankdir TB \
-  --proc-name TelegramInstaller.exe
+  --focus 'proc:host:{guid}' \
+  --start-ts '2026-02-27T15:43:02.066Z'
 ```
+
+## Incident 页面（Flask）
+
+```bash
+TG_PORT=5050 python3 tools/incident_viewer_flask.py
+```
+
+默认读取以下文件（可用环境变量覆盖）：
+
+- `output/incidents.latest.min2.jsonl`
+- `output/scored_tpg.latest.jsonl`
+- `output/adjacency.min.jsonl`
+
+访问：`http://127.0.0.1:5050/`
+
+页面支持：
+
+- Incident 详情（Root + IOA 顶点上下文）
+- TPG 规则/ATT&CK 聚合、TPG 顶点与序列边
+- 基于 root 的 IIP 子图 SVG（可强制刷新）
