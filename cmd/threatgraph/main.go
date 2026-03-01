@@ -17,15 +17,20 @@ import (
 	"threatgraph/config"
 	"threatgraph/internal/analyzer"
 	"threatgraph/internal/graph/adjacency"
+	inputclickhouse "threatgraph/internal/input/clickhouse"
 	inputredis "threatgraph/internal/input/redis"
 	"threatgraph/internal/logger"
+	"threatgraph/internal/output/adjacencyclickhouse"
 	"threatgraph/internal/output/adjacencyhttp"
 	"threatgraph/internal/output/adjacencyjson"
+	"threatgraph/internal/output/incidenthttp"
+	"threatgraph/internal/output/incidentjson"
 	"threatgraph/internal/output/ioaclickhouse"
 	"threatgraph/internal/output/ioajson"
 	"threatgraph/internal/output/rawjson"
 	"threatgraph/internal/pipeline"
 	"threatgraph/internal/rules"
+	"threatgraph/internal/service"
 )
 
 func findConfigFile(configArg string) string {
@@ -92,6 +97,17 @@ func applyDefaults(cfg *config.Config) {
 	}
 	if cfg.ThreatGraph.IOA.Output.ClickHouse.Table == "" {
 		cfg.ThreatGraph.IOA.Output.ClickHouse.Table = "ioa_events"
+	}
+
+	if cfg.ThreatGraph.Output.ClickHouse.Database == "" {
+		cfg.ThreatGraph.Output.ClickHouse.Database = "threatgraph"
+	}
+	if cfg.ThreatGraph.Output.ClickHouse.Table == "" {
+		cfg.ThreatGraph.Output.ClickHouse.Table = "adjacency"
+	}
+
+	if cfg.ThreatGraph.Serve.Analyze.ClickHouse.Database == "" {
+		cfg.ThreatGraph.Serve.Analyze.ClickHouse.Database = "threatgraph"
 	}
 
 	if cfg.ThreatGraph.ReplayCapture.File.Path == "" {
@@ -192,6 +208,22 @@ func runProducer(args []string) {
 		}
 		adjWriter = w
 		logger.Infof("Output mode: http (%s)", cfg.ThreatGraph.Output.HTTP.URL)
+	case "clickhouse":
+		w, err := adjacencyclickhouse.NewWriter(adjacencyclickhouse.Config{
+			URL:      cfg.ThreatGraph.Output.ClickHouse.URL,
+			Database: cfg.ThreatGraph.Output.ClickHouse.Database,
+			Table:    cfg.ThreatGraph.Output.ClickHouse.Table,
+			Username: cfg.ThreatGraph.Output.ClickHouse.Username,
+			Password: cfg.ThreatGraph.Output.ClickHouse.Password,
+			Timeout:  cfg.ThreatGraph.Output.ClickHouse.Timeout,
+			Headers:  cfg.ThreatGraph.Output.ClickHouse.Headers,
+		})
+		if err != nil {
+			logger.Errorf("Failed to create adjacency ClickHouse writer: %v", err)
+			log.Fatalf("Failed to create adjacency ClickHouse writer: %v", err)
+		}
+		adjWriter = w
+		logger.Infof("Output mode: clickhouse (%s/%s.%s)", cfg.ThreatGraph.Output.ClickHouse.URL, cfg.ThreatGraph.Output.ClickHouse.Database, cfg.ThreatGraph.Output.ClickHouse.Table)
 	default:
 		log.Fatalf("Unknown output mode: %s", cfg.ThreatGraph.Output.Mode)
 	}
@@ -351,6 +383,105 @@ func writeJSONLines[T any](path string, rows []T) error {
 	return nil
 }
 
+func runServe(args []string) {
+	configArg := ""
+	if len(args) > 0 {
+		configArg = args[0]
+	}
+
+	configPath := findConfigFile(configArg)
+
+	cfg, err := config.LoadConfig(configPath)
+	if err != nil {
+		log.Fatalf("Failed to load config: %v", err)
+	}
+	applyDefaults(cfg)
+
+	if err := logger.Init(cfg.ThreatGraph.Logging.Enabled, cfg.ThreatGraph.Logging.Level, cfg.ThreatGraph.Logging.File, cfg.ThreatGraph.Logging.Console); err != nil {
+		log.Fatalf("Failed to initialize logger: %v", err)
+	}
+
+	logger.Infof("ThreatGraph serve starting")
+	logger.Infof("Config loaded from: %s", configPath)
+
+	chCfg := cfg.ThreatGraph.Serve.Analyze.ClickHouse
+	reader, err := inputclickhouse.NewReader(inputclickhouse.Config{
+		URL:            chCfg.URL,
+		Database:       chCfg.Database,
+		AdjacencyTable: "adjacency",
+		IOATable:       "ioa_events",
+		Username:       chCfg.Username,
+		Password:       chCfg.Password,
+		Timeout:        chCfg.Timeout,
+	})
+	if err != nil {
+		logger.Errorf("Failed to create ClickHouse reader: %v", err)
+		log.Fatalf("Failed to create ClickHouse reader: %v", err)
+	}
+
+	var incidentOut pipeline.IncidentWriter
+	switch cfg.ThreatGraph.Serve.Incident.Mode {
+	case "file", "":
+		path := cfg.ThreatGraph.Serve.Incident.File.Path
+		if path == "" {
+			path = "output/incidents.jsonl"
+		}
+		w, err := incidentjson.NewWriter(path)
+		if err != nil {
+			logger.Errorf("Failed to create incident file writer: %v", err)
+			log.Fatalf("Failed to create incident file writer: %v", err)
+		}
+		incidentOut = w
+		logger.Infof("Incident output mode: file (%s)", path)
+	case "http":
+		w, err := incidenthttp.NewWriter(incidenthttp.Config{
+			URL:     cfg.ThreatGraph.Serve.Incident.HTTP.URL,
+			Timeout: cfg.ThreatGraph.Serve.Incident.HTTP.Timeout,
+			Headers: cfg.ThreatGraph.Serve.Incident.HTTP.Headers,
+		})
+		if err != nil {
+			logger.Errorf("Failed to create incident HTTP writer: %v", err)
+			log.Fatalf("Failed to create incident HTTP writer: %v", err)
+		}
+		incidentOut = w
+		logger.Infof("Incident output mode: http (%s)", cfg.ThreatGraph.Serve.Incident.HTTP.URL)
+	default:
+		log.Fatalf("Unknown incident output mode: %s", cfg.ThreatGraph.Serve.Incident.Mode)
+	}
+
+	svc := service.NewAnalyzeService(service.AnalyzeServiceConfig{
+		Reader:      reader,
+		IncidentOut: incidentOut,
+		Window:      cfg.ThreatGraph.Serve.Analyze.Window,
+		Interval:    cfg.ThreatGraph.Serve.Analyze.Interval,
+		MinSeq:      cfg.ThreatGraph.Serve.Analyze.MinSeq,
+		Workers:     cfg.ThreatGraph.Serve.Analyze.Workers,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		if err := svc.Run(ctx); err != nil {
+			logger.Errorf("AnalyzeService error: %v", err)
+		}
+	}()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	<-sigCh
+
+	logger.Infof("Shutting down serve")
+	cancel()
+	time.Sleep(1 * time.Second)
+
+	if err := incidentOut.Close(); err != nil {
+		logger.Errorf("Error closing incident writer: %v", err)
+	}
+
+	logger.Infof("ThreatGraph serve stopped")
+}
+
 func main() {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
@@ -359,6 +490,9 @@ func main() {
 			return
 		case "analyze":
 			os.Exit(runAnalyzer(os.Args[2:]))
+		case "serve":
+			runServe(os.Args[2:])
+			return
 		default:
 			// Backward-compatible mode: first arg is config path.
 			runProducer(os.Args[1:])

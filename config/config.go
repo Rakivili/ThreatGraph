@@ -22,6 +22,7 @@ type ThreatGraphConfig struct {
 	IOA           IOAConfig           `yaml:"ioa"`
 	ReplayCapture ReplayCaptureConfig `yaml:"replay_capture"`
 	Logging       LoggingConfig       `yaml:"logging"`
+	Serve         ServeConfig         `yaml:"serve"`
 }
 
 // GraphConfig controls raw adjacency graph emission.
@@ -59,9 +60,10 @@ type RedisConfig struct {
 
 // OutputConfig controls output.
 type OutputConfig struct {
-	Mode string           `yaml:"mode"`
-	File FileOutputConfig `yaml:"file"`
-	HTTP HTTPOutputConfig `yaml:"http"`
+	Mode       string                 `yaml:"mode"` // file|http|clickhouse
+	File       FileOutputConfig       `yaml:"file"`
+	HTTP       HTTPOutputConfig       `yaml:"http"`
+	ClickHouse ClickHouseOutputConfig `yaml:"clickhouse"`
 }
 
 // IOAConfig controls lightweight IOA event output for prefiltering.
@@ -114,6 +116,28 @@ type LoggingConfig struct {
 	Level   string `yaml:"level"`
 	File    string `yaml:"file"`
 	Console bool   `yaml:"console"`
+}
+
+// ServeConfig controls the near-real-time serve command.
+type ServeConfig struct {
+	Analyze  AnalyzeConfig        `yaml:"analyze"`
+	Incident IncidentOutputConfig `yaml:"incident"`
+}
+
+// AnalyzeConfig controls incremental analysis polling.
+type AnalyzeConfig struct {
+	Window     time.Duration          `yaml:"window"`
+	Interval   time.Duration          `yaml:"interval"`
+	MinSeq     int                    `yaml:"min_seq"`
+	Workers    int                    `yaml:"workers"`
+	ClickHouse ClickHouseOutputConfig `yaml:"clickhouse"`
+}
+
+// IncidentOutputConfig controls incident output sink.
+type IncidentOutputConfig struct {
+	Mode string           `yaml:"mode"` // file|http
+	File FileOutputConfig `yaml:"file"`
+	HTTP HTTPOutputConfig `yaml:"http"`
 }
 
 // LoadConfig reads and parses a YAML config file.
