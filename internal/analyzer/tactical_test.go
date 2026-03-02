@@ -103,6 +103,46 @@ func TestBuildIIPGraphsSkipsLaterAlertWhenEarlierAlertExistsInBackwardTrace(t *t
 	}
 }
 
+func TestBuildIIPGraphsAssignsByNearestReachableEarlierAlert(t *testing.T) {
+	t0 := time.Date(2026, 2, 1, 10, 0, 0, 0, time.UTC)
+	t1 := t0.Add(1 * time.Minute)
+	t2 := t0.Add(2 * time.Minute)
+
+	rows := []*models.AdjacencyRow{
+		{Timestamp: t0, RecordType: "edge", Type: "WriteFileEdge", VertexID: "proc:a", AdjacentID: "proc:x", Hostname: "host-a", RecordID: "1", IoaTags: []models.IoaTag{{Name: "A", Technique: "T1001"}}},
+		{Timestamp: t1, RecordType: "edge", Type: "WriteFileEdge", VertexID: "proc:b", AdjacentID: "proc:x", Hostname: "host-a", RecordID: "2", IoaTags: []models.IoaTag{{Name: "B", Technique: "T1002"}}},
+		{Timestamp: t2, RecordType: "edge", Type: "CreateProcessEdge", VertexID: "proc:x", AdjacentID: "proc:y", Hostname: "host-a", RecordID: "3", IoaTags: []models.IoaTag{{Name: "C", Technique: "T1003"}}},
+	}
+
+	graphs := BuildIIPGraphs(rows)
+	if len(graphs) != 2 {
+		t.Fatalf("expected 2 graphs, got %d", len(graphs))
+	}
+
+	alertsByRoot := map[string]map[string]struct{}{}
+	for _, g := range graphs {
+		set := make(map[string]struct{}, len(g.AlertEvents))
+		for _, ev := range g.AlertEvents {
+			set[ev.RecordID] = struct{}{}
+		}
+		alertsByRoot[g.Root] = set
+	}
+
+	if _, ok := alertsByRoot["proc:a"]; !ok {
+		t.Fatalf("expected graph rooted at proc:a")
+	}
+	if _, ok := alertsByRoot["proc:b"]; !ok {
+		t.Fatalf("expected graph rooted at proc:b")
+	}
+
+	if _, ok := alertsByRoot["proc:a"]["3"]; ok {
+		t.Fatalf("record 3 should not be assigned to older reachable alert root proc:a")
+	}
+	if _, ok := alertsByRoot["proc:b"]["3"]; !ok {
+		t.Fatalf("record 3 should be assigned to nearest reachable alert root proc:b")
+	}
+}
+
 func TestBuildTPGDeduplicatesTechniqueNamePerSourceAndOrdersByTime(t *testing.T) {
 	t0 := time.Date(2026, 2, 1, 10, 0, 0, 0, time.UTC)
 	t1 := t0.Add(1 * time.Minute)

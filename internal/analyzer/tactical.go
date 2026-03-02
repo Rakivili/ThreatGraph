@@ -98,9 +98,13 @@ func BuildIIPGraphs(rows []*models.AdjacencyRow) []IIPGraph {
 	}
 
 	idx := buildIIPIndex(rows, alerts)
-	seenAlert := make(map[string]struct{}, len(alerts))
-	backtraceCache := make(map[string]bool, len(alerts)*2)
+	assignment := assignIIPByNearestReachableAlert(idx, alerts)
 	out := make([]IIPGraph, 0, len(alerts))
+
+	alertByID := make(map[string]AlertEvent, len(alerts))
+	for _, alert := range alerts {
+		alertByID[alertIdentity(alert)] = alert
+	}
 
 	hosts := make([]string, 0, len(idx.alertsByHost))
 	for host := range idx.alertsByHost {
@@ -109,21 +113,40 @@ func BuildIIPGraphs(rows []*models.AdjacencyRow) []IIPGraph {
 	sort.Strings(hosts)
 
 	for _, host := range hosts {
+		seedIDs := make([]string, 0, len(idx.alertsByHost[host]))
 		for _, alert := range idx.alertsByHost[host] {
-			if _, ok := seenAlert[alertIdentity(alert)]; ok {
-				continue
+			id := alertIdentity(alert)
+			if assignment[id] == id {
+				seedIDs = append(seedIDs, id)
 			}
-			if backwardHasEarlierAlert(idx, alert, backtraceCache) {
+		}
+		sort.Slice(seedIDs, func(i, j int) bool {
+			ai := alertByID[seedIDs[i]]
+			aj := alertByID[seedIDs[j]]
+			return compareAlertEvents(ai, aj) < 0
+		})
+
+		for _, seedID := range seedIDs {
+			seed, ok := alertByID[seedID]
+			if !ok {
 				continue
 			}
 
-			iip := buildIIPGraph(idx, alert)
+			iip := buildIIPGraph(idx, seed)
 			if len(iip.AlertEvents) == 0 {
 				continue
 			}
+
+			filteredAlerts := make([]AlertEvent, 0, len(iip.AlertEvents))
 			for _, ev := range iip.AlertEvents {
-				seenAlert[alertIdentity(ev)] = struct{}{}
+				if assignment[alertIdentity(ev)] == seedID {
+					filteredAlerts = append(filteredAlerts, ev)
+				}
 			}
+			if len(filteredAlerts) == 0 {
+				continue
+			}
+			iip.AlertEvents = filteredAlerts
 			out = append(out, iip)
 		}
 	}
@@ -144,6 +167,93 @@ func BuildIIPGraphs(rows []*models.AdjacencyRow) []IIPGraph {
 	})
 
 	return out
+}
+
+func assignIIPByNearestReachableAlert(idx iipIndex, alerts []AlertEvent) map[string]string {
+	assignment := make(map[string]string, len(alerts))
+	alertByEdgeID := make(map[string]AlertEvent, len(alerts))
+
+	for _, ev := range alerts {
+		alertByEdgeID[edgeIdentityKey(ev.Row)] = ev
+	}
+
+	for _, hostAlerts := range idx.alertsByHost {
+		for _, alert := range hostAlerts {
+			curID := alertIdentity(alert)
+			prevID := nearestReachableEarlierAlertID(idx, alert, alertByEdgeID)
+			if prevID == "" {
+				assignment[curID] = curID
+				continue
+			}
+			if seedID := assignment[prevID]; seedID != "" {
+				assignment[curID] = seedID
+				continue
+			}
+			assignment[curID] = prevID
+		}
+	}
+
+	return assignment
+}
+
+func nearestReachableEarlierAlertID(idx iipIndex, seed AlertEvent, alertByEdgeID map[string]AlertEvent) string {
+	seedTK := buildTimeKey(seed.TS, seed.RecordID)
+	visited := make(map[string]struct{}, 128)
+	queue := []string{seed.From}
+	visited[seed.From] = struct{}{}
+
+	var bestID string
+	var bestTK timeKey
+	hasBest := false
+
+	for head := 0; head < len(queue); head++ {
+		cur := queue[head]
+		for _, incoming := range idx.reverse[seed.Host][cur] {
+			if !timeKeyLT(incoming.tk, seedTK) {
+				break
+			}
+
+			if isAlertEdge(incoming.row) {
+				candID := alertIdentityFromRow(incoming.row, alertByEdgeID)
+				if candID != "" {
+					if !hasBest || timeKeyLT(bestTK, incoming.tk) {
+						bestID = candID
+						bestTK = incoming.tk
+						hasBest = true
+					}
+				}
+			}
+
+			prev := incoming.row.VertexID
+			if _, ok := visited[prev]; ok {
+				continue
+			}
+			visited[prev] = struct{}{}
+			queue = append(queue, prev)
+		}
+	}
+
+	return bestID
+}
+
+func alertIdentityFromRow(row *models.AdjacencyRow, alertByEdgeID map[string]AlertEvent) string {
+	if row == nil {
+		return ""
+	}
+	if ev, ok := alertByEdgeID[edgeIdentityKey(row)]; ok {
+		return alertIdentity(ev)
+	}
+	tmp := AlertEvent{
+		Host:     hostForRow(row),
+		From:     row.VertexID,
+		To:       row.AdjacentID,
+		Type:     row.Type,
+		TS:       row.Timestamp,
+		RecordID: row.RecordID,
+		IoaTags:  row.IoaTags,
+		Row:      row,
+	}
+	return alertIdentity(tmp)
 }
 
 func buildIIPIndex(rows []*models.AdjacencyRow, alerts []AlertEvent) iipIndex {
