@@ -109,6 +109,12 @@ func applyDefaults(cfg *config.Config) {
 	if cfg.ThreatGraph.Serve.Analyze.ClickHouse.Database == "" {
 		cfg.ThreatGraph.Serve.Analyze.ClickHouse.Database = "threatgraph"
 	}
+	if cfg.ThreatGraph.Serve.Analyze.AdjacencyTable == "" {
+		cfg.ThreatGraph.Serve.Analyze.AdjacencyTable = "adjacency"
+	}
+	if cfg.ThreatGraph.Serve.Analyze.IOATable == "" {
+		cfg.ThreatGraph.Serve.Analyze.IOATable = "ioa_events"
+	}
 
 	if cfg.ThreatGraph.ReplayCapture.File.Path == "" {
 		cfg.ThreatGraph.ReplayCapture.File.Path = "output/raw_events.jsonl"
@@ -408,8 +414,8 @@ func runServe(args []string) {
 	reader, err := inputclickhouse.NewReader(inputclickhouse.Config{
 		URL:            chCfg.URL,
 		Database:       chCfg.Database,
-		AdjacencyTable: "adjacency",
-		IOATable:       "ioa_events",
+		AdjacencyTable: cfg.ThreatGraph.Serve.Analyze.AdjacencyTable,
+		IOATable:       cfg.ThreatGraph.Serve.Analyze.IOATable,
 		Username:       chCfg.Username,
 		Password:       chCfg.Password,
 		Timeout:        chCfg.Timeout,

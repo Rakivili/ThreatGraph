@@ -126,11 +126,13 @@ type ServeConfig struct {
 
 // AnalyzeConfig controls incremental analysis polling.
 type AnalyzeConfig struct {
-	Window     time.Duration          `yaml:"window"`
-	Interval   time.Duration          `yaml:"interval"`
-	MinSeq     int                    `yaml:"min_seq"`
-	Workers    int                    `yaml:"workers"`
-	ClickHouse ClickHouseOutputConfig `yaml:"clickhouse"`
+	Window         time.Duration          `yaml:"window"`
+	Interval       time.Duration          `yaml:"interval"`
+	MinSeq         int                    `yaml:"min_seq"`
+	Workers        int                    `yaml:"workers"`
+	AdjacencyTable string                 `yaml:"adjacency_table"`
+	IOATable       string                 `yaml:"ioa_table"`
+	ClickHouse     ClickHouseOutputConfig `yaml:"clickhouse"`
 }
 
 // IncidentOutputConfig controls incident output sink.

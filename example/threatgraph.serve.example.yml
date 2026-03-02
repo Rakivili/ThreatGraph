@@ -61,10 +61,12 @@ threatgraph:
 
   serve:
     analyze:
-      window: 15m       # lookback window for adjacency rows
+      window: 2h        # lookback window for adjacency rows (2-6h for Windows)
       interval: 30s     # polling interval
       min_seq: 2        # minimum kill-chain sequence length
       workers: 4        # concurrent host analysis goroutines
+      adjacency_table: adjacency   # ClickHouse adjacency table name
+      ioa_table: ioa_events        # ClickHouse IOA events table name
       clickhouse:
         url: http://127.0.0.1:8123
         database: threatgraph
