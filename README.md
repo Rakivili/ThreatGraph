@@ -66,28 +66,33 @@ Produce 压缩清单：`docs/produce_min_metadata_checklist.md`
 
 ### serve（准实时增量）
 
-`serve` 以常驻进程方式周期性轮询 ClickHouse，实现万级主机规模下的准实时增量分析：
+`serve` 以常驻进程方式做 IOA 微批处理（micro-batch），并按需拉取邻接窗口数据做验证分析：
 
 ```
 [produce --output=clickhouse]  常驻写入
     ├→ ClickHouse adjacency 表
     └→ ClickHouse ioa_events 表
 
-[serve]  每 30s 轮询
-    ① SELECT DISTINCT host FROM ioa_events WHERE ts > checkpoint
-    ② 对每个 host:
-       SELECT * FROM adjacency WHERE host = ? AND ts BETWEEN now()-window AND now()
-    ③ BuildIIPGraphs → BuildScoredTPGs → BuildIncidents（复用现有分析链路）
-    ④ 输出 incidents（JSONL 或 Webhook）
-    ⑤ 更新 checkpoint
+[serve]  每 interval 触发一次
+    ① 读取一批未处理 IOA（按 ts + record_id 游标）
+    ② 按 host 聚合本批 IOA，计算每个 host 的分析窗口
+    ③ SELECT * FROM adjacency WHERE host = ? AND ts BETWEEN host_min_ts-window AND now()
+    ④ BuildIIPGraphs → BuildScoredTPGs → BuildIncidents（复用现有分析链路）
+    ⑤ 若某个 IIP 子图覆盖了同批其他 IOA，则这些 IOA 直接视为已处理（不再重复计算）
+    ⑥ 将已覆盖 IOA 写入 ioa_processed（避免后续批次重复计算）
+    ⑦ 输出 incidents（JSONL 或 Webhook），推进游标
 ```
 
 关键参数（均可配置）：
 
-- `window`：邻接数据回看窗口，默认 15m
-- `interval`：轮询间隔，默认 30s
+- `window`：邻接数据回看窗口，默认 2h
+- `interval`：处理周期，默认 30s
+- `batch_size`：每批 IOA 数量，默认 1000
 - `workers`：并发主机分析数，默认 4
 - `min_seq`：最小 kill-chain 序列长度，默认 2
+- `adjacency_table` / `ioa_table` / `processed_table`：ClickHouse 表名
+
+同一 host 的同一批 IOA 会做“子图覆盖去重”：某个 IOA 已被先前计算出的 IIP 子图覆盖时，本批内后续不再重复作为 seed 计算。
 
 IIP 回溯的核心加速来自分析运行时从原始边派生的反向邻接索引。
 事实来源始终是 append-only 邻接表。
@@ -130,11 +135,11 @@ make
 # 进程 1：produce 写入 ClickHouse
 ./bin/threatgraph produce example/threatgraph.serve.example.yml
 
-# 进程 2：serve 轮询 ClickHouse 做增量分析
+# 进程 2：serve 按 IOA 微批增量分析
 ./bin/threatgraph serve example/threatgraph.serve.example.yml
 ```
 
-`serve` 启动后自动每 30s 轮询一次 IOA 表，发现活跃主机后拉取邻接数据、运行分析链路、输出 incident。
+`serve` 启动后按 interval 拉取一批未处理 IOA（`ts+record_id` 游标），按 host 聚合后拉邻接窗口并运行分析链路，最后写入 incident 与已处理标记。
 
 示例配置：
 
@@ -227,10 +232,14 @@ threatgraph:
 threatgraph:
   serve:
     analyze:
-      window: 15m
+      window: 2h
       interval: 30s
+      batch_size: 1000
       min_seq: 2
       workers: 4
+      adjacency_table: adjacency
+      ioa_table: ioa_events
+      processed_table: ioa_processed
       clickhouse:
         url: http://127.0.0.1:8123
         database: threatgraph
@@ -281,6 +290,23 @@ TTL ts + INTERVAL 14 DAY
 
 # 邻接表（serve 模式必需）
 clickhouse-client < migrations/001_adjacency.sql
+
+# 已处理 IOA 映射表（serve 去重与增量必需）
+clickhouse-client --query "
+CREATE TABLE IF NOT EXISTS threatgraph.ioa_processed (
+  ts DateTime64(3),
+  host String,
+  record_id String,
+  name String,
+  iip_root String,
+  iip_ts DateTime64(3),
+  processed_at DateTime64(3)
+)
+ENGINE = MergeTree
+PARTITION BY toDate(ts)
+ORDER BY (host, ts, name, record_id)
+TTL ts + INTERVAL 14 DAY
+"
 ```
 
 ## 可视化
