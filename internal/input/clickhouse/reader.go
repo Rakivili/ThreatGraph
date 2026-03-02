@@ -19,6 +19,7 @@ type Config struct {
 	Database       string
 	AdjacencyTable string
 	IOATable       string
+	ProcessedTable string
 	Username       string
 	Password       string
 	Timeout        time.Duration
@@ -26,12 +27,22 @@ type Config struct {
 
 // Reader queries ClickHouse for adjacency rows and IOA host lists.
 type Reader struct {
-	baseURL  string
-	database string
-	adjTable string
-	ioaTable string
-	headers  map[string]string
-	client   *http.Client
+	baseURL        string
+	database       string
+	adjTable       string
+	ioaTable       string
+	processedTable string
+	headers        map[string]string
+	client         *http.Client
+}
+
+type ProcessedIOA struct {
+	TS       time.Time
+	Host     string
+	RecordID string
+	Name     string
+	IIPRoot  string
+	IIPTS    time.Time
 }
 
 // NewReader creates a ClickHouse HTTP reader.
@@ -48,6 +59,9 @@ func NewReader(cfg Config) (*Reader, error) {
 	if cfg.IOATable == "" {
 		cfg.IOATable = "ioa_events"
 	}
+	if cfg.ProcessedTable == "" {
+		cfg.ProcessedTable = "ioa_processed"
+	}
 	timeout := cfg.Timeout
 	if timeout <= 0 {
 		timeout = 10 * time.Second
@@ -62,13 +76,107 @@ func NewReader(cfg Config) (*Reader, error) {
 	}
 
 	return &Reader{
-		baseURL:  strings.TrimRight(cfg.URL, "/"),
-		database: cfg.Database,
-		adjTable: cfg.AdjacencyTable,
-		ioaTable: cfg.IOATable,
-		headers:  headers,
-		client:   &http.Client{Timeout: timeout},
+		baseURL:        strings.TrimRight(cfg.URL, "/"),
+		database:       cfg.Database,
+		adjTable:       cfg.AdjacencyTable,
+		ioaTable:       cfg.IOATable,
+		processedTable: cfg.ProcessedTable,
+		headers:        headers,
+		client:         &http.Client{Timeout: timeout},
 	}, nil
+}
+
+func (r *Reader) ReadIOABatch(sinceTS time.Time, sinceRecordID string, limit int) ([]*models.IOAEvent, error) {
+	if limit <= 0 {
+		limit = 1000
+	}
+
+	q := fmt.Sprintf(
+		"SELECT ts, host, agent_id, record_id, event_id, edge_type, vertex_id, adjacent_id, name FROM %s.%s AS i "+
+			"WHERE (i.ts > '%s' OR (i.ts = '%s' AND i.record_id > '%s')) "+
+			"AND NOT EXISTS (SELECT 1 FROM %s.%s AS p WHERE p.host = i.host AND p.record_id = i.record_id AND p.name = i.name) "+
+			"ORDER BY i.ts, i.record_id LIMIT %d FORMAT JSONEachRow",
+		quoteIdent(r.database), quoteIdent(r.ioaTable),
+		sinceTS.UTC().Format("2006-01-02 15:04:05.000"),
+		sinceTS.UTC().Format("2006-01-02 15:04:05.000"),
+		escapeSQLString(sinceRecordID),
+		quoteIdent(r.database), quoteIdent(r.processedTable),
+		limit,
+	)
+
+	body, err := r.execQuery(q)
+	if err != nil {
+		return nil, fmt.Errorf("ReadIOABatch: %w", err)
+	}
+	defer body.Close()
+
+	rows := make([]*models.IOAEvent, 0, limit)
+	scanner := bufio.NewScanner(body)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var row struct {
+			TS         string `json:"ts"`
+			Host       string `json:"host"`
+			AgentID    string `json:"agent_id"`
+			RecordID   string `json:"record_id"`
+			EventID    int    `json:"event_id"`
+			EdgeType   string `json:"edge_type"`
+			VertexID   string `json:"vertex_id"`
+			AdjacentID string `json:"adjacent_id"`
+			Name       string `json:"name"`
+		}
+		if err := json.Unmarshal([]byte(line), &row); err != nil {
+			continue
+		}
+		ts, err := parseTimestamp(row.TS)
+		if err != nil {
+			continue
+		}
+		rows = append(rows, &models.IOAEvent{
+			Timestamp:  ts,
+			Host:       row.Host,
+			AgentID:    row.AgentID,
+			RecordID:   row.RecordID,
+			EventID:    row.EventID,
+			EdgeType:   row.EdgeType,
+			VertexID:   row.VertexID,
+			AdjacentID: row.AdjacentID,
+			Name:       row.Name,
+		})
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+func (r *Reader) MarkProcessedIOAs(items []ProcessedIOA) error {
+	if len(items) == 0 {
+		return nil
+	}
+
+	var body strings.Builder
+	enc := json.NewEncoder(&body)
+	for _, it := range items {
+		row := map[string]any{
+			"ts":           it.TS.UTC().Format("2006-01-02 15:04:05.000"),
+			"host":         it.Host,
+			"record_id":    it.RecordID,
+			"name":         it.Name,
+			"iip_root":     it.IIPRoot,
+			"iip_ts":       it.IIPTS.UTC().Format("2006-01-02 15:04:05.000"),
+			"processed_at": time.Now().UTC().Format("2006-01-02 15:04:05.000"),
+		}
+		if err := enc.Encode(row); err != nil {
+			return fmt.Errorf("MarkProcessedIOAs encode: %w", err)
+		}
+	}
+
+	q := fmt.Sprintf("INSERT INTO %s.%s FORMAT JSONEachRow", quoteIdent(r.database), quoteIdent(r.processedTable))
+	return r.execInsert(q, strings.NewReader(body.String()))
 }
 
 // ReadHosts returns distinct hosts with IOA events since the given timestamp.
@@ -160,6 +268,29 @@ func (r *Reader) execQuery(query string) (io.ReadCloser, error) {
 	return resp.Body, nil
 }
 
+func (r *Reader) execInsert(query string, body io.Reader) error {
+	endpoint := r.baseURL + "/?query=" + url.QueryEscape(query)
+	req, err := http.NewRequest(http.MethodPost, endpoint, body)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	for k, v := range r.headers {
+		req.Header.Set(k, v)
+	}
+
+	resp, err := r.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("clickhouse request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("clickhouse request failed with status %s: %s", resp.Status, strings.TrimSpace(string(errBody)))
+	}
+	return nil
+}
+
 // chAdjacencyRow is the ClickHouse wire representation of an adjacency row.
 type chAdjacencyRow struct {
 	TS         string `json:"ts"`
@@ -180,12 +311,9 @@ func parseAdjacencyRow(data []byte) (*models.AdjacencyRow, error) {
 		return nil, err
 	}
 
-	ts, err := time.Parse("2006-01-02 15:04:05.000", ch.TS)
+	ts, err := parseTimestamp(ch.TS)
 	if err != nil {
-		ts, err = time.Parse("2006-01-02T15:04:05.000Z", ch.TS)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse timestamp %q: %w", ch.TS, err)
-		}
+		return nil, fmt.Errorf("failed to parse timestamp %q: %w", ch.TS, err)
 	}
 
 	var tags []models.IoaTag
@@ -219,4 +347,20 @@ func quoteIdent(v string) string {
 
 func escapeSQLString(v string) string {
 	return strings.ReplaceAll(v, "'", "\\'")
+}
+
+func parseTimestamp(v string) (time.Time, error) {
+	ts, err := time.Parse("2006-01-02 15:04:05.000", v)
+	if err == nil {
+		return ts.UTC(), nil
+	}
+	ts, err = time.Parse("2006-01-02T15:04:05.000Z", v)
+	if err == nil {
+		return ts.UTC(), nil
+	}
+	ts, err = time.Parse(time.RFC3339Nano, v)
+	if err == nil {
+		return ts.UTC(), nil
+	}
+	return time.Time{}, err
 }
