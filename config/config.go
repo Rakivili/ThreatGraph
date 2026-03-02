@@ -128,10 +128,12 @@ type ServeConfig struct {
 type AnalyzeConfig struct {
 	Window         time.Duration          `yaml:"window"`
 	Interval       time.Duration          `yaml:"interval"`
+	BatchSize      int                    `yaml:"batch_size"`
 	MinSeq         int                    `yaml:"min_seq"`
 	Workers        int                    `yaml:"workers"`
 	AdjacencyTable string                 `yaml:"adjacency_table"`
 	IOATable       string                 `yaml:"ioa_table"`
+	ProcessedTable string                 `yaml:"processed_table"`
 	ClickHouse     ClickHouseOutputConfig `yaml:"clickhouse"`
 }
 

@@ -109,6 +109,18 @@ func applyDefaults(cfg *config.Config) {
 	if cfg.ThreatGraph.Serve.Analyze.ClickHouse.Database == "" {
 		cfg.ThreatGraph.Serve.Analyze.ClickHouse.Database = "threatgraph"
 	}
+	if cfg.ThreatGraph.Serve.Analyze.BatchSize <= 0 {
+		cfg.ThreatGraph.Serve.Analyze.BatchSize = 1000
+	}
+	if strings.TrimSpace(cfg.ThreatGraph.Serve.Analyze.AdjacencyTable) == "" {
+		cfg.ThreatGraph.Serve.Analyze.AdjacencyTable = "adjacency"
+	}
+	if strings.TrimSpace(cfg.ThreatGraph.Serve.Analyze.IOATable) == "" {
+		cfg.ThreatGraph.Serve.Analyze.IOATable = "ioa_events"
+	}
+	if strings.TrimSpace(cfg.ThreatGraph.Serve.Analyze.ProcessedTable) == "" {
+		cfg.ThreatGraph.Serve.Analyze.ProcessedTable = "ioa_processed"
+	}
 	if cfg.ThreatGraph.Serve.Analyze.AdjacencyTable == "" {
 		cfg.ThreatGraph.Serve.Analyze.AdjacencyTable = "adjacency"
 	}
@@ -416,6 +428,7 @@ func runServe(args []string) {
 		Database:       chCfg.Database,
 		AdjacencyTable: cfg.ThreatGraph.Serve.Analyze.AdjacencyTable,
 		IOATable:       cfg.ThreatGraph.Serve.Analyze.IOATable,
+		ProcessedTable: cfg.ThreatGraph.Serve.Analyze.ProcessedTable,
 		Username:       chCfg.Username,
 		Password:       chCfg.Password,
 		Timeout:        chCfg.Timeout,
@@ -460,6 +473,7 @@ func runServe(args []string) {
 		IncidentOut: incidentOut,
 		Window:      cfg.ThreatGraph.Serve.Analyze.Window,
 		Interval:    cfg.ThreatGraph.Serve.Analyze.Interval,
+		BatchSize:   cfg.ThreatGraph.Serve.Analyze.BatchSize,
 		MinSeq:      cfg.ThreatGraph.Serve.Analyze.MinSeq,
 		Workers:     cfg.ThreatGraph.Serve.Analyze.Workers,
 	})
