@@ -38,6 +38,13 @@ type IIPGraph struct {
 	Edges       []*models.AdjacencyRow `json:"edges"`
 }
 
+type IIPBuildStats struct {
+	AlertCount             int            `json:"alert_count"`
+	BackwardTraversalCount int            `json:"backward_traversal_count"`
+	ForwardTraversalCount  int            `json:"forward_traversal_count"`
+	SeedCountByHost        map[string]int `json:"seed_count_by_host,omitempty"`
+}
+
 // TPGSequenceEdge links two alert-event vertices in temporal order.
 type TPGSequenceEdge struct {
 	From int `json:"from"`
@@ -92,9 +99,17 @@ func CollectAlertEvents(rows []*models.AdjacencyRow) []AlertEvent {
 
 // BuildIIPGraphs builds IIP graphs from adjacency rows.
 func BuildIIPGraphs(rows []*models.AdjacencyRow) []IIPGraph {
+	out, _ := BuildIIPGraphsWithStats(rows)
+	return out
+}
+
+func BuildIIPGraphsWithStats(rows []*models.AdjacencyRow) ([]IIPGraph, IIPBuildStats) {
+	stats := IIPBuildStats{SeedCountByHost: make(map[string]int, 8)}
 	alerts := CollectAlertEvents(rows)
+	stats.AlertCount = len(alerts)
+	stats.BackwardTraversalCount = len(alerts)
 	if len(alerts) == 0 {
-		return nil
+		return nil, stats
 	}
 
 	idx := buildIIPIndex(rows, alerts)
@@ -147,6 +162,8 @@ func BuildIIPGraphs(rows []*models.AdjacencyRow) []IIPGraph {
 				continue
 			}
 			iip.AlertEvents = filteredAlerts
+			stats.ForwardTraversalCount++
+			stats.SeedCountByHost[host]++
 			out = append(out, iip)
 		}
 	}
@@ -166,7 +183,7 @@ func BuildIIPGraphs(rows []*models.AdjacencyRow) []IIPGraph {
 		return out[i].Root < out[j].Root
 	})
 
-	return out
+	return out, stats
 }
 
 func assignIIPByNearestReachableAlert(idx iipIndex, alerts []AlertEvent) map[string]string {

@@ -17,6 +17,8 @@ logsource:
   product: windows
   service: sysmon
 detection:
+  sel_same_parent:
+    SameParentDir: true
   sel_users:
     Image|startswith: 'C:\Users\'
     ImageLoaded|startswith: 'C:\Users\'
@@ -42,7 +44,7 @@ detection:
       - 'Untrusted'
       - 'Unsigned'
       - 'NotSigned'
-  condition: (sel_users or sel_programdata or sel_temp) and (sel_unsigned or sel_bad_sigstatus) and not filter_signed_os_modules
+  condition: sel_same_parent and (sel_users or sel_programdata or sel_temp) and (sel_unsigned or sel_bad_sigstatus) and not filter_signed_os_modules
 falsepositives:
   - Portable applications running from user profile directories
   - Legitimate software self-updaters extracting and loading temporary modules

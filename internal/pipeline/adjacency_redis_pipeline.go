@@ -216,6 +216,8 @@ func (p *RedisAdjacencyPipeline) workerLoop(in <-chan []byte, out chan<- redisWo
 			continue
 		}
 
+		enrichDerivedFields(event)
+
 		if p.engine != nil {
 			event.IoaTags = p.engine.Apply(event)
 		}
@@ -343,4 +345,55 @@ func rowNames(row *models.AdjacencyRow) []string {
 		out = append(out, n)
 	}
 	return out
+}
+
+func enrichDerivedFields(event *models.Event) {
+	if event == nil || event.EventID != 7 || event.Fields == nil {
+		return
+	}
+
+	image := eventFieldString(event.Fields, "Image")
+	imageLoaded := eventFieldString(event.Fields, "ImageLoaded")
+	if image == "" || imageLoaded == "" {
+		return
+	}
+
+	imageDir := parentPath(image)
+	imageLoadedDir := parentPath(imageLoaded)
+	if imageDir == "" || imageLoadedDir == "" {
+		return
+	}
+
+	event.Fields["ImageDir"] = imageDir
+	event.Fields["ImageLoadedDir"] = imageLoadedDir
+	event.Fields["SameParentDir"] = strings.EqualFold(imageDir, imageLoadedDir)
+}
+
+func eventFieldString(fields map[string]interface{}, key string) string {
+	if fields == nil {
+		return ""
+	}
+	v, ok := fields[key]
+	if !ok || v == nil {
+		return ""
+	}
+	s, ok := v.(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(s)
+}
+
+func parentPath(path string) string {
+	p := strings.TrimSpace(path)
+	if p == "" {
+		return ""
+	}
+	p = strings.ReplaceAll(p, "/", "\\")
+	p = strings.TrimRight(p, "\\")
+	idx := strings.LastIndex(p, "\\")
+	if idx <= 0 {
+		return ""
+	}
+	return p[:idx]
 }

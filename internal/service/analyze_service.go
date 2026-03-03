@@ -141,13 +141,14 @@ func (s *AnalyzeService) poll(ctx context.Context) {
 
 		wg.Add(1)
 		sem <- struct{}{}
-		go func(h string, from, to time.Time) {
+		batchIOA := hosts[host]
+		go func(h string, from, to time.Time, hostBatch []*models.IOAEvent) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			if err := s.analyzeHost(h, from, to); err != nil {
+			if err := s.analyzeHost(h, from, to, hostBatch); err != nil {
 				errCh <- err
 			}
-		}(host, since, until)
+		}(host, since, until, batchIOA)
 	}
 
 	wg.Wait()
@@ -164,7 +165,7 @@ func (s *AnalyzeService) poll(ctx context.Context) {
 	s.checkpointRID = strings.TrimSpace(last.RecordID)
 }
 
-func (s *AnalyzeService) analyzeHost(host string, since, until time.Time) error {
+func (s *AnalyzeService) analyzeHost(host string, since, until time.Time, batchIOA []*models.IOAEvent) error {
 	rows, err := s.reader.ReadRows(host, since, until)
 	if err != nil {
 		return fmt.Errorf("read rows host=%s: %w", host, err)
@@ -173,35 +174,87 @@ func (s *AnalyzeService) analyzeHost(host string, since, until time.Time) error 
 		return nil
 	}
 
-	iips := analyzer.BuildIIPGraphs(rows)
+	iips, iipStats := analyzer.BuildIIPGraphsWithStats(rows)
 	if len(iips) == 0 {
 		return nil
 	}
 
 	processed := processedFromIIPs(iips)
+	coveredBatchIOA, batchIOATotal, batchIIPRoots := countCoveredBatchIOA(host, batchIOA, processed)
 	if err := s.reader.MarkProcessedIOAs(processed); err != nil {
 		return fmt.Errorf("mark processed host=%s: %w", host, err)
 	}
 
 	scored := analyzer.BuildScoredTPGs(iips)
 	incidents := analyzer.BuildIncidents(scored, s.minSeq)
-	if len(incidents) == 0 {
-		return nil
+	novelCount := 0
+	if len(incidents) > 0 {
+		novel := s.filterNovel(incidents, until)
+		novelCount = len(novel)
+		if novelCount > 0 {
+			if err := s.incidentOut.WriteIncidents(novel); err != nil {
+				return fmt.Errorf("write incidents host=%s: %w", host, err)
+			}
+		}
 	}
 
-	// dedup: only emit new or materially changed incidents
-	novel := s.filterNovel(incidents, until)
-	if len(novel) == 0 {
-		return nil
+	coveragePct := 0.0
+	if batchIOATotal > 0 {
+		coveragePct = float64(coveredBatchIOA) * 100.0 / float64(batchIOATotal)
 	}
 
-	if err := s.incidentOut.WriteIncidents(novel); err != nil {
-		return fmt.Errorf("write incidents host=%s: %w", host, err)
-	}
-
-	logger.Infof("AnalyzeService: host=%s rows=%d iips=%d incidents=%d (new=%d)",
-		host, len(rows), len(iips), len(incidents), len(novel))
+	logger.Infof("AnalyzeService: host=%s rows=%d batch_ioa=%d covered_ioa=%d coverage=%.1f%% batch_iips=%d window_iips=%d alerts=%d backward=%d forward=%d incidents=%d (new=%d)",
+		host,
+		len(rows),
+		batchIOATotal,
+		coveredBatchIOA,
+		coveragePct,
+		batchIIPRoots,
+		len(iips),
+		iipStats.AlertCount,
+		iipStats.BackwardTraversalCount,
+		iipStats.ForwardTraversalCount,
+		len(incidents),
+		novelCount,
+	)
 	return nil
+}
+
+func countCoveredBatchIOA(host string, batch []*models.IOAEvent, processed []clickhouse.ProcessedIOA) (covered int, total int, batchIIPRoots int) {
+	if len(batch) == 0 {
+		return 0, 0, 0
+	}
+
+	procSet := make(map[string]struct{}, len(processed))
+	rootByKey := make(map[string]string, len(processed))
+	for _, p := range processed {
+		if strings.TrimSpace(p.Host) != host {
+			continue
+		}
+		k := p.Host + "|" + strings.TrimSpace(p.RecordID) + "|" + strings.TrimSpace(p.Name)
+		procSet[k] = struct{}{}
+		rootByKey[k] = strings.TrimSpace(p.IIPRoot)
+	}
+	roots := make(map[string]struct{}, 16)
+
+	for _, ev := range batch {
+		if ev == nil {
+			continue
+		}
+		if strings.TrimSpace(ev.Host) != host {
+			continue
+		}
+		total++
+		k := host + "|" + strings.TrimSpace(ev.RecordID) + "|" + strings.TrimSpace(ev.Name)
+		if _, ok := procSet[k]; ok {
+			covered++
+			if root := rootByKey[k]; root != "" {
+				roots[root] = struct{}{}
+			}
+		}
+	}
+
+	return covered, total, len(roots)
 }
 
 // filterNovel returns only incidents that are new or have a higher sequence
