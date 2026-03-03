@@ -48,11 +48,17 @@ Produce 压缩清单：`docs/produce_min_metadata_checklist.md`
 
 1) Redis list (`BLPOP`) 取消息
 2) 解析 Sysmon JSON（主要使用 `winlog.event_data`）
-3) Sigma 规则匹配，命中后给边打 IOA 标签
-4) 映射为邻接表行（append-only）
-5) 输出邻接表（JSONL / HTTP / ClickHouse）
-6) 可选输出 IOA 事件（JSONL 或 ClickHouse）
-7) 可选落盘原始消息（重放用）
+3) 对 ImageLoad（EventID=7）补充派生字段：`ImageDir`、`ImageLoadedDir`、`SameParentDir`
+4) Sigma 规则匹配，命中后给边打 IOA 标签
+5) 映射为邻接表行（append-only）
+6) 输出邻接表（JSONL / HTTP / ClickHouse）
+7) 可选输出 IOA 事件（JSONL 或 ClickHouse）
+8) 可选落盘原始消息（重放用）
+
+说明：
+
+- `SameParentDir` 由 `dirname(Image)` 与 `dirname(ImageLoaded)` 比较得到（忽略大小写）
+- 可在 Sigma 规则中直接使用 `SameParentDir: true` 约束同目录侧加载场景
 
 ### analyze（批量离线）
 
@@ -93,6 +99,16 @@ Produce 压缩清单：`docs/produce_min_metadata_checklist.md`
 - `adjacency_table` / `ioa_table` / `processed_table`：ClickHouse 表名
 
 同一 host 的同一批 IOA 会做“子图覆盖去重”：某个 IOA 已被先前计算出的 IIP 子图覆盖时，本批内后续不再重复作为 seed 计算。
+
+`serve` 日志中的关键批次指标：
+
+- `batch_ioa`：该 host 在当前微批内的 IOA 条数
+- `covered_ioa` / `coverage`：本批 IOA 被 IIP 覆盖并标记 processed 的条数/比例
+- `batch_iips`：本批 IOA 实际映射到的 IIP root 数
+- `window_iips`：当前分析窗口（`window`）内构建出的 IIP 总数（历史上下文）
+- `backward` / `forward`：IIP 构建阶段的回溯/前向遍历次数
+
+注意：`window_iips` 不是“本批次 IIP 数”，它通常会大于 `batch_ioa`。
 
 IIP 回溯的核心加速来自分析运行时从原始边派生的反向邻接索引。
 事实来源始终是 append-only 邻接表。
@@ -164,6 +180,9 @@ threatgraph:
 - timeframe 相关
 - 复杂条件（超出 `and/or/not + 简单标识符` 的表达式）
 - 非 windows/sysmon 数据源
+
+另外，当前引擎不支持在规则条件里做“字段对字段计算比较”（例如直接比较 `dirname(Image)` 与 `dirname(ImageLoaded)`）。
+这类需求应在 `produce` 阶段先补充派生字段，再由规则匹配该派生字段。
 
 ## Analyze 用法（批量离线）
 
