@@ -121,12 +121,6 @@ func applyDefaults(cfg *config.Config) {
 	if strings.TrimSpace(cfg.ThreatGraph.Serve.Analyze.ProcessedTable) == "" {
 		cfg.ThreatGraph.Serve.Analyze.ProcessedTable = "ioa_processed"
 	}
-	if cfg.ThreatGraph.Serve.Analyze.AdjacencyTable == "" {
-		cfg.ThreatGraph.Serve.Analyze.AdjacencyTable = "adjacency"
-	}
-	if cfg.ThreatGraph.Serve.Analyze.IOATable == "" {
-		cfg.ThreatGraph.Serve.Analyze.IOATable = "ioa_events"
-	}
 
 	if cfg.ThreatGraph.ReplayCapture.File.Path == "" {
 		cfg.ThreatGraph.ReplayCapture.File.Path = "output/raw_events.jsonl"
