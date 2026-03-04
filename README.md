@@ -59,6 +59,7 @@ Produce 压缩清单：`docs/produce_min_metadata_checklist.md`
 
 - `SameParentDir` 由 `dirname(Image)` 与 `dirname(ImageLoaded)` 比较得到（忽略大小写）
 - 可在 Sigma 规则中直接使用 `SameParentDir: true` 约束同目录侧加载场景
+- 终端标识默认以 `agent.id` 为准（仅当 `agent.id` 缺失时才回退到 hostname）
 
 ### analyze（批量离线）
 

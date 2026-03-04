@@ -275,10 +275,10 @@ func baseRow(event *models.Event, recordType, rowType, vertexID, adjacentID stri
 }
 
 func pickHost(event *models.Event) string {
-	if event.Hostname != "" {
-		return event.Hostname
+	if event.AgentID != "" {
+		return event.AgentID
 	}
-	return event.AgentID
+	return event.Hostname
 }
 
 func processIDFromEvent(event *models.Event) (string, bool) {
