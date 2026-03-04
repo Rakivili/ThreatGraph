@@ -306,3 +306,32 @@ func TestBuildIncidentsFiltersBySequenceLength(t *testing.T) {
 		t.Fatalf("expected high/critical severity, got %s", incidents[0].Severity)
 	}
 }
+
+func TestScoreTPGRepeatedSameRuleUsesLogDampening(t *testing.T) {
+	t0 := time.Date(2026, 2, 5, 10, 0, 0, 0, time.UTC)
+	tpg := TPG{
+		Host: "host-a",
+		Root: "proc:a",
+		Vertices: []AlertEvent{
+			{TS: t0, RecordID: "1", IoaTags: []models.IoaTag{{Name: "SameRule", Tactic: "execution", Severity: "high", Technique: "T1059"}}},
+			{TS: t0.Add(1 * time.Minute), RecordID: "2", IoaTags: []models.IoaTag{{Name: "SameRule", Tactic: "execution", Severity: "high", Technique: "T1059"}}},
+			{TS: t0.Add(2 * time.Minute), RecordID: "3", IoaTags: []models.IoaTag{{Name: "SameRule", Tactic: "execution", Severity: "high", Technique: "T1059"}}},
+		},
+		SequenceEdges: []TPGSequenceEdge{{From: 0, To: 1}, {From: 1, To: 2}},
+	}
+
+	score := ScoreTPG(tpg)
+	if score.SequenceLength != 3 {
+		t.Fatalf("expected sequence length 3, got %d", score.SequenceLength)
+	}
+	if score.RiskProduct <= 0 {
+		t.Fatalf("expected positive risk product, got %f", score.RiskProduct)
+	}
+
+	if score.RiskProduct >= 200 {
+		t.Fatalf("expected dampened risk product (not exponential), got %f", score.RiskProduct)
+	}
+	if score.RiskProduct <= 12 {
+		t.Fatalf("expected repeated rule to still increase score over single hit, got %f", score.RiskProduct)
+	}
+}

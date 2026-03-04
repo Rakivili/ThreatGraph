@@ -161,11 +161,25 @@ func ScoreTPG(tpg TPG) TacticalScore {
 	riskProduct := 1.0
 	riskSum := 0.0
 	recordIDs := make([]string, 0, len(path))
+	ruleHitCount := make(map[string]int, len(path))
+	ruleBaseScore := make(map[string]float64, len(path))
 	for _, idx := range path {
 		usedTactics[ranks[idx]] = struct{}{}
-		riskProduct *= baseScore[idx]
+		ruleKey := alertRuleKey(tpg.Vertices[idx])
+		ruleHitCount[ruleKey]++
+		if baseScore[idx] > ruleBaseScore[ruleKey] {
+			ruleBaseScore[ruleKey] = baseScore[idx]
+		}
 		riskSum += baseScore[idx]
 		recordIDs = append(recordIDs, strings.TrimSpace(tpg.Vertices[idx].RecordID))
+	}
+	for ruleKey, hitCount := range ruleHitCount {
+		base := max(ruleBaseScore[ruleKey], 1e-9)
+		contribution := base
+		if hitCount > 1 {
+			contribution = base * (1 + math.Log(float64(hitCount)))
+		}
+		riskProduct *= max(contribution, 1e-9)
 	}
 
 	return TacticalScore{
@@ -235,6 +249,19 @@ func singleAlertScore(tag models.IoaTag) float64 {
 		likelihood = max(1, sev-1)
 	}
 	return (2 * sev) + likelihood
+}
+
+func alertRuleKey(ev AlertEvent) string {
+	for _, tag := range ev.IoaTags {
+		name := strings.ToLower(strings.TrimSpace(tag.Name))
+		if name != "" {
+			return name
+		}
+	}
+	if rid := strings.TrimSpace(ev.RecordID); rid != "" {
+		return "record:" + rid
+	}
+	return "unknown"
 }
 
 func max(a, b float64) float64 {
