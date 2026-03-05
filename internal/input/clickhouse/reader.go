@@ -97,8 +97,8 @@ func (r *Reader) ReadIOABatch(sinceTS time.Time, sinceRecordID string, limit int
 			"AND NOT EXISTS (SELECT 1 FROM %s.%s AS p WHERE p.host = i.host AND p.record_id = i.record_id AND p.name = i.name) "+
 			"ORDER BY i.ts, i.record_id LIMIT %d FORMAT JSONEachRow",
 		quoteIdent(r.database), quoteIdent(r.ioaTable),
-		sinceTS.UTC().Format("2006-01-02 15:04:05.000"),
-		sinceTS.UTC().Format("2006-01-02 15:04:05.000"),
+		sinceTS.In(time.Local).Format("2006-01-02 15:04:05.000"),
+		sinceTS.In(time.Local).Format("2006-01-02 15:04:05.000"),
 		escapeSQLString(sinceRecordID),
 		quoteIdent(r.database), quoteIdent(r.processedTable),
 		limit,
@@ -162,13 +162,13 @@ func (r *Reader) MarkProcessedIOAs(items []ProcessedIOA) error {
 	enc := json.NewEncoder(&body)
 	for _, it := range items {
 		row := map[string]any{
-			"ts":           it.TS.UTC().Format("2006-01-02 15:04:05.000"),
+			"ts":           it.TS.In(time.Local).Format("2006-01-02 15:04:05.000"),
 			"host":         it.Host,
 			"record_id":    it.RecordID,
 			"name":         it.Name,
 			"iip_root":     it.IIPRoot,
-			"iip_ts":       it.IIPTS.UTC().Format("2006-01-02 15:04:05.000"),
-			"processed_at": time.Now().UTC().Format("2006-01-02 15:04:05.000"),
+			"iip_ts":       it.IIPTS.In(time.Local).Format("2006-01-02 15:04:05.000"),
+			"processed_at": time.Now().In(time.Local).Format("2006-01-02 15:04:05.000"),
 		}
 		if err := enc.Encode(row); err != nil {
 			return fmt.Errorf("MarkProcessedIOAs encode: %w", err)
@@ -184,7 +184,7 @@ func (r *Reader) ReadHosts(since time.Time) ([]string, error) {
 	q := fmt.Sprintf(
 		"SELECT DISTINCT host FROM %s.%s WHERE ts > '%s' FORMAT JSONEachRow",
 		quoteIdent(r.database), quoteIdent(r.ioaTable),
-		since.UTC().Format("2006-01-02 15:04:05.000"),
+		since.In(time.Local).Format("2006-01-02 15:04:05.000"),
 	)
 
 	body, err := r.execQuery(q)
@@ -219,8 +219,8 @@ func (r *Reader) ReadRows(host string, since, until time.Time) ([]*models.Adjace
 		"SELECT * FROM %s.%s WHERE host = '%s' AND ts BETWEEN '%s' AND '%s' ORDER BY ts, record_id FORMAT JSONEachRow",
 		quoteIdent(r.database), quoteIdent(r.adjTable),
 		escapeSQLString(host),
-		since.UTC().Format("2006-01-02 15:04:05.000"),
-		until.UTC().Format("2006-01-02 15:04:05.000"),
+		since.In(time.Local).Format("2006-01-02 15:04:05.000"),
+		until.In(time.Local).Format("2006-01-02 15:04:05.000"),
 	)
 
 	body, err := r.execQuery(q)
@@ -324,7 +324,7 @@ func parseAdjacencyRow(data []byte) (*models.AdjacencyRow, error) {
 	}
 
 	return &models.AdjacencyRow{
-		Timestamp:  ts.UTC(),
+		Timestamp:  ts,
 		RecordType: ch.RecordType,
 		Type:       ch.Type,
 		VertexID:   ch.VertexID,
@@ -350,17 +350,17 @@ func escapeSQLString(v string) string {
 }
 
 func parseTimestamp(v string) (time.Time, error) {
-	ts, err := time.Parse("2006-01-02 15:04:05.000", v)
+	ts, err := time.ParseInLocation("2006-01-02 15:04:05.000", v, time.Local)
 	if err == nil {
-		return ts.UTC(), nil
+		return ts, nil
 	}
 	ts, err = time.Parse("2006-01-02T15:04:05.000Z", v)
 	if err == nil {
-		return ts.UTC(), nil
+		return ts.In(time.Local), nil
 	}
 	ts, err = time.Parse(time.RFC3339Nano, v)
 	if err == nil {
-		return ts.UTC(), nil
+		return ts.In(time.Local), nil
 	}
 	return time.Time{}, err
 }

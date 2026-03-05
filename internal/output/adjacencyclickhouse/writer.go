@@ -100,7 +100,7 @@ func (w *Writer) WriteRows(rows []*models.AdjacencyRow) error {
 			tagsJSON = string(b)
 		}
 		ir := insertRow{
-			TS:         row.Timestamp.UTC().Format("2006-01-02 15:04:05.000"),
+			TS:         row.Timestamp.In(time.Local).Format("2006-01-02 15:04:05.000"),
 			RecordType: row.RecordType,
 			Type:       row.Type,
 			VertexID:   row.VertexID,

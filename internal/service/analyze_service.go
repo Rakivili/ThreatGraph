@@ -2,7 +2,9 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -27,6 +29,12 @@ type AnalyzeService struct {
 	checkpoint    time.Time
 	checkpointRID string
 	batchSize     int
+	scoredOutPath string
+	compatIncPath string
+
+	snapshotsMu      sync.Mutex
+	scoredByHostRoot map[string]analyzer.ScoredTPG
+	incByHostRoot    map[string]analyzer.Incident
 
 	// dedup: key = "host|root", value = digest of last emitted incident
 	mu   sync.Mutex
@@ -43,13 +51,15 @@ type incidentDigest struct {
 
 // AnalyzeServiceConfig configures the analyze service.
 type AnalyzeServiceConfig struct {
-	Reader      *clickhouse.Reader
-	IncidentOut pipeline.IncidentWriter
-	Window      time.Duration
-	Interval    time.Duration
-	BatchSize   int
-	MinSeq      int
-	Workers     int
+	Reader             *clickhouse.Reader
+	IncidentOut        pipeline.IncidentWriter
+	Window             time.Duration
+	Interval           time.Duration
+	BatchSize          int
+	MinSeq             int
+	Workers            int
+	ScoredOutPath      string
+	CompatIncidentPath string
 }
 
 // NewAnalyzeService creates a new analyze service.
@@ -75,16 +85,20 @@ func NewAnalyzeService(cfg AnalyzeServiceConfig) *AnalyzeService {
 		batchSize = 1000
 	}
 	return &AnalyzeService{
-		reader:        cfg.Reader,
-		incidentOut:   cfg.IncidentOut,
-		window:        window,
-		interval:      interval,
-		minSeq:        minSeq,
-		workers:       workers,
-		checkpoint:    time.Now().UTC().Add(-window),
-		checkpointRID: "",
-		batchSize:     batchSize,
-		seen:          make(map[string]incidentDigest),
+		reader:           cfg.Reader,
+		incidentOut:      cfg.IncidentOut,
+		window:           window,
+		interval:         interval,
+		minSeq:           minSeq,
+		workers:          workers,
+		checkpoint:       time.Now().Add(-window),
+		checkpointRID:    "",
+		batchSize:        batchSize,
+		scoredOutPath:    strings.TrimSpace(cfg.ScoredOutPath),
+		compatIncPath:    strings.TrimSpace(cfg.CompatIncidentPath),
+		seen:             make(map[string]incidentDigest),
+		scoredByHostRoot: make(map[string]analyzer.ScoredTPG, 64),
+		incByHostRoot:    make(map[string]analyzer.Incident, 64),
 	}
 }
 
@@ -108,7 +122,7 @@ func (s *AnalyzeService) Run(ctx context.Context) error {
 }
 
 func (s *AnalyzeService) poll(ctx context.Context) {
-	now := time.Now().UTC()
+	now := time.Now()
 	batch, err := s.reader.ReadIOABatch(s.checkpoint, s.checkpointRID, s.batchSize)
 	if err != nil {
 		logger.Errorf("AnalyzeService: failed to read ioa batch: %v", err)
@@ -161,7 +175,7 @@ func (s *AnalyzeService) poll(ctx context.Context) {
 	}
 
 	last := batch[len(batch)-1]
-	s.checkpoint = last.Timestamp.UTC()
+	s.checkpoint = last.Timestamp
 	s.checkpointRID = strings.TrimSpace(last.RecordID)
 }
 
@@ -185,8 +199,14 @@ func (s *AnalyzeService) analyzeHost(host string, since, until time.Time, batchI
 		return fmt.Errorf("mark processed host=%s: %w", host, err)
 	}
 
-	scored := analyzer.BuildScoredTPGs(iips)
+	scored := consolidateScoredByRoot(analyzer.BuildScoredTPGs(iips))
 	incidents := analyzer.BuildIncidents(scored, s.minSeq)
+	s.refreshHostScored(host, scored)
+	s.refreshHostIncidents(host, incidents)
+	if err := s.writeCompatibilityOutputs(); err != nil {
+		logger.Errorf("AnalyzeService: failed to write compatibility outputs host=%s: %v", host, err)
+	}
+
 	novelCount := 0
 	if len(incidents) > 0 {
 		novel := s.filterNovel(incidents, until)
@@ -364,4 +384,156 @@ func processedFromIIPs(iips []analyzer.IIPGraph) []clickhouse.ProcessedIOA {
 	})
 
 	return out
+}
+
+func (s *AnalyzeService) refreshHostScored(host string, scored []analyzer.ScoredTPG) {
+	s.snapshotsMu.Lock()
+	defer s.snapshotsMu.Unlock()
+	for k := range s.scoredByHostRoot {
+		if strings.HasPrefix(k, host+"|") {
+			delete(s.scoredByHostRoot, k)
+		}
+	}
+	for _, st := range scored {
+		if strings.TrimSpace(st.Host) == "" || strings.TrimSpace(st.Root) == "" {
+			continue
+		}
+		k := st.Host + "|" + st.Root
+		s.scoredByHostRoot[k] = st
+	}
+}
+
+func (s *AnalyzeService) refreshHostIncidents(host string, incidents []analyzer.Incident) {
+	s.snapshotsMu.Lock()
+	defer s.snapshotsMu.Unlock()
+	for k := range s.incByHostRoot {
+		if strings.HasPrefix(k, host+"|") {
+			delete(s.incByHostRoot, k)
+		}
+	}
+	for _, inc := range incidents {
+		if strings.TrimSpace(inc.Host) == "" || strings.TrimSpace(inc.Root) == "" {
+			continue
+		}
+		k := inc.Host + "|" + inc.Root
+		s.incByHostRoot[k] = inc
+	}
+}
+
+func (s *AnalyzeService) writeCompatibilityOutputs() error {
+	if s.scoredOutPath == "" && s.compatIncPath == "" {
+		return nil
+	}
+
+	s.snapshotsMu.Lock()
+	scored := make([]analyzer.ScoredTPG, 0, len(s.scoredByHostRoot))
+	for _, v := range s.scoredByHostRoot {
+		scored = append(scored, v)
+	}
+	incidents := make([]analyzer.Incident, 0, len(s.incByHostRoot))
+	for _, v := range s.incByHostRoot {
+		incidents = append(incidents, v)
+	}
+	s.snapshotsMu.Unlock()
+
+	sort.Slice(scored, func(i, j int) bool {
+		if scored[i].Score.SequenceLength != scored[j].Score.SequenceLength {
+			return scored[i].Score.SequenceLength > scored[j].Score.SequenceLength
+		}
+		if scored[i].Score.RiskProduct != scored[j].Score.RiskProduct {
+			return scored[i].Score.RiskProduct > scored[j].Score.RiskProduct
+		}
+		if scored[i].Host != scored[j].Host {
+			return scored[i].Host < scored[j].Host
+		}
+		return scored[i].Root < scored[j].Root
+	})
+
+	sort.Slice(incidents, func(i, j int) bool {
+		if incidents[i].RiskProduct != incidents[j].RiskProduct {
+			return incidents[i].RiskProduct > incidents[j].RiskProduct
+		}
+		if incidents[i].SequenceLength != incidents[j].SequenceLength {
+			return incidents[i].SequenceLength > incidents[j].SequenceLength
+		}
+		if incidents[i].Host != incidents[j].Host {
+			return incidents[i].Host < incidents[j].Host
+		}
+		return incidents[i].Root < incidents[j].Root
+	})
+
+	if s.scoredOutPath != "" {
+		if err := writeJSONLSnapshot(s.scoredOutPath, scored); err != nil {
+			return err
+		}
+	}
+	if s.compatIncPath != "" {
+		if err := writeJSONLSnapshot(s.compatIncPath, incidents); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func writeJSONLSnapshot[T any](path string, items []T) error {
+	tmpPath := path + ".tmp"
+	f, err := os.Create(tmpPath)
+	if err != nil {
+		return err
+	}
+	enc := json.NewEncoder(f)
+	for _, item := range items {
+		if err := enc.Encode(item); err != nil {
+			_ = f.Close()
+			return err
+		}
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
+}
+
+func consolidateScoredByRoot(scored []analyzer.ScoredTPG) []analyzer.ScoredTPG {
+	if len(scored) <= 1 {
+		return scored
+	}
+
+	best := make(map[string]analyzer.ScoredTPG, len(scored))
+	for _, cur := range scored {
+		k := strings.TrimSpace(cur.Host) + "|" + strings.TrimSpace(cur.Root)
+		if prev, ok := best[k]; ok {
+			if isBetterScored(cur, prev) {
+				best[k] = cur
+			}
+			continue
+		}
+		best[k] = cur
+	}
+
+	out := make([]analyzer.ScoredTPG, 0, len(best))
+	for _, v := range best {
+		out = append(out, v)
+	}
+
+	sort.Slice(out, func(i, j int) bool {
+		return isBetterScored(out[i], out[j])
+	})
+	return out
+}
+
+func isBetterScored(a, b analyzer.ScoredTPG) bool {
+	if a.Score.SequenceLength != b.Score.SequenceLength {
+		return a.Score.SequenceLength > b.Score.SequenceLength
+	}
+	if a.Score.RiskProduct != b.Score.RiskProduct {
+		return a.Score.RiskProduct > b.Score.RiskProduct
+	}
+	if a.Score.TacticCoverage != b.Score.TacticCoverage {
+		return a.Score.TacticCoverage > b.Score.TacticCoverage
+	}
+	if a.Host != b.Host {
+		return a.Host < b.Host
+	}
+	return a.Root < b.Root
 }

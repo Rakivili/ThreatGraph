@@ -158,6 +158,13 @@ make
 
 `serve` 启动后按 interval 拉取一批未处理 IOA（`ts+record_id` 游标），按 host 聚合后拉邻接窗口并运行分析链路，最后写入 incident 与已处理标记。
 
+当 `serve.incident.mode=file` 时，会在同目录额外维护两份 analyze 兼容快照：
+
+- `incidents.latest.min2.jsonl`（当前增量状态下的 incident 快照）
+- `scored_tpg.latest.jsonl`（当前增量状态下的 scored TPG 快照）
+
+这样 Flask 等消费端可以直接复用 analyze 时代的文件名，不需要再额外跑一次离线 analyze。
+
 示例配置：
 
 - `example/threatgraph.example.yml` — 纯 JSONL 模式
@@ -206,6 +213,26 @@ threatgraph:
 - `--incident-min-seq`：incident 最小序列长度阈值（默认 `2`）
 
 对于万级主机或需要持续运行的场景，推荐使用 `serve` 子命令替代手动循环调用 `analyze`。
+
+## Incident 深度提取（TPG 详情）
+
+`serve` 输出的 incident 是 SOC 归并摘要，不包含完整 TPG 顶点/时间线。可使用内置命令按 incident 反查邻接窗口并重建 IIP/TPG：
+
+```bash
+./bin/threatgraph explain-incident \
+  --config threatgraph.ubuntu.yml \
+  --incident-file output/incidents.serve.jsonl \
+  --index -1 \
+  --out output/incident_explain.latest.json
+```
+
+输出文件包含：
+
+- `incident`：原始 incident 摘要
+- `iip`：匹配到的 IIP 子图（`alert_events` + `edges`）
+- `tpg`：重建后的 TPG（`vertices` + `sequence_edges`）
+- `score`：当前评分结果（sequence/risk/tactic coverage）
+- `timeline`：按时间展开的 IOA 顶点序列（含规则名、tactic、technique）
 
 ## 关键配置片段
 

@@ -230,10 +230,11 @@ func (m *Mapper) mapRemoteThread(event *models.Event) []*models.AdjacencyRow {
 }
 
 func (m *Mapper) mapProcessAccess(event *models.Event) []*models.AdjacencyRow {
+	host := pickHost(event)
 	sourceGUID := event.Field("SourceProcessGuid")
 	targetGUID := event.Field("TargetProcessGuid")
-	sourceID := processVertexID(pickHost(event), sourceGUID)
-	targetID := processVertexID(pickHost(event), targetGUID)
+	sourceID := processVertexID(host, sourceGUID)
+	targetID := processVertexID(host, targetGUID)
 	if sourceID == "" || targetID == "" {
 		return nil
 	}
@@ -242,8 +243,24 @@ func (m *Mapper) mapProcessAccess(event *models.Event) []*models.AdjacencyRow {
 		rows = append(rows, vertexRow("ProcessVertex", sourceID, event, processVertexDataFromFields(event, "SourceImage", "SourceCommandLine", "")))
 		rows = append(rows, vertexRow("ProcessVertex", targetID, event, processVertexDataFromFields(event, "TargetImage", "TargetCommandLine", "")))
 	}
-	rows = append(rows, edgeRow("ProcessAccessEdge", sourceID, targetID, event, nil, m.includeEdgeData))
+	rows = append(rows, edgeRow("ProcessAccessEdge", sourceID, targetID, event, processAccessImageData(event), m.includeEdgeData))
 	return rows
+}
+
+func processAccessImageData(event *models.Event) map[string]interface{} {
+	sourceImage := strings.TrimSpace(event.Field("SourceImage"))
+	targetImage := strings.TrimSpace(event.Field("TargetImage"))
+	if sourceImage == "" && targetImage == "" {
+		return nil
+	}
+	data := map[string]interface{}{}
+	if sourceImage != "" {
+		data["source_image"] = sourceImage
+	}
+	if targetImage != "" {
+		data["target_image"] = targetImage
+	}
+	return data
 }
 
 func vertexRow(rowType, vertexID string, event *models.Event, data map[string]interface{}) *models.AdjacencyRow {

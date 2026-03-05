@@ -312,8 +312,35 @@ def parse_ts(row):
         try:
             return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
         except ValueError:
-            return None
+            pass
+        for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+            try:
+                return datetime.strptime(ts, fmt).timestamp()
+            except ValueError:
+                continue
+        return None
     return None
+
+
+def normalize_ioa_tags(row):
+    if not isinstance(row, dict):
+        return row
+    tags = row.get("ioa_tags")
+    if isinstance(tags, list):
+        return row
+    if isinstance(tags, str):
+        raw = tags.strip()
+        if not raw:
+            row["ioa_tags"] = []
+            return row
+        try:
+            decoded = json.loads(raw)
+            row["ioa_tags"] = decoded if isinstance(decoded, list) else []
+        except Exception:
+            row["ioa_tags"] = []
+        return row
+    row["ioa_tags"] = []
+    return row
 
 
 def edge_time_key(row):
@@ -506,6 +533,7 @@ def detect_input_kind(path):
                 row = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            row = normalize_ioa_tags(row)
             if isinstance(row, dict):
                 if row.get("record_type") in ("vertex", "edge"):
                     return "adjacency"
@@ -569,6 +597,7 @@ def load_finding_roots(path, finding_index):
                 row = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            row = normalize_ioa_tags(row)
             if not isinstance(row, dict) or not isinstance(row.get("sequence"), list):
                 continue
             finding_idx += 1
@@ -652,12 +681,13 @@ def load_rows_from_adjacency(path, match, limit, edge_types, allowed_kinds):
                 row = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            row = normalize_ioa_tags(row)
             if row.get("record_type") == "vertex" and row.get("vertex_id"):
                 meta[row["vertex_id"]] = row
 
     nodes = set()
-    edges = []
-    edge_keys = set()
+    edge_order = []
+    edge_by_key = {}
 
     with open(path, "r", encoding="utf-8") as handle:
         for line in handle:
@@ -668,6 +698,7 @@ def load_rows_from_adjacency(path, match, limit, edge_types, allowed_kinds):
                 row = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            row = normalize_ioa_tags(row)
 
             record_type = row.get("record_type")
             vertex_id = row.get("vertex_id")
@@ -692,18 +723,22 @@ def load_rows_from_adjacency(path, match, limit, edge_types, allowed_kinds):
             if should_skip_file_edge(vertex_id, adjacent_id, meta):
                 continue
 
-            edge_key = (vertex_id, adjacent_id, row.get("type"))
-            if edge_key in edge_keys:
-                continue
-            edge_keys.add(edge_key)
+            key = (vertex_id, adjacent_id, row.get("type"))
+            existing = edge_by_key.get(key)
+            if existing is None:
+                edge_order.append(key)
+                edge_by_key[key] = row
+            else:
+                if edge_has_ioa(row) and not edge_has_ioa(existing):
+                    edge_by_key[key] = row
 
             nodes.add(vertex_id)
             nodes.add(adjacent_id)
-            edges.append(row)
 
-            if limit and len(edges) >= limit:
+            if limit and len(edge_order) >= limit:
                 break
 
+    edges = [edge_by_key[k] for k in edge_order]
     return nodes, edges, meta
 
 

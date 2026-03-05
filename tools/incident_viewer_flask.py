@@ -7,7 +7,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from flask import Flask, jsonify, render_template_string, send_file
+from flask import Flask, Response, jsonify, render_template_string, send_file
 
 
 APP_HTML = """
@@ -311,7 +311,93 @@ def create_app() -> Flask:
     svg_cache_dir.mkdir(parents=True, exist_ok=True)
     json_cache_dir.mkdir(parents=True, exist_ok=True)
 
+    def _svg_fallback(message: str) -> Response:
+        safe = (message or "SVG unavailable").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        body = (
+            "<svg xmlns='http://www.w3.org/2000/svg' width='960' height='120' viewBox='0 0 960 120'>"
+            "<rect x='0' y='0' width='960' height='120' fill='#0b1220'/>"
+            "<text x='20' y='68' fill='#e2e8f0' font-size='20' font-family='Arial'>"
+            + safe
+            + "</text></svg>"
+        )
+        return Response(body, mimetype="image/svg+xml")
+
+    def _svg_from_tpg(target: dict[str, Any]) -> Response:
+        tpg = (target or {}).get("tpg") if isinstance(target, dict) else None
+        verts = (tpg or {}).get("vertices") if isinstance(tpg, dict) else None
+        if not isinstance(verts, list) or not verts:
+            return _svg_fallback("No TPG vertices")
+
+        width = 1200
+        step_x = 330
+        box_w = 280
+        box_h = 84
+        start_x = 30
+        y = 72
+        height = 180
+        for i in range(len(verts)):
+            need = start_x + i * step_x + box_w + 40
+            if need > width:
+                width = need
+
+        parts = [
+            f"<svg xmlns='http://www.w3.org/2000/svg' width='{width}' height='{height}' viewBox='0 0 {width} {height}'>",
+            "<rect x='0' y='0' width='100%' height='100%' fill='#0b1220'/>",
+        ]
+
+        def esc(v: Any) -> str:
+            return str(v or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+        for i, v in enumerate(verts):
+            x = start_x + i * step_x
+            tags = v.get("ioa_tags") if isinstance(v, dict) else []
+            if not isinstance(tags, list):
+                tags = []
+            rule = ""
+            if tags:
+                t0 = tags[0] if isinstance(tags[0], dict) else {}
+                rule = esc(t0.get("name") or "")
+            etype = esc((v or {}).get("type") if isinstance(v, dict) else "")
+            ts = esc((v or {}).get("ts") if isinstance(v, dict) else "")
+            rid = esc((v or {}).get("record_id") if isinstance(v, dict) else "")
+
+            parts.append(
+                f"<rect x='{x}' y='{y}' width='{box_w}' height='{box_h}' rx='8' ry='8' fill='#111827' stroke='#475569' stroke-width='1.2'/>"
+            )
+            parts.append(f"<text x='{x+10}' y='{y+22}' fill='#e2e8f0' font-size='13' font-family='Arial'>#{i} {etype}</text>")
+            parts.append(f"<text x='{x+10}' y='{y+43}' fill='#93c5fd' font-size='12' font-family='Arial'>{rule[:58]}</text>")
+            parts.append(f"<text x='{x+10}' y='{y+62}' fill='#94a3b8' font-size='11' font-family='Arial'>{ts[:30]}</text>")
+            parts.append(f"<text x='{x+10}' y='{y+78}' fill='#64748b' font-size='10' font-family='Arial'>{rid[:38]}</text>")
+
+            if i < len(verts) - 1:
+                x1 = x + box_w
+                x2 = x + step_x
+                ym = y + box_h / 2
+                parts.append(f"<line x1='{x1}' y1='{ym}' x2='{x2-12}' y2='{ym}' stroke='#22c55e' stroke-width='1.6' />")
+                parts.append(
+                    f"<polygon points='{x2-12},{ym-4} {x2-12},{ym+4} {x2-4},{ym}' fill='#22c55e'/>"
+                )
+
+        parts.append("</svg>")
+        return Response("".join(parts), mimetype="image/svg+xml")
+
     adjacency_cache: dict[str, Any] = {"mtime": None, "meta": {}}
+
+    def _adjacency_candidates() -> list[Path]:
+        cands = [
+            adjacency_path,
+            output_dir / "adjacency.full.norm.jsonl",
+            output_dir / "adjacency.full.jsonl",
+        ]
+        out: list[Path] = []
+        seen: set[str] = set()
+        for p in cands:
+            key = str(p.resolve()) if p.exists() else str(p)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(p)
+        return out
 
     def _vertex_kind(vertex_id: str) -> str:
         if not isinstance(vertex_id, str) or ":" not in vertex_id:
@@ -430,12 +516,13 @@ def create_app() -> Flask:
         digest = hashlib.sha1(key).hexdigest()[:16]
         return json_cache_dir / f"iip_{digest}.json"
 
-    def _build_svg(root: str, target: Path, start_ts: str = "") -> None:
+    def _build_svg(root: str, target: Path, start_ts: str = "", input_file: Path | None = None) -> None:
+        src = input_file or adjacency_path
         cmd = [
             "python3",
             "tools/visualize_adjacency.py",
             "--input",
-            str(adjacency_path),
+            str(src),
             "--focus",
             root,
             "--render",
@@ -455,12 +542,13 @@ def create_app() -> Flask:
             cmd.extend(["--start-ts", start_ts])
         subprocess.run(cmd, cwd=Path(__file__).resolve().parents[1], check=True, capture_output=True, text=True)
 
-    def _build_json(root: str, target: Path) -> None:
+    def _build_json(root: str, target: Path, input_file: Path | None = None) -> None:
+        src = input_file or adjacency_path
         cmd = [
             "python3",
             "tools/visualize_adjacency.py",
             "--input",
-            str(adjacency_path),
+            str(src),
             "--focus",
             root,
             "--json-out",
@@ -478,8 +566,24 @@ def create_app() -> Flask:
         if not should_rebuild and adjacency_path.exists() and path.exists():
             should_rebuild = adjacency_path.stat().st_mtime > path.stat().st_mtime
         if should_rebuild:
-            _build_json(root, path)
-        return json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+            built = False
+            for cand in _adjacency_candidates():
+                if not cand.exists() or cand.stat().st_size == 0:
+                    continue
+                try:
+                    _build_json(root, path, input_file=cand)
+                    built = True
+                    break
+                except subprocess.CalledProcessError:
+                    continue
+            if not built:
+                return {"nodes": [], "edges": [], "seeds": [root], "error": "subgraph_build_failed"}
+        if not path.exists():
+            return {"nodes": [], "edges": [], "seeds": [root], "error": "subgraph_json_missing"}
+        try:
+            return json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+        except Exception:
+            return {"nodes": [], "edges": [], "seeds": [root], "error": "subgraph_json_invalid"}
 
     @app.get("/")
     def index() -> str:
@@ -510,12 +614,12 @@ def create_app() -> Flask:
         host = (request.args.get("host") or "").strip()
         if not root:
             return jsonify({"error": "missing root"}), 400
-        if not adjacency_path.exists() or adjacency_path.stat().st_size == 0:
-            return jsonify({"error": "adjacency file missing or empty"}), 404
+        candidates = [p for p in _adjacency_candidates() if p.exists() and p.stat().st_size > 0]
+        if not candidates:
+            return _svg_fallback("adjacency file missing or empty")
 
         svg_path = _svg_cache_file(root, host)
         force = (request.args.get("force") or "").strip() in {"1", "true", "yes"}
-        start_ts = ""
         scored = _read_jsonl(scored_path)
         target = None
         for row in scored:
@@ -527,23 +631,36 @@ def create_app() -> Flask:
                 if row.get("root") == root:
                     target = row
                     break
-        if isinstance(target, dict):
-            vertices = ((target.get("tpg") or {}).get("vertices") or [])
-            ts_list = [str(v.get("ts") or "") for v in vertices if isinstance(v, dict) and v.get("ts")]
-            if ts_list:
-                ts_list.sort()
-                start_ts = ts_list[0]
         try:
             should_rebuild = force or (not svg_path.exists())
-            if not should_rebuild and adjacency_path.exists() and svg_path.exists():
-                should_rebuild = adjacency_path.stat().st_mtime > svg_path.stat().st_mtime
+            newest_input_mtime = max((p.stat().st_mtime for p in candidates), default=0)
+            if not should_rebuild and svg_path.exists():
+                should_rebuild = newest_input_mtime > svg_path.stat().st_mtime
             if should_rebuild:
-                _build_svg(root, svg_path, start_ts=start_ts)
+                built = False
+                for cand in candidates:
+                    try:
+                        _build_svg(root, svg_path, start_ts="", input_file=cand)
+                        built = True
+                        break
+                    except subprocess.CalledProcessError:
+                        continue
+                if not built:
+                    if isinstance(target, dict):
+                        return _svg_from_tpg(target)
+                    return _svg_fallback("svg generation failed")
             return send_file(svg_path, mimetype="image/svg+xml")
         except subprocess.CalledProcessError as exc:
-            return jsonify({"error": "svg generation failed", "stderr": exc.stderr[-1200:] if exc.stderr else ""}), 500
+            if isinstance(target, dict):
+                return _svg_from_tpg(target)
+            msg = "svg generation failed"
+            if exc.stderr:
+                msg = f"svg generation failed: {exc.stderr[-200:]}"
+            return _svg_fallback(msg)
         except Exception as exc:
-            return jsonify({"error": str(exc)}), 500
+            if isinstance(target, dict):
+                return _svg_from_tpg(target)
+            return _svg_fallback(str(exc))
 
     @app.get("/api/detail")
     def api_detail():

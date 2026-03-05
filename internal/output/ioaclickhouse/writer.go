@@ -91,7 +91,7 @@ func (w *Writer) WriteEvents(events []*models.IOAEvent) error {
 	enc := json.NewEncoder(&body)
 	for _, event := range events {
 		row := insertRow{
-			TS:         event.Timestamp.UTC().Format("2006-01-02 15:04:05.000"),
+			TS:         event.Timestamp.In(time.Local).Format("2006-01-02 15:04:05.000"),
 			Host:       event.Host,
 			AgentID:    event.AgentID,
 			RecordID:   event.RecordID,

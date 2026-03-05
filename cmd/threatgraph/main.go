@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -32,6 +34,42 @@ import (
 	"threatgraph/internal/rules"
 	"threatgraph/internal/service"
 )
+
+type incidentExplainOutput struct {
+	Incident analyzer.Incident      `json:"incident"`
+	Window   incidentExplainWindow  `json:"window"`
+	Summary  incidentExplainSummary `json:"summary"`
+	IIP      analyzer.IIPGraph      `json:"iip"`
+	TPG      analyzer.TPG           `json:"tpg"`
+	Score    analyzer.TacticalScore `json:"score"`
+	Timeline []timelineEvent        `json:"timeline"`
+}
+
+type incidentExplainWindow struct {
+	Start time.Time `json:"start"`
+	End   time.Time `json:"end"`
+}
+
+type incidentExplainSummary struct {
+	RowsInWindow      int `json:"rows_in_window"`
+	IIPCountInWindow  int `json:"iip_count_in_window"`
+	TPGVertexCount    int `json:"tpg_vertex_count"`
+	TPGSequenceEdges  int `json:"tpg_sequence_edges"`
+	DistinctIOARules  int `json:"distinct_ioa_rules"`
+	DistinctTactics   int `json:"distinct_tactics"`
+	DistinctTechnique int `json:"distinct_techniques"`
+}
+
+type timelineEvent struct {
+	TS         time.Time `json:"ts"`
+	RecordID   string    `json:"record_id"`
+	From       string    `json:"from"`
+	To         string    `json:"to"`
+	EdgeType   string    `json:"edge_type"`
+	IOANames   []string  `json:"ioa_names,omitempty"`
+	Tactics    []string  `json:"tactics,omitempty"`
+	Techniques []string  `json:"techniques,omitempty"`
+}
 
 func findConfigFile(configArg string) string {
 	if configArg != "" {
@@ -433,6 +471,8 @@ func runServe(args []string) {
 	}
 
 	var incidentOut pipeline.IncidentWriter
+	compatIncidentPath := ""
+	compatScoredPath := ""
 	switch cfg.ThreatGraph.Serve.Incident.Mode {
 	case "file", "":
 		path := cfg.ThreatGraph.Serve.Incident.File.Path
@@ -446,6 +486,10 @@ func runServe(args []string) {
 		}
 		incidentOut = w
 		logger.Infof("Incident output mode: file (%s)", path)
+		if dir := strings.TrimSpace(filepath.Dir(path)); dir != "" && dir != "." {
+			compatIncidentPath = filepath.Join(dir, "incidents.latest.min2.jsonl")
+			compatScoredPath = filepath.Join(dir, "scored_tpg.latest.jsonl")
+		}
 	case "http":
 		w, err := incidenthttp.NewWriter(incidenthttp.Config{
 			URL:     cfg.ThreatGraph.Serve.Incident.HTTP.URL,
@@ -463,13 +507,15 @@ func runServe(args []string) {
 	}
 
 	svc := service.NewAnalyzeService(service.AnalyzeServiceConfig{
-		Reader:      reader,
-		IncidentOut: incidentOut,
-		Window:      cfg.ThreatGraph.Serve.Analyze.Window,
-		Interval:    cfg.ThreatGraph.Serve.Analyze.Interval,
-		BatchSize:   cfg.ThreatGraph.Serve.Analyze.BatchSize,
-		MinSeq:      cfg.ThreatGraph.Serve.Analyze.MinSeq,
-		Workers:     cfg.ThreatGraph.Serve.Analyze.Workers,
+		Reader:             reader,
+		IncidentOut:        incidentOut,
+		Window:             cfg.ThreatGraph.Serve.Analyze.Window,
+		Interval:           cfg.ThreatGraph.Serve.Analyze.Interval,
+		BatchSize:          cfg.ThreatGraph.Serve.Analyze.BatchSize,
+		MinSeq:             cfg.ThreatGraph.Serve.Analyze.MinSeq,
+		Workers:            cfg.ThreatGraph.Serve.Analyze.Workers,
+		ScoredOutPath:      compatScoredPath,
+		CompatIncidentPath: compatIncidentPath,
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -496,6 +542,281 @@ func runServe(args []string) {
 	logger.Infof("ThreatGraph serve stopped")
 }
 
+func runExplainIncident(args []string) int {
+	fs := flag.NewFlagSet("explain-incident", flag.ContinueOnError)
+	configPath := fs.String("config", "", "Config YAML path (defaults to threatgraph.yml lookup)")
+	incidentPath := fs.String("incident-file", "", "Incident JSONL path (default from serve config)")
+	index := fs.Int("index", -1, "Incident index (0-based). -1 means latest")
+	host := fs.String("host", "", "Filter incident by host")
+	root := fs.String("root", "", "Filter incident by root")
+	iipTSRaw := fs.String("iip-ts", "", "Filter incident by iip timestamp (RFC3339)")
+	window := fs.Duration("window", 0, "Time window around incident iip_ts (default analyze.window)")
+	outPath := fs.String("out", "output/incident_explain.json", "Output JSON path")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	cfg, err := config.LoadConfig(findConfigFile(*configPath))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
+		return 1
+	}
+	applyDefaults(cfg)
+
+	path := strings.TrimSpace(*incidentPath)
+	if path == "" {
+		path = strings.TrimSpace(cfg.ThreatGraph.Serve.Incident.File.Path)
+	}
+	if path == "" {
+		path = "output/incidents.jsonl"
+	}
+
+	incidents, err := loadIncidents(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to load incidents: %v\n", err)
+		return 1
+	}
+
+	var iipTSFilter time.Time
+	if strings.TrimSpace(*iipTSRaw) != "" {
+		iipTSFilter, err = time.Parse(time.RFC3339, strings.TrimSpace(*iipTSRaw))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "invalid --iip-ts (must be RFC3339): %v\n", err)
+			return 2
+		}
+	}
+
+	selected, err := selectIncident(incidents, *index, strings.TrimSpace(*host), strings.TrimSpace(*root), iipTSFilter)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to select incident: %v\n", err)
+		return 1
+	}
+
+	analysisWindow := *window
+	if analysisWindow <= 0 {
+		analysisWindow = cfg.ThreatGraph.Serve.Analyze.Window
+	}
+	if analysisWindow <= 0 {
+		analysisWindow = 2 * time.Hour
+	}
+
+	since := selected.IIPTS.Add(-analysisWindow)
+	until := selected.IIPTS.Add(analysisWindow)
+
+	chCfg := cfg.ThreatGraph.Serve.Analyze.ClickHouse
+	reader, err := inputclickhouse.NewReader(inputclickhouse.Config{
+		URL:            chCfg.URL,
+		Database:       chCfg.Database,
+		AdjacencyTable: cfg.ThreatGraph.Serve.Analyze.AdjacencyTable,
+		IOATable:       cfg.ThreatGraph.Serve.Analyze.IOATable,
+		ProcessedTable: cfg.ThreatGraph.Serve.Analyze.ProcessedTable,
+		Username:       chCfg.Username,
+		Password:       chCfg.Password,
+		Timeout:        chCfg.Timeout,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to create clickhouse reader: %v\n", err)
+		return 1
+	}
+
+	rows, err := reader.ReadRows(selected.Host, since, until)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to read adjacency rows: %v\n", err)
+		return 1
+	}
+
+	iips := analyzer.BuildIIPGraphs(rows)
+	matchedIIP, err := pickIncidentIIP(iips, selected)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to locate incident iip: %v\n", err)
+		return 1
+	}
+
+	tpg := analyzer.BuildTPG(matchedIIP)
+	score := analyzer.ScoreTPG(tpg)
+	timeline, ruleCount, tacticCount, techniqueCount := buildTimeline(tpg.Vertices)
+
+	out := incidentExplainOutput{
+		Incident: selected,
+		Window: incidentExplainWindow{
+			Start: since,
+			End:   until,
+		},
+		Summary: incidentExplainSummary{
+			RowsInWindow:      len(rows),
+			IIPCountInWindow:  len(iips),
+			TPGVertexCount:    len(tpg.Vertices),
+			TPGSequenceEdges:  len(tpg.SequenceEdges),
+			DistinctIOARules:  ruleCount,
+			DistinctTactics:   tacticCount,
+			DistinctTechnique: techniqueCount,
+		},
+		IIP:      matchedIIP,
+		TPG:      tpg,
+		Score:    score,
+		Timeline: timeline,
+	}
+
+	if err := writeJSONFile(*outPath, out); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to write output: %v\n", err)
+		return 1
+	}
+
+	fmt.Printf("incident_explain_ok host=%s root=%s tpg_vertices=%d out=%s\n", selected.Host, selected.Root, len(tpg.Vertices), *outPath)
+	return 0
+}
+
+func loadIncidents(path string) ([]analyzer.Incident, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	out := make([]analyzer.Incident, 0, 64)
+	dec := json.NewDecoder(f)
+	for {
+		var inc analyzer.Incident
+		if err := dec.Decode(&inc); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return nil, err
+		}
+		out = append(out, inc)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no incidents found in %s", path)
+	}
+	return out, nil
+}
+
+func selectIncident(incidents []analyzer.Incident, index int, host, root string, iipTS time.Time) (analyzer.Incident, error) {
+	if len(incidents) == 0 {
+		return analyzer.Incident{}, fmt.Errorf("incident list is empty")
+	}
+
+	filtered := make([]analyzer.Incident, 0, len(incidents))
+	for _, inc := range incidents {
+		if host != "" && inc.Host != host {
+			continue
+		}
+		if root != "" && inc.Root != root {
+			continue
+		}
+		if !iipTS.IsZero() && !inc.IIPTS.UTC().Equal(iipTS.UTC()) {
+			continue
+		}
+		filtered = append(filtered, inc)
+	}
+	if len(filtered) == 0 {
+		return analyzer.Incident{}, fmt.Errorf("no incident matched filters")
+	}
+
+	if index < 0 {
+		return filtered[len(filtered)-1], nil
+	}
+	if index >= len(filtered) {
+		return analyzer.Incident{}, fmt.Errorf("index out of range: %d (matched=%d)", index, len(filtered))
+	}
+	return filtered[index], nil
+}
+
+func pickIncidentIIP(iips []analyzer.IIPGraph, incident analyzer.Incident) (analyzer.IIPGraph, error) {
+	if len(iips) == 0 {
+		return analyzer.IIPGraph{}, fmt.Errorf("no iip built in selected window")
+	}
+
+	best := -1
+	bestDelta := time.Duration(1<<63 - 1)
+	for i := range iips {
+		iip := iips[i]
+		if iip.Host != incident.Host {
+			continue
+		}
+		if iip.Root != incident.Root {
+			continue
+		}
+		d := iip.IIPTS.Sub(incident.IIPTS)
+		if d < 0 {
+			d = -d
+		}
+		if d < bestDelta {
+			best = i
+			bestDelta = d
+		}
+	}
+	if best >= 0 {
+		return iips[best], nil
+	}
+
+	for i := range iips {
+		if iips[i].Host == incident.Host {
+			return iips[i], nil
+		}
+	}
+	return analyzer.IIPGraph{}, fmt.Errorf("no iip matches incident host/root")
+}
+
+func buildTimeline(vertices []analyzer.AlertEvent) ([]timelineEvent, int, int, int) {
+	out := make([]timelineEvent, 0, len(vertices))
+	rules := make(map[string]struct{}, 16)
+	tactics := make(map[string]struct{}, 16)
+	techniques := make(map[string]struct{}, 16)
+
+	for _, v := range vertices {
+		names := make([]string, 0, len(v.IoaTags))
+		tacticList := make([]string, 0, len(v.IoaTags))
+		techList := make([]string, 0, len(v.IoaTags))
+		for _, tag := range v.IoaTags {
+			if name := strings.TrimSpace(tag.Name); name != "" {
+				names = append(names, name)
+				rules[strings.ToLower(name)] = struct{}{}
+			}
+			if t := strings.TrimSpace(tag.Tactic); t != "" {
+				tacticList = append(tacticList, t)
+				tactics[strings.ToLower(t)] = struct{}{}
+			}
+			if tech := strings.TrimSpace(tag.Technique); tech != "" {
+				techList = append(techList, tech)
+				techniques[strings.ToLower(tech)] = struct{}{}
+			}
+		}
+
+		out = append(out, timelineEvent{
+			TS:         v.TS,
+			RecordID:   v.RecordID,
+			From:       v.From,
+			To:         v.To,
+			EdgeType:   v.Type,
+			IOANames:   names,
+			Tactics:    tacticList,
+			Techniques: techList,
+		})
+	}
+
+	return out, len(rules), len(tactics), len(techniques)
+}
+
+func writeJSONFile(path string, v any) error {
+	dir := filepath.Dir(path)
+	if dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return err
+		}
+	}
+
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", "  ")
+	return enc.Encode(v)
+}
+
 func main() {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
@@ -507,6 +828,8 @@ func main() {
 		case "serve":
 			runServe(os.Args[2:])
 			return
+		case "explain-incident":
+			os.Exit(runExplainIncident(os.Args[2:]))
 		default:
 			// Backward-compatible mode: first arg is config path.
 			runProducer(os.Args[1:])

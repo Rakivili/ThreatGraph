@@ -1,0 +1,27 @@
+title: Suspicious Process Access With UNKNOWN CallTrace
+id: 97d53c5a-673f-4fb7-b18f-9f8d0e2e8f01
+status: experimental
+description: >-
+  Detects Sysmon ProcessAccess events where CallTrace contains UNKNOWN,
+  which may indicate suspicious process access behavior associated with
+  process injection techniques.
+references:
+  - https://attack.mitre.org/techniques/T1055/
+author: ThreatGraph
+date: 2026-03-05
+tags:
+  - attack.defense-evasion
+  - attack.privilege-escalation
+  - attack.t1055
+logsource:
+  product: windows
+  service: sysmon
+  category: process_access
+detection:
+  sel_unknown_calltrace:
+    CallTrace|contains: 'UNKNOWN'
+  condition: sel_unknown_calltrace
+falsepositives:
+  - Security products or endpoint tooling with incomplete symbol resolution in call traces
+  - Debugging or profiling tools that generate unresolved call stacks
+level: low
