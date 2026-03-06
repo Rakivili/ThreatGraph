@@ -78,6 +78,9 @@ func attachIOATags(rows []*models.AdjacencyRow, tags []models.IoaTag) []*models.
 		if row == nil || row.RecordType != recordEdge {
 			continue
 		}
+		if row.Type == "ImageOfEdge" {
+			continue
+		}
 		row.IoaTags = append([]models.IoaTag(nil), tags...)
 	}
 

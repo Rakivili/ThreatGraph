@@ -56,3 +56,57 @@ func TestMapProcessAccessIncludesImageMappingsAndAccessData(t *testing.T) {
 		t.Fatalf("unexpected target_image: %v", processAccessEdge.Data["target_image"])
 	}
 }
+
+func TestMapDoesNotAttachIOATagsToImageOfEdge(t *testing.T) {
+	m := NewMapper(MapperOptions{WriteVertexRows: false, IncludeEdgeData: false})
+	e := &models.Event{
+		Timestamp: time.Date(2026, 3, 6, 2, 0, 0, 0, time.UTC),
+		EventID:   1,
+		AgentID:   "agent-1",
+		RecordID:  "rec-2",
+		IoaTags: []models.IoaTag{{
+			Name:      "test-ioa",
+			Severity:  "low",
+			Tactic:    "execution",
+			Technique: "T1059",
+		}},
+		Fields: map[string]interface{}{
+			"ProcessGuid":       "{PROC}",
+			"ParentProcessGuid": "{PARENT}",
+			"Image":             `C:\ProgramData\sample.exe`,
+			"CommandLine":       `C:\ProgramData\sample.exe -x`,
+			"ParentImage":       `C:\Windows\explorer.exe`,
+		},
+	}
+
+	rows := m.Map(e)
+	if len(rows) == 0 {
+		t.Fatalf("expected mapped rows, got 0")
+	}
+
+	var parentEdge, imageOfEdge *models.AdjacencyRow
+	for _, r := range rows {
+		if r == nil || r.RecordType != "edge" {
+			continue
+		}
+		switch r.Type {
+		case "ParentOfEdge":
+			parentEdge = r
+		case "ImageOfEdge":
+			imageOfEdge = r
+		}
+	}
+
+	if parentEdge == nil {
+		t.Fatalf("expected ParentOfEdge to be mapped")
+	}
+	if imageOfEdge == nil {
+		t.Fatalf("expected ImageOfEdge to be mapped")
+	}
+	if len(parentEdge.IoaTags) == 0 {
+		t.Fatalf("expected ParentOfEdge to retain ioa tags")
+	}
+	if len(imageOfEdge.IoaTags) != 0 {
+		t.Fatalf("expected ImageOfEdge to have no ioa tags, got %d", len(imageOfEdge.IoaTags))
+	}
+}
