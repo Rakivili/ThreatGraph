@@ -1,0 +1,111 @@
+# Offline EDR 邻接表映射说明（当前实现）
+
+本文档记录当前 `ThreatGraph/internal/graph/adjacency/mapper.go` 的已实现事件类型与字段映射。
+
+> 适用范围：离线 EDR 数据（`event.Raw`）与 Sysmon 事件（`event.EventID`）
+
+---
+
+## 1. Host Key（顶点命名中的 host 维度）
+
+当前 `pickHost(event)` 规则：
+
+1. 优先 `Raw["client_id"]`
+2. 其次 `event.AgentID`
+3. 最后 `event.Hostname`
+
+因此 `proc:/path:` 顶点 ID 默认会按 `client_id` 分桶（若存在）。
+
+---
+
+## 2. 离线 EDR 路径判定
+
+若 `Raw["risk_level"]` 存在，则进入离线 EDR 映射：
+
+- `risk_level == notice`
+  - 仅处理 `operation == CreateProcess`
+  - 其它 notice 事件直接忽略（不产邻接）
+- `risk_level != notice`
+  - 走 non-notice 映射
+
+---
+
+## 3. notice + CreateProcess 映射
+
+### 3.1 主进程链
+
+- 子进程 GUID：`ProcessGuid` / `newprocessuuid` / `new_process_uuid`
+- 父（创建者）进程 GUID：`ParentProcessGuid` / `processuuid` / `parent_processuuid`
+
+### 3.2 字段到顶点/边
+
+- 子进程路径：`Image` / `newprocess` / `new_process`
+- 子进程命令行：`CommandLine` / `new_command_line` / `newcommandline`
+- 父进程路径：`ParentImage` / `process` / `parent_process`
+- 父进程命令行：`ParentCommandLine` / `command_line`
+
+### 3.3 产出
+
+- `ParentOfEdge`: `parent_proc -> child_proc`
+- `ProcessCPEdge`（若有 `processcpuuid`）: `cp_proc -> creator_proc`
+- `RPCTriggerEdge`（若有 `rpcprocessuuid`）: `rpc_proc -> creator_proc`
+
+---
+
+## 4. non-notice 映射
+
+### 4.1 主体（subject）
+
+- 主体 GUID：`ProcessGuid` / `processuuid`
+- 主体路径：`Image` / `process`
+- 主体命令行：`CommandLine` / `command_line`
+
+### 4.2 产出
+
+- `ProcessCPEdge`（仅当 `processcpuuid` 存在）: `cp_proc -> subject_proc`
+- `RPCTriggerEdge`（仅当 `rpcprocessuuid` 存在）: `rpc_proc -> subject_proc`
+
+### 4.3 额外约束
+
+- `processcp` / `rpcprocess` **无 UUID 不关联**（不会建 image fallback 边）
+- 若 `processuuid == rpcprocessuuid`（忽略大小写、忽略 `{}`）
+  - 认为是同一进程
+  - **不建立 `RPCTriggerEdge`**
+
+---
+
+## 5. Sysmon EventID 映射（当前）
+
+`Map(event)` 中已支持：
+
+- `1`  -> `mapProcessCreate`
+- `3`  -> `mapNetworkConnect`
+- `7`  -> `mapImageLoad`
+- `8`  -> `mapRemoteThread`
+- `10` -> `mapProcessAccess`
+- `11` -> `mapFileCreate`
+- `22` -> `mapDNSQuery`
+
+> 当前未实现 Sysmon 12/13/14 注册表 EventID 的专门映射。
+
+---
+
+## 6. IOA 标签挂载规则（当前）
+
+默认边会继承 `event.IoaTags`，但以下边类型明确排除：
+
+- 所有 `RPC*` 边（如 `RPCTriggerEdge`）
+- 所有 `ProcessCP*` 边（如 `ProcessCPEdge`）
+
+即：`rpc / processcp` 这两类边不挂 IOA。
+
+---
+
+## 7. 顶点 ID 规则
+
+- 进程：`proc:{host_key}:{guid}`
+- 路径：`path:{host_key}:{path}`
+- 域名：`domain:{domain}`
+- 网络：`net:{ip}` 或 `net:{ip}:{port}`
+
+其中 `{host_key}` 为第 1 节中的 host 选择结果（优先 `client_id`）。
