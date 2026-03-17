@@ -1,6 +1,7 @@
 package adjacency
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -57,7 +58,7 @@ func TestMapProcessAccessIncludesImageMappingsAndAccessData(t *testing.T) {
 	}
 }
 
-func TestMapDoesNotAttachIOATagsToImageOfEdge(t *testing.T) {
+func TestMapParentEdgeKeepsIOATags(t *testing.T) {
 	m := NewMapper(MapperOptions{WriteVertexRows: false, IncludeEdgeData: false})
 	e := &models.Event{
 		Timestamp: time.Date(2026, 3, 6, 2, 0, 0, 0, time.UTC),
@@ -84,29 +85,307 @@ func TestMapDoesNotAttachIOATagsToImageOfEdge(t *testing.T) {
 		t.Fatalf("expected mapped rows, got 0")
 	}
 
-	var parentEdge, imageOfEdge *models.AdjacencyRow
+	var parentEdge *models.AdjacencyRow
 	for _, r := range rows {
 		if r == nil || r.RecordType != "edge" {
 			continue
 		}
-		switch r.Type {
-		case "ParentOfEdge":
+		if r.Type == "ParentOfEdge" {
 			parentEdge = r
-		case "ImageOfEdge":
-			imageOfEdge = r
 		}
 	}
 
 	if parentEdge == nil {
 		t.Fatalf("expected ParentOfEdge to be mapped")
 	}
-	if imageOfEdge == nil {
-		t.Fatalf("expected ImageOfEdge to be mapped")
-	}
 	if len(parentEdge.IoaTags) == 0 {
 		t.Fatalf("expected ParentOfEdge to retain ioa tags")
 	}
-	if len(imageOfEdge.IoaTags) != 0 {
-		t.Fatalf("expected ImageOfEdge to have no ioa tags, got %d", len(imageOfEdge.IoaTags))
+}
+
+func TestMapOfflineEDRNoticeOnlyKeepsCreateProcess(t *testing.T) {
+	m := NewMapper(MapperOptions{WriteVertexRows: false, IncludeEdgeData: false})
+
+	noticeCreate := &models.Event{
+		Timestamp: time.Date(2026, 3, 4, 15, 49, 3, 0, time.UTC),
+		AgentID:   "agent-edr",
+		RecordID:  "notice-create-1",
+		IoaTags: []models.IoaTag{{
+			Name:      "offline-edr-ioa",
+			Severity:  "high",
+			Tactic:    "persistence",
+			Technique: "T1547",
+		}},
+		Raw: map[string]interface{}{
+			"risk_level":       "notice",
+			"operation":        "CreateProcess",
+			"processuuid":      "{PARENT}",
+			"processcp":        `C:\Windows\System32\services.exe`,
+			"processcpuuid":    "{CP}",
+			"rpcprocess":       `C:\Windows\System32\svchost.exe`,
+			"rpcprocessuuid":   "{RPC}",
+			"newprocessuuid":   "{CHILD}",
+			"process":          `C:\Windows\System32\services.exe`,
+			"newprocess":       `C:\Windows\System32\svchost.exe`,
+			"command_line":     `C:\Windows\System32\services.exe`,
+			"new_command_line": `C:\Windows\System32\svchost.exe -k netsvcs`,
+		},
+	}
+
+	rows := m.Map(noticeCreate)
+	if len(rows) == 0 {
+		t.Fatalf("expected rows for notice CreateProcess")
+	}
+
+	var hasParentEdge, hasCP, hasRPC bool
+	for _, r := range rows {
+		if r == nil || r.RecordType != "edge" {
+			continue
+		}
+		if r.Type == "ParentOfEdge" {
+			hasParentEdge = true
+			if len(r.IoaTags) == 0 {
+				t.Fatalf("expected ParentOfEdge to keep ioa tags")
+			}
+		}
+		if r.Type == "ProcessCPEdge" {
+			hasCP = true
+			if len(r.IoaTags) != 0 {
+				t.Fatalf("expected ProcessCPEdge to drop ioa tags")
+			}
+		}
+		if r.Type == "RPCTriggerEdge" {
+			hasRPC = true
+			if len(r.IoaTags) != 0 {
+				t.Fatalf("expected RPCTriggerEdge to drop ioa tags")
+			}
+		}
+	}
+	if !hasParentEdge || !hasCP || !hasRPC {
+		t.Fatalf("expected ParentOfEdge, ProcessCPEdge, RPCTriggerEdge; got rows=%v", rows)
+	}
+
+	noticeNonCreate := &models.Event{
+		Timestamp: time.Date(2026, 3, 4, 15, 50, 0, 0, time.UTC),
+		AgentID:   "agent-edr",
+		RecordID:  "notice-non-create-1",
+		Raw: map[string]interface{}{
+			"risk_level":  "notice",
+			"operation":   "TcpSend",
+			"processuuid": "{PROC}",
+		},
+	}
+	if rows := m.Map(noticeNonCreate); len(rows) != 0 {
+		t.Fatalf("expected no rows for notice non-CreateProcess, got %d", len(rows))
+	}
+}
+
+func TestMapOfflineEDRNonNoticeAddsProcessCPAndRPCTrigger(t *testing.T) {
+	m := NewMapper(MapperOptions{WriteVertexRows: false, IncludeEdgeData: false})
+	e := &models.Event{
+		Timestamp: time.Date(2026, 3, 4, 16, 3, 52, 0, time.UTC),
+		AgentID:   "agent-edr",
+		RecordID:  "non-notice-1",
+		Raw: map[string]interface{}{
+			"risk_level":     "high",
+			"operation":      "SetValueKey",
+			"processuuid":    "{SUBJ}",
+			"process":        `C:\Windows\System32\lsass.exe`,
+			"rpcprocess":     `C:\Windows\System32\spoolsv.exe`,
+			"rpcprocessuuid": "{RPC}",
+			"processcp":      `C:\Windows\System32\services.exe`,
+			"processcpuuid":  "{CP}",
+		},
+	}
+
+	rows := m.Map(e)
+	if len(rows) == 0 {
+		t.Fatalf("expected rows for non-notice event")
+	}
+
+	var hasRPCTrigger, hasCPEdge bool
+	for _, r := range rows {
+		if r == nil || r.RecordType != "edge" {
+			continue
+		}
+		switch r.Type {
+		case "RPCTriggerEdge":
+			hasRPCTrigger = true
+		case "ProcessCPEdge":
+			hasCPEdge = true
+		}
+	}
+
+	if !hasRPCTrigger {
+		t.Fatalf("expected RPCTriggerEdge")
+	}
+	if !hasCPEdge {
+		t.Fatalf("expected ProcessCPEdge")
+	}
+}
+
+func TestMapOfflineEDRNonNoticeSkipsCPAndRPCWithoutUUID(t *testing.T) {
+	m := NewMapper(MapperOptions{WriteVertexRows: false, IncludeEdgeData: false})
+	e := &models.Event{
+		Timestamp: time.Date(2026, 3, 4, 16, 4, 0, 0, time.UTC),
+		AgentID:   "agent-edr",
+		RecordID:  "non-notice-no-uuid",
+		Raw: map[string]interface{}{
+			"risk_level":  "high",
+			"operation":   "SetValueKey",
+			"processuuid": "{SUBJ}",
+			"process":     `C:\Windows\System32\lsass.exe`,
+			"rpcprocess":  `C:\Windows\System32\spoolsv.exe`,
+			"processcp":   `C:\Windows\System32\services.exe`,
+			"keyname":     `\REGISTRY\MACHINE\SOFTWARE\Test`,
+		},
+	}
+
+	rows := m.Map(e)
+	if len(rows) == 0 {
+		t.Fatalf("expected rows for non-notice event")
+	}
+
+	for _, r := range rows {
+		if r == nil || r.RecordType != "edge" {
+			continue
+		}
+		if r.Type == "RPCTriggerEdge" || r.Type == "ProcessCPEdge" || r.Type == "RPCTriggerImageEdge" || r.Type == "ProcessCPImageEdge" {
+			t.Fatalf("expected no cp/rpc relation edge without uuid, got %s", r.Type)
+		}
+	}
+}
+
+func TestMapOfflineEDRSkipsRPCWhenSubjectAndRPCUUIDEqual(t *testing.T) {
+	m := NewMapper(MapperOptions{WriteVertexRows: false, IncludeEdgeData: false})
+	e := &models.Event{
+		Timestamp: time.Date(2026, 3, 4, 16, 5, 0, 0, time.UTC),
+		AgentID:   "agent-edr",
+		RecordID:  "non-notice-same-rpc-uuid",
+		Raw: map[string]interface{}{
+			"risk_level":     "high",
+			"operation":      "SetValueKey",
+			"processuuid":    "{ABC-123}",
+			"process":        `C:\Windows\System32\lsass.exe`,
+			"rpcprocess":     `C:\Windows\System32\spoolsv.exe`,
+			"rpcprocessuuid": "abc-123",
+			"keyname":        `\REGISTRY\MACHINE\SOFTWARE\Test`,
+		},
+	}
+
+	rows := m.Map(e)
+	if len(rows) == 0 {
+		t.Fatalf("expected rows for non-notice event")
+	}
+
+	for _, r := range rows {
+		if r == nil || r.RecordType != "edge" {
+			continue
+		}
+		if r.Type == "RPCTriggerEdge" {
+			t.Fatalf("expected no RPCTriggerEdge when processuuid == rpcprocessuuid")
+		}
+	}
+}
+
+func TestMapOfflineEDRPrefersClientIDAsHostKey(t *testing.T) {
+	m := NewMapper(MapperOptions{WriteVertexRows: false, IncludeEdgeData: false})
+	e := &models.Event{
+		Timestamp: time.Date(2026, 3, 4, 16, 6, 0, 0, time.UTC),
+		AgentID:   "agent-should-not-win",
+		Hostname:  "hostname-should-not-win",
+		RecordID:  "non-notice-client-id-host-key",
+		Raw: map[string]interface{}{
+			"client_id":   "AA0000119100000427",
+			"risk_level":  "high",
+			"operation":   "SetValueKey",
+			"processuuid": "{SUBJ}",
+			"process":     `C:\Windows\System32\lsass.exe`,
+			"keyname":     `\REGISTRY\MACHINE\SOFTWARE\Test`,
+		},
+	}
+
+	rows := m.Map(e)
+	if len(rows) == 0 {
+		t.Fatalf("expected rows for non-notice event")
+	}
+
+	found := false
+	for _, r := range rows {
+		if r == nil || r.RecordType != "edge" {
+			continue
+		}
+		if strings.HasPrefix(r.VertexID, "proc:aa0000119100000427:") || strings.HasPrefix(r.AdjacentID, "proc:aa0000119100000427:") {
+			found = true
+		}
+		if strings.HasPrefix(r.VertexID, "proc:agent-should-not-win:") || strings.HasPrefix(r.AdjacentID, "proc:agent-should-not-win:") {
+			t.Fatalf("expected client_id host key, got agent id in vertex ids")
+		}
+	}
+	if !found {
+		t.Fatalf("expected proc vertex ids keyed by client_id")
+	}
+}
+
+func TestMapOfflineEDRNonNoticeSkipsPortAttack(t *testing.T) {
+	m := NewMapper(MapperOptions{WriteVertexRows: false, IncludeEdgeData: false})
+	e := &models.Event{
+		Timestamp: time.Date(2026, 3, 4, 16, 7, 0, 0, time.UTC),
+		RecordID:  "portattack-skip",
+		Raw: map[string]interface{}{
+			"client_id":   "AA0000119100000427",
+			"risk_level":  "high",
+			"operation":   "PortAttack",
+			"processuuid": "{SUBJ}",
+			"process":     `C:\Windows\System32\svchost.exe`,
+		},
+	}
+	if rows := m.Map(e); len(rows) != 0 {
+		t.Fatalf("expected PortAttack to be skipped, got %d rows", len(rows))
+	}
+}
+
+func TestMapOfflineEDRNonNoticeAddsSubjectObjectEdges(t *testing.T) {
+	m := NewMapper(MapperOptions{WriteVertexRows: false, IncludeEdgeData: false})
+	e := &models.Event{
+		Timestamp: time.Date(2026, 3, 4, 16, 8, 0, 0, time.UTC),
+		RecordID:  "non-notice-objects",
+		Raw: map[string]interface{}{
+			"client_id":         "AA0000119100000427",
+			"risk_level":        "high",
+			"operation":         "SetValueKey",
+			"processuuid":       "{SUBJ}",
+			"process":           `C:\Windows\System32\lsass.exe`,
+			"targetprocessuuid": "{TGT}",
+			"targetprocess":     `C:\Windows\System32\winlogon.exe`,
+			"file":              `C:\ProgramData\dropper.exe`,
+			"newimage":          `C:\ProgramData\evil.dll`,
+			"keyname":           `\REGISTRY\MACHINE\SOFTWARE\Test`,
+			"valuename":         `Start`,
+			"valuetype":         `3`,
+			"remoteip":          `8.8.8.8`,
+			"remoteport":        `443`,
+		},
+	}
+
+	rows := m.Map(e)
+	if len(rows) == 0 {
+		t.Fatalf("expected rows for non-notice object mapping")
+	}
+
+	seen := map[string]bool{}
+	for _, r := range rows {
+		if r == nil || r.RecordType != "edge" {
+			continue
+		}
+		seen[r.Type] = true
+		if r.Type == "ImageLoadEdge" && !strings.HasPrefix(r.VertexID, "path:aa0000119100000427:") {
+			t.Fatalf("expected module path to point to subject via client_id-scoped path vertex")
+		}
+	}
+	for _, typ := range []string{"TargetProcessEdge", "FileAccessEdge", "ImageLoadEdge", "RegistrySetValueEdge", "ConnectEdge"} {
+		if !seen[typ] {
+			t.Fatalf("expected edge type %s to be present", typ)
+		}
 	}
 }

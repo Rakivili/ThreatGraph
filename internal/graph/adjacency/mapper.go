@@ -42,6 +42,12 @@ func (m *Mapper) Map(event *models.Event) []*models.AdjacencyRow {
 		logger.Errorf("Skipping event without valid UtcTime (event_id=%d, record_id=%s, host=%s, agent_id=%s)", event.EventID, event.RecordID, event.Hostname, event.AgentID)
 		return nil
 	}
+	if rows, handled := m.mapEDROffline(event); handled {
+		if len(event.IoaTags) > 0 {
+			rows = attachIOATags(rows, event.IoaTags)
+		}
+		return rows
+	}
 	var rows []*models.AdjacencyRow
 	switch event.EventID {
 	case 1:
@@ -69,6 +75,233 @@ func (m *Mapper) Map(event *models.Event) []*models.AdjacencyRow {
 	return rows
 }
 
+func (m *Mapper) mapEDROffline(event *models.Event) ([]*models.AdjacencyRow, bool) {
+	risk := strings.ToLower(strings.TrimSpace(edrField(event, "risk_level")))
+	if risk == "" {
+		return nil, false
+	}
+	operation := strings.TrimSpace(edrField(event, "operation"))
+	if risk == "notice" {
+		if strings.EqualFold(operation, "CreateProcess") {
+			return m.mapEDRNoticeProcessCreate(event), true
+		}
+		return nil, true
+	}
+	if strings.EqualFold(operation, "PortAttack") {
+		return nil, true
+	}
+	return m.mapEDRNonNotice(event), true
+}
+
+func (m *Mapper) mapEDRNoticeProcessCreate(event *models.Event) []*models.AdjacencyRow {
+	childGUID := firstField(event,
+		"ProcessGuid",
+		"newprocessuuid",
+		"new_process_uuid",
+	)
+	if childGUID == "" {
+		return nil
+	}
+	host := pickHost(event)
+	childID := processVertexID(host, childGUID)
+	if childID == "" {
+		return nil
+	}
+
+	childImage := firstField(event, "Image", "newprocess", "new_process")
+	childCommandLine := firstField(event, "CommandLine", "new_command_line", "newcommandline")
+	creatorGUID := firstField(event, "ParentProcessGuid", "processuuid", "parent_processuuid")
+	parentImage := firstField(event, "ParentImage", "process", "parent_process")
+	parentCommandLine := firstField(event, "ParentCommandLine", "command_line")
+
+	rows := make([]*models.AdjacencyRow, 0, 4)
+	if m.writeVertexRows {
+		rows = append(rows, vertexRow("ProcessVertex", childID, event, map[string]interface{}{
+			"image":               childImage,
+			"process_path":        childImage,
+			"command_line":        childCommandLine,
+			"parent_image":        parentImage,
+			"parent_process_path": parentImage,
+			"parent_command_line": parentCommandLine,
+		}))
+	}
+
+	creatorID := ""
+	if creatorGUID != "" {
+		creatorID = processVertexID(host, creatorGUID)
+		if creatorID != "" && creatorID != childID {
+			if m.writeVertexRows {
+				rows = append(rows, vertexRow("ProcessVertex", creatorID, event, map[string]interface{}{
+					"image":        parentImage,
+					"process_path": parentImage,
+					"command_line": parentCommandLine,
+				}))
+			}
+			rows = append(rows, edgeRow("ParentOfEdge", creatorID, childID, event, nil, m.includeEdgeData))
+		}
+	}
+
+	if creatorID != "" {
+		rows = m.appendOfflineCauseEdges(rows, event, creatorID)
+	}
+
+	return rows
+}
+
+func (m *Mapper) mapEDRNonNotice(event *models.Event) []*models.AdjacencyRow {
+	host := pickHost(event)
+	subjectGUID := firstField(event, "ProcessGuid", "processuuid")
+	if subjectGUID == "" {
+		return nil
+	}
+	subjectID := processVertexID(host, subjectGUID)
+	if subjectID == "" {
+		return nil
+	}
+
+	subjectImage := firstField(event, "Image", "process")
+	subjectCommandLine := firstField(event, "CommandLine", "command_line")
+	rows := make([]*models.AdjacencyRow, 0, 6)
+
+	if m.writeVertexRows {
+		rows = append(rows, vertexRow("ProcessVertex", subjectID, event, map[string]interface{}{
+			"image":        subjectImage,
+			"process_path": subjectImage,
+			"command_line": subjectCommandLine,
+		}))
+	}
+
+	rows = m.appendOfflineCauseEdges(rows, event, subjectID)
+	rows = m.appendOfflineTargetProcessEdges(rows, event, subjectID)
+	rows = m.appendOfflineFileEdges(rows, event, subjectID)
+	rows = m.appendOfflineModuleEdges(rows, event, subjectID)
+	rows = m.appendOfflineRegistryEdges(rows, event, subjectID)
+	rows = m.appendOfflineNetworkEdges(rows, event, subjectID)
+
+	return rows
+}
+
+func (m *Mapper) appendOfflineCauseEdges(rows []*models.AdjacencyRow, event *models.Event, targetProcID string) []*models.AdjacencyRow {
+	host := pickHost(event)
+	if targetProcID == "" || host == "" {
+		return rows
+	}
+	targetGUID := normalizeGUIDForCompare(firstField(event, "ProcessGuid", "processuuid", "newprocessuuid"))
+
+	if cpGUID := strings.TrimSpace(edrField(event, "processcpuuid")); cpGUID != "" {
+		cpID := processVertexID(host, cpGUID)
+		if cpID != "" && cpID != targetProcID {
+			if m.writeVertexRows {
+				rows = append(rows, vertexRow("ProcessVertex", cpID, event, processVertexDataFromRaw(event, "processcp", "")))
+			}
+			rows = append(rows, edgeRow("ProcessCPEdge", cpID, targetProcID, event, nil, m.includeEdgeData))
+		}
+	}
+
+	if rpcGUID := strings.TrimSpace(edrField(event, "rpcprocessuuid")); rpcGUID != "" {
+		if targetGUID != "" && normalizeGUIDForCompare(rpcGUID) == targetGUID {
+			return rows
+		}
+		rpcID := processVertexID(host, rpcGUID)
+		if rpcID != "" && rpcID != targetProcID {
+			if m.writeVertexRows {
+				rows = append(rows, vertexRow("ProcessVertex", rpcID, event, processVertexDataFromRaw(event, "rpcprocess", "")))
+			}
+			rows = append(rows, edgeRow("RPCTriggerEdge", rpcID, targetProcID, event, nil, m.includeEdgeData))
+		}
+	}
+
+	return rows
+}
+
+func (m *Mapper) appendOfflineTargetProcessEdges(rows []*models.AdjacencyRow, event *models.Event, subjectID string) []*models.AdjacencyRow {
+	host := pickHost(event)
+	targetGUID := firstField(event, "TargetProcessGuid", "targetprocessuuid")
+	if host == "" || subjectID == "" || targetGUID == "" {
+		return rows
+	}
+	targetID := processVertexID(host, targetGUID)
+	if targetID == "" || targetID == subjectID {
+		return rows
+	}
+	if m.writeVertexRows {
+		rows = append(rows, vertexRow("ProcessVertex", targetID, event, processVertexDataFromRaw(event, "targetprocess", "")))
+	}
+	rows = append(rows, edgeRow("TargetProcessEdge", subjectID, targetID, event, nil, m.includeEdgeData))
+	return rows
+}
+
+func (m *Mapper) appendOfflineFileEdges(rows []*models.AdjacencyRow, event *models.Event, subjectID string) []*models.AdjacencyRow {
+	host := pickHost(event)
+	targetPath := firstField(event, "file", "filepath", "filename")
+	if host == "" || subjectID == "" || targetPath == "" {
+		return rows
+	}
+	pathID := filePathVertexID(host, targetPath)
+	if pathID == "" {
+		return rows
+	}
+	if m.writeVertexRows {
+		rows = append(rows, vertexRow("FilePathVertex", pathID, event, nil))
+	}
+	rows = append(rows, edgeRow("FileAccessEdge", subjectID, pathID, event, nil, m.includeEdgeData))
+	return rows
+}
+
+func (m *Mapper) appendOfflineModuleEdges(rows []*models.AdjacencyRow, event *models.Event, subjectID string) []*models.AdjacencyRow {
+	host := pickHost(event)
+	modulePath := firstField(event, "newimage", "moduleilpath", "modulename")
+	if host == "" || subjectID == "" || modulePath == "" {
+		return rows
+	}
+	pathID := filePathVertexID(host, modulePath)
+	if pathID == "" {
+		return rows
+	}
+	if m.writeVertexRows {
+		rows = append(rows, vertexRow("FilePathVertex", pathID, event, nil))
+	}
+	rows = append(rows, edgeRow("ImageLoadEdge", pathID, subjectID, event, nil, m.includeEdgeData))
+	return rows
+}
+
+func (m *Mapper) appendOfflineRegistryEdges(rows []*models.AdjacencyRow, event *models.Event, subjectID string) []*models.AdjacencyRow {
+	host := pickHost(event)
+	keyName := firstField(event, "keyname", "registry_path", "reg_path")
+	if host == "" || subjectID == "" || keyName == "" {
+		return rows
+	}
+	valueName := firstField(event, "valuename", "value_name")
+	keyID := registryKeyVertexID(host, keyName)
+	if valueName != "" {
+		valueID := registryValueVertexID(host, keyName, valueName)
+		if m.writeVertexRows {
+			rows = append(rows, vertexRow("RegistryValueVertex", valueID, event, registryValueData(event, keyName, valueName)))
+		}
+		rows = append(rows, edgeRow("RegistrySetValueEdge", subjectID, valueID, event, nil, m.includeEdgeData))
+		return rows
+	}
+	if m.writeVertexRows {
+		rows = append(rows, vertexRow("RegistryKeyVertex", keyID, event, registryKeyData(keyName)))
+	}
+	rows = append(rows, edgeRow("RegistryKeyEdge", subjectID, keyID, event, nil, m.includeEdgeData))
+	return rows
+}
+
+func (m *Mapper) appendOfflineNetworkEdges(rows []*models.AdjacencyRow, event *models.Event, subjectID string) []*models.AdjacencyRow {
+	ip := firstField(event, "DestinationIp", "remoteip", "dstip")
+	port := firstField(event, "DestinationPort", "remoteport", "dstport")
+	if subjectID == "" || ip == "" {
+		return rows
+	}
+	netID := networkVertexID(ip, port)
+	if m.writeVertexRows {
+		rows = append(rows, vertexRow("NetworkVertex", netID, event, nil))
+	}
+	rows = append(rows, edgeRow("ConnectEdge", subjectID, netID, event, nil, m.includeEdgeData))
+	return rows
+}
+
 func attachIOATags(rows []*models.AdjacencyRow, tags []models.IoaTag) []*models.AdjacencyRow {
 	if len(rows) == 0 || len(tags) == 0 {
 		return rows
@@ -78,13 +311,24 @@ func attachIOATags(rows []*models.AdjacencyRow, tags []models.IoaTag) []*models.
 		if row == nil || row.RecordType != recordEdge {
 			continue
 		}
-		if row.Type == "ImageOfEdge" {
+		if skipIOATagEdgeType(row.Type) {
 			continue
 		}
 		row.IoaTags = append([]models.IoaTag(nil), tags...)
 	}
 
 	return rows
+}
+
+func skipIOATagEdgeType(edgeType string) bool {
+	t := strings.TrimSpace(edgeType)
+	if strings.HasPrefix(t, "RPC") {
+		return true
+	}
+	if strings.HasPrefix(t, "ProcessCP") {
+		return true
+	}
+	return false
 }
 
 func (m *Mapper) mapProcessCreate(event *models.Event) []*models.AdjacencyRow {
@@ -119,14 +363,6 @@ func (m *Mapper) mapProcessCreate(event *models.Event) []*models.AdjacencyRow {
 			}))
 		}
 		rows = append(rows, edgeRow("ParentOfEdge", parentID, procID, event, nil, m.includeEdgeData))
-	}
-
-	if image := event.Field("Image"); image != "" {
-		pathID := filePathVertexID(host, image)
-		if m.writeVertexRows {
-			rows = append(rows, vertexRow("FilePathVertex", pathID, event, nil))
-		}
-		rows = append(rows, edgeRow("ImageOfEdge", pathID, procID, event, nil, m.includeEdgeData))
 	}
 
 	return rows
@@ -295,6 +531,9 @@ func baseRow(event *models.Event, recordType, rowType, vertexID, adjacentID stri
 }
 
 func pickHost(event *models.Event) string {
+	if clientID := strings.TrimSpace(edrField(event, "client_id")); clientID != "" {
+		return clientID
+	}
 	if event.AgentID != "" {
 		return event.AgentID
 	}
@@ -302,7 +541,7 @@ func pickHost(event *models.Event) string {
 }
 
 func processIDFromEvent(event *models.Event) (string, bool) {
-	guid := event.Field("ProcessGuid")
+	guid := firstField(event, "ProcessGuid", "processuuid", "newprocessuuid")
 	if guid == "" {
 		guid = event.Field("SourceProcessGuid")
 	}
@@ -347,6 +586,20 @@ func networkVertexID(ip, port string) string {
 	return fmt.Sprintf("net:%s", strings.ToLower(ip))
 }
 
+func registryKeyVertexID(host, key string) string {
+	if host == "" || key == "" {
+		return ""
+	}
+	return fmt.Sprintf("regkey:%s:%s", strings.ToLower(host), strings.ToLower(key))
+}
+
+func registryValueVertexID(host, key, value string) string {
+	if host == "" || key == "" || value == "" {
+		return ""
+	}
+	return fmt.Sprintf("regval:%s:%s|%s", strings.ToLower(host), strings.ToLower(key), strings.ToLower(value))
+}
+
 func extractHash(hashes, key string) string {
 	if hashes == "" {
 		return ""
@@ -367,8 +620,73 @@ func firstField(event *models.Event, names ...string) string {
 		if v := event.Field(name); v != "" {
 			return v
 		}
+		if v := edrField(event, name); v != "" {
+			return v
+		}
 	}
 	return ""
+}
+
+func edrField(event *models.Event, key string) string {
+	if event == nil {
+		return ""
+	}
+	if event.Raw != nil {
+		if v, ok := event.Raw[key]; ok {
+			if s := strings.TrimSpace(fmt.Sprintf("%v", v)); s != "" {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
+func processVertexDataFromRaw(event *models.Event, imageKey, commandKey string) map[string]interface{} {
+	image := strings.TrimSpace(edrField(event, imageKey))
+	command := strings.TrimSpace(edrField(event, commandKey))
+	if image == "" && command == "" {
+		return nil
+	}
+	data := map[string]interface{}{}
+	if image != "" {
+		data["image"] = image
+		data["process_path"] = image
+	}
+	if command != "" {
+		data["command_line"] = command
+	}
+	return data
+}
+
+func registryKeyData(keyName string) map[string]interface{} {
+	if strings.TrimSpace(keyName) == "" {
+		return nil
+	}
+	return map[string]interface{}{"keyname": keyName}
+}
+
+func registryValueData(event *models.Event, keyName, valueName string) map[string]interface{} {
+	data := map[string]interface{}{}
+	if strings.TrimSpace(keyName) != "" {
+		data["keyname"] = keyName
+	}
+	if strings.TrimSpace(valueName) != "" {
+		data["valuename"] = valueName
+	}
+	if valueType := strings.TrimSpace(edrField(event, "valuetype")); valueType != "" {
+		data["valuetype"] = valueType
+	}
+	if len(data) == 0 {
+		return nil
+	}
+	return data
+}
+
+func normalizeGUIDForCompare(v string) string {
+	s := strings.ToLower(strings.TrimSpace(v))
+	s = strings.TrimPrefix(s, "{")
+	s = strings.TrimSuffix(s, "}")
+	return strings.TrimSpace(s)
 }
 
 func processVertexData(event *models.Event) map[string]interface{} {
