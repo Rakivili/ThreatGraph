@@ -41,6 +41,21 @@ var tacticOrder = map[string]int{
 	"impact":               12,
 }
 
+var tacticIDOrder = map[string]int{
+	"ta0001": 1,
+	"ta0002": 2,
+	"ta0003": 3,
+	"ta0004": 4,
+	"ta0005": 5,
+	"ta0006": 6,
+	"ta0007": 7,
+	"ta0008": 8,
+	"ta0009": 9,
+	"ta0011": 10,
+	"ta0010": 11,
+	"ta0040": 12,
+}
+
 var severityWeight = map[string]float64{
 	"informational": 1,
 	"low":           2,
@@ -233,7 +248,10 @@ func tacticRank(v string) int {
 	}
 	n = strings.ReplaceAll(n, "_", "-")
 	n = strings.ReplaceAll(n, " ", "-")
-	return tacticOrder[n]
+	if rank := tacticOrder[n]; rank > 0 {
+		return rank
+	}
+	return tacticIDOrder[n]
 }
 
 // singleAlertScore follows engineering fallback of TS = 2*severity + likelihood.

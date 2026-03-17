@@ -143,6 +143,30 @@ func TestBuildIIPGraphsAssignsByNearestReachableEarlierAlert(t *testing.T) {
 	}
 }
 
+func TestBuildIIPGraphsDedupesSameEdgeSameRuleByEarliestAlert(t *testing.T) {
+	t0 := time.Date(2026, 2, 1, 10, 0, 0, 0, time.UTC)
+	t1 := t0.Add(1 * time.Minute)
+
+	rows := []*models.AdjacencyRow{
+		{Timestamp: t0, RecordType: "edge", Type: "RegistrySetValueEdge", VertexID: "proc:a", AdjacentID: "reg:v1", Hostname: "host-a", RecordID: "1", IoaTags: []models.IoaTag{{ID: "rule-1", Name: "A", Technique: "T1112"}}},
+		{Timestamp: t1, RecordType: "edge", Type: "RegistrySetValueEdge", VertexID: "proc:a", AdjacentID: "reg:v1", Hostname: "host-a", RecordID: "2", IoaTags: []models.IoaTag{{ID: "rule-1", Name: "A", Technique: "T1112"}}},
+	}
+
+	graphs := BuildIIPGraphs(rows)
+	if len(graphs) != 1 {
+		t.Fatalf("expected 1 graph, got %d", len(graphs))
+	}
+	if graphs[0].IIPRecordID != "1" {
+		t.Fatalf("expected earliest alert record to remain seed, got %s", graphs[0].IIPRecordID)
+	}
+	if len(graphs[0].AlertEvents) != 1 {
+		t.Fatalf("expected duplicate later alert to be suppressed, got %d alert events", len(graphs[0].AlertEvents))
+	}
+	if graphs[0].AlertEvents[0].RecordID != "1" {
+		t.Fatalf("expected surviving alert record 1, got %s", graphs[0].AlertEvents[0].RecordID)
+	}
+}
+
 func TestBuildTPGDeduplicatesTechniqueNamePerSourceAndOrdersByTime(t *testing.T) {
 	t0 := time.Date(2026, 2, 1, 10, 0, 0, 0, time.UTC)
 	t1 := t0.Add(1 * time.Minute)
@@ -333,5 +357,31 @@ func TestScoreTPGRepeatedSameRuleUsesLogDampening(t *testing.T) {
 	}
 	if score.RiskProduct <= 12 {
 		t.Fatalf("expected repeated rule to still increase score over single hit, got %f", score.RiskProduct)
+	}
+}
+
+func TestScoreTPGSupportsTacticIDs(t *testing.T) {
+	t0 := time.Date(2026, 2, 2, 10, 0, 0, 0, time.UTC)
+	t1 := t0.Add(1 * time.Minute)
+
+	tpg := TPG{
+		Host: "host-a",
+		Root: "proc:a",
+		Vertices: []AlertEvent{
+			{TS: t0, RecordID: "1", IoaTags: []models.IoaTag{{Tactic: "TA0002", Severity: "high", Technique: "T1059", Name: "exec-a"}}},
+			{TS: t1, RecordID: "2", IoaTags: []models.IoaTag{{Tactic: "TA0008", Severity: "high", Technique: "T1021", Name: "lat-a"}}},
+		},
+		SequenceEdges: []TPGSequenceEdge{{From: 0, To: 1}},
+	}
+
+	score := ScoreTPG(tpg)
+	if score.SequenceLength != 2 {
+		t.Fatalf("expected sequence length 2 with tactic IDs, got %d", score.SequenceLength)
+	}
+	if score.RiskProduct <= 0 {
+		t.Fatalf("expected positive risk product with tactic IDs, got %f", score.RiskProduct)
+	}
+	if score.TacticCoverage != 2 {
+		t.Fatalf("expected tactic coverage 2 with tactic IDs, got %d", score.TacticCoverage)
 	}
 }

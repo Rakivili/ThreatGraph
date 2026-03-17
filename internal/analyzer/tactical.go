@@ -104,6 +104,7 @@ func BuildIIPGraphs(rows []*models.AdjacencyRow) []IIPGraph {
 }
 
 func BuildIIPGraphsWithStats(rows []*models.AdjacencyRow) ([]IIPGraph, IIPBuildStats) {
+	rows = dedupeSameEdgeSameRuleAlerts(rows)
 	stats := IIPBuildStats{SeedCountByHost: make(map[string]int, 8)}
 	alerts := CollectAlertEvents(rows)
 	stats.AlertCount = len(alerts)
@@ -679,6 +680,45 @@ func alertIdentity(ev AlertEvent) string {
 
 func isAlertEdge(row *models.AdjacencyRow) bool {
 	return row != nil && row.RecordType == "edge" && len(row.IoaTags) > 0
+}
+
+func dedupeSameEdgeSameRuleAlerts(rows []*models.AdjacencyRow) []*models.AdjacencyRow {
+	if len(rows) == 0 {
+		return rows
+	}
+	seen := make(map[string]struct{}, 256)
+	out := make([]*models.AdjacencyRow, 0, len(rows))
+	for _, row := range rows {
+		if row == nil || !isAlertEdge(row) {
+			out = append(out, row)
+			continue
+		}
+		ruleID := firstRuleID(row.IoaTags)
+		if ruleID == "" {
+			out = append(out, row)
+			continue
+		}
+		key := hostForRow(row) + "|" + row.VertexID + "|" + row.AdjacentID + "|" + row.Type + "|" + ruleID
+		if _, ok := seen[key]; ok {
+			clone := *row
+			clone.IoaTags = nil
+			out = append(out, &clone)
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, row)
+	}
+	return out
+}
+
+func firstRuleID(tags []models.IoaTag) string {
+	for _, tag := range tags {
+		id := strings.TrimSpace(tag.ID)
+		if id != "" {
+			return id
+		}
+	}
+	return ""
 }
 
 func firstTechniqueAndName(tags []models.IoaTag) (string, string) {
