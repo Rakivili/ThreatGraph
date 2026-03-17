@@ -3,9 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import ssl
 import subprocess
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 from flask import Flask, Response, jsonify, render_template_string, send_file
 
@@ -104,7 +107,7 @@ function renderTable() {
       <td>${x.sequence_length||0}</td>
       <td>${x.alert_count||0}</td>
       <td>${x.risk_product||0}</td>
-      <td class="mono">${x.root||''}</td>`;
+<td class="mono">${x.root_display || x.root || ''}</td>`;
     tr.onclick = () => showDetail(x);
     tbody.appendChild(tr);
   });
@@ -125,7 +128,8 @@ function showDetail(inc) {
   document.getElementById('detail').innerHTML = `
     <div class="kvs">
       <div class="kv"><div class="k">Host</div><div class="v mono">${inc.host||''}</div></div>
-      <div class="kv"><div class="k">Root</div><div class="v mono">${inc.root||''}</div></div>
+<div class="kv"><div class="k">Root</div><div class="v mono">${inc.root||''}</div></div>
+<div class="kv"><div class="k">Root Display</div><div class="v mono">${inc.root_display||''}</div></div>
       <div class="kv"><div class="k">IIP Time</div><div class="v">${inc.iip_ts||''}</div></div>
       <div class="kv"><div class="k">Seq / Alerts / Risk</div><div class="v">${inc.sequence_length||0} / ${inc.alert_count||0} / ${inc.risk_product||0}</div></div>
     </div>
@@ -306,10 +310,21 @@ def create_app() -> Flask:
     incidents_path = Path(os.environ.get("TG_INCIDENTS_FILE", str(output_dir / "incidents.latest.min2.jsonl")))
     scored_path = Path(os.environ.get("TG_SCORED_FILE", str(output_dir / "scored_tpg.latest.jsonl")))
     adjacency_path = Path(os.environ.get("TG_ADJACENCY_FILE", str(output_dir / "adjacency.min.jsonl")))
+    ch_url = (os.environ.get("TG_CH_URL", "") or "").strip()
+    ch_database = (os.environ.get("TG_CH_DATABASE", "threatgraph") or "threatgraph").strip()
+    ch_table = (os.environ.get("TG_CH_TABLE", "") or "").strip()
+    ch_since = (os.environ.get("TG_CH_SINCE", "") or "").strip()
+    ch_until = (os.environ.get("TG_CH_UNTIL", "") or "").strip()
+    es_url = (os.environ.get("TG_ES_URL", "https://192.168.120.134:9200") or "").strip()
+    es_user = (os.environ.get("TG_ES_USER", "elastic") or "").strip()
+    es_pass = (os.environ.get("TG_ES_PASS", "__nmRSxBG2Hzr15uWCoI") or "").strip()
+    es_index = (os.environ.get("TG_ES_INDEX", "edr-offline-ls-*") or "").strip()
     svg_cache_dir = output_dir / "svg_cache"
     json_cache_dir = output_dir / "json_cache"
+    ch_cache_dir = output_dir / "ch_cache"
     svg_cache_dir.mkdir(parents=True, exist_ok=True)
     json_cache_dir.mkdir(parents=True, exist_ok=True)
+    ch_cache_dir.mkdir(parents=True, exist_ok=True)
 
     def _svg_fallback(message: str) -> Response:
         safe = (message or "SVG unavailable").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -382,6 +397,7 @@ def create_app() -> Flask:
         return Response("".join(parts), mimetype="image/svg+xml")
 
     adjacency_cache: dict[str, Any] = {"mtime": None, "meta": {}}
+    proc_root_display_cache: dict[str, str] = {}
 
     def _adjacency_candidates() -> list[Path]:
         cands = [
@@ -399,6 +415,102 @@ def create_app() -> Flask:
             out.append(p)
         return out
 
+    def _sql_quote(value: str) -> str:
+        return "'" + str(value).replace("\\", "\\\\").replace("'", "''") + "'"
+
+    def _clickhouse_enabled() -> bool:
+        return bool(ch_url and ch_table and ch_since and ch_until)
+
+    def _clickhouse_host_cache_file(host: str) -> Path:
+        digest = hashlib.sha1(host.encode("utf-8", errors="ignore")).hexdigest()[:16]
+        return ch_cache_dir / f"host_{digest}.jsonl"
+
+    def _clickhouse_query(query: str) -> str:
+        req = Request(ch_url + "?" + urlencode({"query": query}))
+        with urlopen(req, timeout=120) as resp:
+            return resp.read().decode("utf-8", errors="ignore")
+
+    def _es_query(payload: dict[str, Any]) -> dict[str, Any]:
+        req = Request(es_url.rstrip("/") + f"/{es_index}/_search", data=json.dumps(payload).encode("utf-8"), method="POST")
+        req.add_header("Content-Type", "application/json")
+        if es_user:
+            import base64
+            token = base64.b64encode(f"{es_user}:{es_pass}".encode("utf-8")).decode("ascii")
+            req.add_header("Authorization", f"Basic {token}")
+        ctx = ssl._create_unverified_context()
+        with urlopen(req, timeout=120, context=ctx) as resp:
+            return json.loads(resp.read().decode("utf-8", errors="ignore"))
+
+    def _proc_root_display(root: str, host: str) -> str:
+        if not isinstance(root, str) or not root.startswith("proc:") or not host:
+            return ""
+        cache_key = f"{host}::{root}"
+        cached = proc_root_display_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        parts = root.split(":", 2)
+        if len(parts) < 3:
+            proc_root_display_cache[cache_key] = ""
+            return ""
+        guid = parts[2]
+        query = {
+            "size": 1,
+            "_source": ["process", "newprocess"],
+            "query": {
+                "bool": {
+                    "filter": [
+                        {"term": {"client_id": host}},
+                        {
+                            "bool": {
+                                "should": [
+                                    {"term": {"processuuid": guid}},
+                                    {"term": {"newprocessuuid": guid}},
+                                ],
+                                "minimum_should_match": 1,
+                            }
+                        },
+                    ]
+                }
+            },
+            "sort": [{"@timestamp": "asc"}],
+        }
+        try:
+            data = _es_query(query)
+            hits = (((data or {}).get("hits") or {}).get("hits") or [])
+            if hits:
+                src = hits[0].get("_source") or {}
+                display = str(src.get("process") or src.get("newprocess") or "")
+                proc_root_display_cache[cache_key] = display
+                return display
+        except Exception:
+            pass
+        proc_root_display_cache[cache_key] = ""
+        return ""
+
+    def _fetch_clickhouse_host_rows(host: str, force: bool = False) -> Path | None:
+        if not _clickhouse_enabled() or not host:
+            return None
+        path = _clickhouse_host_cache_file(host)
+        if path.exists() and not force:
+            return path
+        query = (
+            "SELECT ts, record_type, type, vertex_id, adjacent_id, event_id, host, agent_id, record_id, ioa_tags "
+            f"FROM {ch_database}.{ch_table} "
+            "WHERE host = " + _sql_quote(host) + " "
+            "AND ts >= toDateTime64(" + _sql_quote(ch_since) + ", 3) "
+            "AND ts < toDateTime64(" + _sql_quote(ch_until) + ", 3) "
+            "ORDER BY ts, record_id FORMAT JSONEachRow"
+        )
+        data = _clickhouse_query(query)
+        path.write_text(data, encoding="utf-8")
+        return path if path.exists() else None
+
+    def _resolve_adjacency_input(host: str, force: bool = False) -> Path | None:
+        candidates = [p for p in _adjacency_candidates() if p.exists() and p.stat().st_size > 0]
+        if candidates:
+            return candidates[0]
+        return _fetch_clickhouse_host_rows(host, force=force)
+
     def _vertex_kind(vertex_id: str) -> str:
         if not isinstance(vertex_id, str) or ":" not in vertex_id:
             return "unknown"
@@ -412,15 +524,16 @@ def create_app() -> Flask:
         parts = vertex_id.split(":", 2)
         return parts[2] if len(parts) >= 3 else ""
 
-    def _load_adjacency_meta() -> dict[str, dict[str, Any]]:
-        if not adjacency_path.exists():
+    def _load_adjacency_meta(source_path: Path | None = None) -> dict[str, dict[str, Any]]:
+        src = source_path or adjacency_path
+        if not src.exists():
             return {}
-        mtime = adjacency_path.stat().st_mtime
+        mtime = src.stat().st_mtime
         if adjacency_cache["mtime"] == mtime and adjacency_cache["meta"]:
             return adjacency_cache["meta"]
 
         meta: dict[str, dict[str, Any]] = {}
-        for line in adjacency_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        for line in src.read_text(encoding="utf-8", errors="ignore").splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -436,13 +549,13 @@ def create_app() -> Flask:
                 meta[vid] = {"id": vid, "kind": _vertex_kind(vid), "data": data}
                 continue
 
-            if rtype == "edge" and row.get("type") == "ImageOfEdge":
-                src = row.get("vertex_id")
-                dst = row.get("adjacent_id")
-                if _vertex_kind(src) in {"path", "file"} and _vertex_kind(dst) == "proc":
-                    image = _extract_path_from_path_vertex(src)
+            if rtype == "edge" and row.get("type") == "ImageLoadEdge":
+                src_v = row.get("vertex_id")
+                dst_v = row.get("adjacent_id")
+                if _vertex_kind(src_v) in {"path", "file"} and _vertex_kind(dst_v) == "proc":
+                    image = _extract_path_from_path_vertex(src_v)
                     if image:
-                        item = meta.setdefault(dst, {"id": dst, "kind": "proc", "data": {}})
+                        item = meta.setdefault(dst_v, {"id": dst_v, "kind": "proc", "data": {}})
                         d = item.setdefault("data", {})
                         if not (d.get("image") or d.get("Image")):
                             d["image"] = image
@@ -542,6 +655,32 @@ def create_app() -> Flask:
             cmd.extend(["--start-ts", start_ts])
         subprocess.run(cmd, cwd=Path(__file__).resolve().parents[1], check=True, capture_output=True, text=True)
 
+    def _build_svg_from_tpg_subgraph(root: str, host: str, target_svg: Path, input_file: Path | None = None, force: bool = False) -> None:
+        src = input_file or adjacency_path
+        cmd = [
+            "python3",
+            "tools/visualize_tpg_subgraph.py",
+            "--input",
+            str(src),
+            "--scored",
+            str(scored_path),
+            "--root",
+            root,
+            "--host",
+            host,
+            "--image",
+            str(target_svg),
+            "--layout",
+            "tree",
+            "--limit",
+            "5000",
+            "--edge-label",
+            "text",
+            "--max-size",
+            "2400",
+        ]
+        subprocess.run(cmd, cwd=Path(__file__).resolve().parents[1], check=True, capture_output=True, text=True)
+
     def _build_json(root: str, target: Path, input_file: Path | None = None) -> None:
         src = input_file or adjacency_path
         cmd = [
@@ -560,16 +699,16 @@ def create_app() -> Flask:
         ]
         subprocess.run(cmd, cwd=Path(__file__).resolve().parents[1], check=True, capture_output=True, text=True)
 
-    def _load_or_build_subgraph_json(root: str, host: str, force: bool = False) -> dict[str, Any]:
+    def _load_or_build_subgraph_json(root: str, host: str, source_file: Path | None = None, force: bool = False) -> dict[str, Any]:
         path = _json_cache_file(root, host)
         should_rebuild = force or (not path.exists())
-        if not should_rebuild and adjacency_path.exists() and path.exists():
-            should_rebuild = adjacency_path.stat().st_mtime > path.stat().st_mtime
+        src = source_file or adjacency_path
+        if not should_rebuild and src.exists() and path.exists():
+            should_rebuild = src.stat().st_mtime > path.stat().st_mtime
         if should_rebuild:
             built = False
-            for cand in _adjacency_candidates():
-                if not cand.exists() or cand.stat().st_size == 0:
-                    continue
+            candidates = [src] if src and src.exists() else [p for p in _adjacency_candidates() if p.exists() and p.stat().st_size > 0]
+            for cand in candidates:
                 try:
                     _build_json(root, path, input_file=cand)
                     built = True
@@ -592,6 +731,11 @@ def create_app() -> Flask:
     @app.get("/api/data")
     def api_data():
         incidents = _read_jsonl(incidents_path)
+        for inc in incidents:
+            root = str(inc.get("root") or "")
+            host = str(inc.get("host") or "")
+            if root.startswith("proc:"):
+                inc["root_display"] = _proc_root_display(root, host)
         incidents.sort(key=lambda x: (x.get("risk_product", 0), x.get("sequence_length", 0)), reverse=True)
         scored = _read_jsonl(scored_path)
         return jsonify(
@@ -614,12 +758,7 @@ def create_app() -> Flask:
         host = (request.args.get("host") or "").strip()
         if not root:
             return jsonify({"error": "missing root"}), 400
-        candidates = [p for p in _adjacency_candidates() if p.exists() and p.stat().st_size > 0]
-        if not candidates:
-            return _svg_fallback("adjacency file missing or empty")
 
-        svg_path = _svg_cache_file(root, host)
-        force = (request.args.get("force") or "").strip() in {"1", "true", "yes"}
         scored = _read_jsonl(scored_path)
         target = None
         for row in scored:
@@ -631,24 +770,33 @@ def create_app() -> Flask:
                 if row.get("root") == root:
                     target = row
                     break
+
+        force = (request.args.get("force") or "").strip() in {"1", "true", "yes"}
+        source_input = _resolve_adjacency_input(host, force=force)
+        if source_input is None or not source_input.exists() or source_input.stat().st_size == 0:
+            if isinstance(target, dict):
+                return _svg_from_tpg(target)
+            return _svg_fallback("adjacency file missing or empty")
+
+        svg_path = _svg_cache_file(root, host)
         try:
             should_rebuild = force or (not svg_path.exists())
-            newest_input_mtime = max((p.stat().st_mtime for p in candidates), default=0)
+            newest_input_mtime = source_input.stat().st_mtime
             if not should_rebuild and svg_path.exists():
                 should_rebuild = newest_input_mtime > svg_path.stat().st_mtime
             if should_rebuild:
-                built = False
-                for cand in candidates:
-                    try:
-                        _build_svg(root, svg_path, start_ts="", input_file=cand)
-                        built = True
-                        break
-                    except subprocess.CalledProcessError:
-                        continue
-                if not built:
+                try:
                     if isinstance(target, dict):
-                        return _svg_from_tpg(target)
-                    return _svg_fallback("svg generation failed")
+                        _build_svg_from_tpg_subgraph(root, host, svg_path, input_file=source_input, force=force)
+                    else:
+                        _build_svg(root, svg_path, start_ts="", input_file=source_input)
+                except subprocess.CalledProcessError:
+                    try:
+                        _build_svg(root, svg_path, start_ts="", input_file=source_input)
+                    except subprocess.CalledProcessError:
+                        if isinstance(target, dict):
+                            return _svg_from_tpg(target)
+                        return _svg_fallback("svg generation failed")
             return send_file(svg_path, mimetype="image/svg+xml")
         except subprocess.CalledProcessError as exc:
             if isinstance(target, dict):
@@ -685,8 +833,9 @@ def create_app() -> Flask:
         if target is None:
             return jsonify({"error": "incident not found in scored_tpg"}), 404
 
-        meta_map = _load_adjacency_meta()
-        subgraph = _load_or_build_subgraph_json(root, host, force=False)
+        source_input = _resolve_adjacency_input(host, force=False)
+        meta_map = _load_adjacency_meta(source_input)
+        subgraph = _load_or_build_subgraph_json(root, host, source_file=source_input, force=False)
         label_map: dict[str, str] = {}
         for n in (subgraph.get("nodes") or []):
             if isinstance(n, dict) and n.get("id"):
