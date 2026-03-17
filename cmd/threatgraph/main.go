@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -34,6 +35,7 @@ import (
 	"threatgraph/internal/pipeline"
 	"threatgraph/internal/rules"
 	"threatgraph/internal/service"
+	"threatgraph/pkg/models"
 )
 
 type incidentExplainOutput struct {
@@ -400,7 +402,13 @@ func runProducer(args []string) {
 
 func runAnalyzer(args []string) int {
 	fs := flag.NewFlagSet("analyze", flag.ContinueOnError)
+	source := fs.String("source", "file", "Analyze source: file|clickhouse")
+	configPath := fs.String("config", "", "Config YAML path (required for clickhouse source)")
 	input := fs.String("input", "output/adjacency.jsonl", "Adjacency JSONL input path")
+	hostFilter := fs.String("host", "", "Optional host filter for clickhouse source (comma-separated)")
+	sinceRaw := fs.String("since", "", "Start time for clickhouse source (RFC3339)")
+	untilRaw := fs.String("until", "", "End time for clickhouse source (RFC3339)")
+	adjTable := fs.String("adjacency-table", "", "ClickHouse adjacency table override")
 	output := fs.String("output", "output/iip_graphs.jsonl", "IIP graph JSONL output path")
 	tacticalOutput := fs.String("tactical-output", "", "Optional tactical scored TPG JSONL output path")
 	incidentOutput := fs.String("incident-output", "", "Optional incident JSONL output path")
@@ -413,12 +421,139 @@ func runAnalyzer(args []string) int {
 		return 2
 	}
 
-	rows, err := analyzer.LoadRowsJSONL(*input)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to load adjacency rows: %v\n", err)
-		return 1
+	var rows []*models.AdjacencyRow
+	var iips []analyzer.IIPGraph
+	var err error
+	switch strings.ToLower(strings.TrimSpace(*source)) {
+	case "", "file":
+		rows, err = analyzer.LoadRowsJSONL(*input)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to load adjacency rows: %v\n", err)
+			return 1
+		}
+		iips = analyzer.BuildIIPGraphs(rows)
+	case "clickhouse":
+		cfg, err := config.LoadConfig(findConfigFile(*configPath))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
+			return 1
+		}
+		applyDefaults(cfg)
+		if strings.TrimSpace(*sinceRaw) == "" || strings.TrimSpace(*untilRaw) == "" {
+			fmt.Fprintf(os.Stderr, "analyze --source=clickhouse requires --since and --until\n")
+			return 2
+		}
+		since, err := time.Parse(time.RFC3339, strings.TrimSpace(*sinceRaw))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "invalid --since (must be RFC3339): %v\n", err)
+			return 2
+		}
+		until, err := time.Parse(time.RFC3339, strings.TrimSpace(*untilRaw))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "invalid --until (must be RFC3339): %v\n", err)
+			return 2
+		}
+		if !since.Before(until) {
+			fmt.Fprintf(os.Stderr, "--since must be earlier than --until\n")
+			return 2
+		}
+		chCfg := cfg.ThreatGraph.Serve.Analyze.ClickHouse
+		table := strings.TrimSpace(*adjTable)
+		if table == "" {
+			table = cfg.ThreatGraph.Serve.Analyze.AdjacencyTable
+		}
+		reader, err := inputclickhouse.NewReader(inputclickhouse.Config{
+			URL:            chCfg.URL,
+			Database:       chCfg.Database,
+			AdjacencyTable: table,
+			IOATable:       cfg.ThreatGraph.Serve.Analyze.IOATable,
+			ProcessedTable: cfg.ThreatGraph.Serve.Analyze.ProcessedTable,
+			Username:       chCfg.Username,
+			Password:       chCfg.Password,
+			Timeout:        chCfg.Timeout,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to create clickhouse reader: %v\n", err)
+			return 1
+		}
+		hosts := splitCSV(strings.TrimSpace(*hostFilter))
+		if len(hosts) == 0 {
+			hosts, err = reader.ReadAlertHostsFromAdjacency(since, until)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "failed to discover clickhouse hosts: %v\n", err)
+				return 1
+			}
+		}
+		if len(hosts) == 0 {
+			fmt.Printf("analyzed rows=0 iips=0 iip_output=%s\n", *output)
+			return 0
+		}
+		sort.Strings(hosts)
+		if err := prepareJSONLinesFile(*output); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to prepare iip output: %v\n", err)
+			return 1
+		}
+		if strings.TrimSpace(*tacticalOutput) != "" {
+			if err := prepareJSONLinesFile(*tacticalOutput); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to prepare tactical output: %v\n", err)
+				return 1
+			}
+		}
+		if strings.TrimSpace(*incidentOutput) != "" {
+			if err := prepareJSONLinesFile(*incidentOutput); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to prepare incident output: %v\n", err)
+				return 1
+			}
+		}
+		totalRows := 0
+		totalIIPs := 0
+		totalIncidents := 0
+		for _, host := range hosts {
+			hostRows, err := reader.ReadRows(host, since, until)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "failed to read adjacency rows for host %s: %v\n", host, err)
+				return 1
+			}
+			if len(hostRows) == 0 {
+				continue
+			}
+			totalRows += len(hostRows)
+			hostIIPs := analyzer.BuildIIPGraphs(hostRows)
+			if len(hostIIPs) == 0 {
+				continue
+			}
+			totalIIPs += len(hostIIPs)
+			if err := appendJSONLines(*output, hostIIPs); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to append iip output: %v\n", err)
+				return 1
+			}
+			hostScored := analyzer.BuildScoredTPGs(hostIIPs)
+			if strings.TrimSpace(*tacticalOutput) != "" {
+				if err := appendJSONLines(*tacticalOutput, hostScored); err != nil {
+					fmt.Fprintf(os.Stderr, "failed to append tactical output: %v\n", err)
+					return 1
+				}
+			}
+			if strings.TrimSpace(*incidentOutput) != "" {
+				hostIncidents := analyzer.BuildIncidents(hostScored, *incidentMinSeq)
+				totalIncidents += len(hostIncidents)
+				if err := appendJSONLines(*incidentOutput, hostIncidents); err != nil {
+					fmt.Fprintf(os.Stderr, "failed to append incidents: %v\n", err)
+					return 1
+				}
+			}
+		}
+		if strings.TrimSpace(*incidentOutput) != "" {
+			fmt.Printf("analyzed rows=%d iips=%d incidents=%d iip_output=%s\n", totalRows, totalIIPs, totalIncidents, *output)
+			return 0
+		}
+		fmt.Printf("analyzed rows=%d iips=%d iip_output=%s\n", totalRows, totalIIPs, *output)
+		return 0
+	default:
+		fmt.Fprintf(os.Stderr, "unknown analyze source: %s\n", *source)
+		return 2
 	}
-	iips := analyzer.BuildIIPGraphs(rows)
+
 	scored := analyzer.BuildScoredTPGs(iips)
 
 	if err := writeJSONLines(*output, iips); err != nil {
@@ -445,7 +580,35 @@ func runAnalyzer(args []string) int {
 	return 0
 }
 
+func splitCSV(v string) []string {
+	if strings.TrimSpace(v) == "" {
+		return nil
+	}
+	parts := strings.Split(v, ",")
+	out := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for _, p := range parts {
+		s := strings.TrimSpace(p)
+		if s == "" {
+			continue
+		}
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out
+}
+
 func writeJSONLines[T any](path string, rows []T) error {
+	if err := prepareJSONLinesFile(path); err != nil {
+		return err
+	}
+	return appendJSONLines(path, rows)
+}
+
+func prepareJSONLinesFile(path string) error {
 	dir := filepath.Dir(path)
 	if dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0755); err != nil {
@@ -456,6 +619,14 @@ func writeJSONLines[T any](path string, rows []T) error {
 	f, err := os.Create(path)
 	if err != nil {
 		return fmt.Errorf("create output file: %w", err)
+	}
+	return f.Close()
+}
+
+func appendJSONLines[T any](path string, rows []T) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return fmt.Errorf("open output file: %w", err)
 	}
 	defer f.Close()
 

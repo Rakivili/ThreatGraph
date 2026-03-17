@@ -245,6 +245,40 @@ func (r *Reader) ReadRows(host string, since, until time.Time) ([]*models.Adjace
 	return rows, scanner.Err()
 }
 
+func (r *Reader) ReadAlertHostsFromAdjacency(since, until time.Time) ([]string, error) {
+	q := fmt.Sprintf(
+		"SELECT DISTINCT host FROM %s.%s WHERE record_type = 'edge' AND ioa_tags != '[]' AND ts BETWEEN '%s' AND '%s' ORDER BY host FORMAT JSONEachRow",
+		quoteIdent(r.database), quoteIdent(r.adjTable),
+		since.In(time.Local).Format("2006-01-02 15:04:05.000"),
+		until.In(time.Local).Format("2006-01-02 15:04:05.000"),
+	)
+
+	body, err := r.execQuery(q)
+	if err != nil {
+		return nil, fmt.Errorf("ReadAlertHostsFromAdjacency: %w", err)
+	}
+	defer body.Close()
+
+	var hosts []string
+	scanner := bufio.NewScanner(body)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var row struct {
+			Host string `json:"host"`
+		}
+		if err := json.Unmarshal([]byte(line), &row); err != nil {
+			continue
+		}
+		if strings.TrimSpace(row.Host) != "" {
+			hosts = append(hosts, strings.TrimSpace(row.Host))
+		}
+	}
+	return hosts, scanner.Err()
+}
+
 func (r *Reader) execQuery(query string) (io.ReadCloser, error) {
 	endpoint := r.baseURL + "/?query=" + url.QueryEscape(query)
 
