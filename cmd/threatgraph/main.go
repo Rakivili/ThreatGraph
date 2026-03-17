@@ -20,6 +20,7 @@ import (
 	"threatgraph/internal/analyzer"
 	"threatgraph/internal/graph/adjacency"
 	inputclickhouse "threatgraph/internal/input/clickhouse"
+	inputelasticsearch "threatgraph/internal/input/elasticsearch"
 	inputredis "threatgraph/internal/input/redis"
 	"threatgraph/internal/logger"
 	"threatgraph/internal/output/adjacencyclickhouse"
@@ -100,11 +101,23 @@ func applyDefaults(cfg *config.Config) {
 	if cfg.ThreatGraph.Input.Redis.Addr == "" {
 		cfg.ThreatGraph.Input.Redis.Addr = "127.0.0.1:6379"
 	}
+	if cfg.ThreatGraph.Input.Mode == "" {
+		cfg.ThreatGraph.Input.Mode = "redis"
+	}
 	if cfg.ThreatGraph.Input.Redis.Key == "" {
 		cfg.ThreatGraph.Input.Redis.Key = "sysmon_events"
 	}
 	if cfg.ThreatGraph.Input.Redis.BlockTimeout == 0 {
 		cfg.ThreatGraph.Input.Redis.BlockTimeout = 5 * time.Second
+	}
+	if cfg.ThreatGraph.Input.Elasticsearch.BatchSize <= 0 {
+		cfg.ThreatGraph.Input.Elasticsearch.BatchSize = 1000
+	}
+	if cfg.ThreatGraph.Input.Elasticsearch.Scroll <= 0 {
+		cfg.ThreatGraph.Input.Elasticsearch.Scroll = 5 * time.Minute
+	}
+	if cfg.ThreatGraph.Input.Elasticsearch.Timeout <= 0 {
+		cfg.ThreatGraph.Input.Elasticsearch.Timeout = 30 * time.Second
 	}
 
 	if cfg.ThreatGraph.Pipeline.Workers <= 0 {
@@ -196,16 +209,42 @@ func runProducer(args []string) {
 	logger.Infof("ThreatGraph starting")
 	logger.Infof("Config loaded from: %s", configPath)
 
-	consumer, err := inputredis.NewConsumer(inputredis.Config{
-		Addr:         cfg.ThreatGraph.Input.Redis.Addr,
-		Password:     cfg.ThreatGraph.Input.Redis.Password,
-		DB:           cfg.ThreatGraph.Input.Redis.DB,
-		Key:          cfg.ThreatGraph.Input.Redis.Key,
-		BlockTimeout: cfg.ThreatGraph.Input.Redis.BlockTimeout,
-	})
-	if err != nil {
-		logger.Errorf("Failed to create Redis consumer: %v", err)
-		log.Fatalf("Failed to create Redis consumer: %v", err)
+	var consumer pipeline.MessageConsumer
+	switch strings.ToLower(strings.TrimSpace(cfg.ThreatGraph.Input.Mode)) {
+	case "", "redis":
+		consumer, err = inputredis.NewConsumer(inputredis.Config{
+			Addr:         cfg.ThreatGraph.Input.Redis.Addr,
+			Password:     cfg.ThreatGraph.Input.Redis.Password,
+			DB:           cfg.ThreatGraph.Input.Redis.DB,
+			Key:          cfg.ThreatGraph.Input.Redis.Key,
+			BlockTimeout: cfg.ThreatGraph.Input.Redis.BlockTimeout,
+		})
+		if err != nil {
+			logger.Errorf("Failed to create Redis consumer: %v", err)
+			log.Fatalf("Failed to create Redis consumer: %v", err)
+		}
+		logger.Infof("Input mode: redis (%s key=%s)", cfg.ThreatGraph.Input.Redis.Addr, cfg.ThreatGraph.Input.Redis.Key)
+	case "elasticsearch":
+		consumer, err = inputelasticsearch.NewConsumer(inputelasticsearch.Config{
+			URL:        cfg.ThreatGraph.Input.Elasticsearch.URL,
+			Username:   cfg.ThreatGraph.Input.Elasticsearch.Username,
+			Password:   cfg.ThreatGraph.Input.Elasticsearch.Password,
+			Index:      cfg.ThreatGraph.Input.Elasticsearch.Index,
+			Query:      cfg.ThreatGraph.Input.Elasticsearch.Query,
+			BatchSize:  cfg.ThreatGraph.Input.Elasticsearch.BatchSize,
+			Scroll:     cfg.ThreatGraph.Input.Elasticsearch.Scroll,
+			Timeout:    cfg.ThreatGraph.Input.Elasticsearch.Timeout,
+			Headers:    cfg.ThreatGraph.Input.Elasticsearch.Headers,
+			CACertPath: cfg.ThreatGraph.Input.Elasticsearch.CACertPath,
+			Insecure:   cfg.ThreatGraph.Input.Elasticsearch.Insecure,
+		})
+		if err != nil {
+			logger.Errorf("Failed to create Elasticsearch consumer: %v", err)
+			log.Fatalf("Failed to create Elasticsearch consumer: %v", err)
+		}
+		logger.Infof("Input mode: elasticsearch (%s index=%s)", cfg.ThreatGraph.Input.Elasticsearch.URL, cfg.ThreatGraph.Input.Elasticsearch.Index)
+	default:
+		log.Fatalf("Unknown input mode: %s", cfg.ThreatGraph.Input.Mode)
 	}
 
 	mapper := adjacency.NewMapper(adjacency.MapperOptions{

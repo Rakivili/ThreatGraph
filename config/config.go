@@ -33,7 +33,9 @@ type GraphConfig struct {
 
 // InputConfig controls the input reader.
 type InputConfig struct {
-	Redis RedisConfig `yaml:"redis"`
+	Mode          string              `yaml:"mode"`
+	Redis         RedisConfig         `yaml:"redis"`
+	Elasticsearch ElasticsearchConfig `yaml:"elasticsearch"`
 }
 
 // PipelineConfig controls pipeline behavior.
@@ -56,6 +58,20 @@ type RedisConfig struct {
 	DB           int           `yaml:"db"`
 	Key          string        `yaml:"key"`
 	BlockTimeout time.Duration `yaml:"block_timeout"`
+}
+
+type ElasticsearchConfig struct {
+	URL        string            `yaml:"url"`
+	Username   string            `yaml:"username"`
+	Password   string            `yaml:"password"`
+	Index      string            `yaml:"index"`
+	Query      string            `yaml:"query"`
+	BatchSize  int               `yaml:"batch_size"`
+	Scroll     time.Duration     `yaml:"scroll"`
+	Timeout    time.Duration     `yaml:"timeout"`
+	Headers    map[string]string `yaml:"headers"`
+	CACertPath string            `yaml:"ca_cert_path"`
+	Insecure   bool              `yaml:"insecure"`
 }
 
 // OutputConfig controls output.
