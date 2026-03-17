@@ -2,21 +2,28 @@ package pipeline
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"time"
 
 	"threatgraph/internal/graph/adjacency"
-	inputredis "threatgraph/internal/input/redis"
 	"threatgraph/internal/logger"
 	"threatgraph/internal/rules"
 	"threatgraph/internal/transform/sysmon"
 	"threatgraph/pkg/models"
 )
 
+type MessageConsumer interface {
+	Pop(ctx context.Context) ([]byte, error)
+	Close() error
+}
+
 // RedisAdjacencyPipeline consumes Redis events and writes adjacency rows.
 type RedisAdjacencyPipeline struct {
-	consumer      *inputredis.Consumer
+	consumer      MessageConsumer
 	engine        rules.Engine
 	mapper        *adjacency.Mapper
 	writer        AdjacencyWriter
@@ -35,7 +42,7 @@ type redisWorkItem struct {
 }
 
 // NewRedisAdjacencyPipeline creates a pipeline for Redis adjacency output.
-func NewRedisAdjacencyPipeline(consumer *inputredis.Consumer, engine rules.Engine, mapper *adjacency.Mapper, writer AdjacencyWriter, ioaWriter IOAWriter, rawWriter RawWriter, workers, batchSize int, flushInterval time.Duration, rawBatchSize int, rawFlushInterval time.Duration) *RedisAdjacencyPipeline {
+func NewRedisAdjacencyPipeline(consumer MessageConsumer, engine rules.Engine, mapper *adjacency.Mapper, writer AdjacencyWriter, ioaWriter IOAWriter, rawWriter RawWriter, workers, batchSize int, flushInterval time.Duration, rawBatchSize int, rawFlushInterval time.Duration) *RedisAdjacencyPipeline {
 	return &RedisAdjacencyPipeline{
 		consumer:      consumer,
 		engine:        engine,
@@ -80,6 +87,7 @@ func (p *RedisAdjacencyPipeline) Run(ctx context.Context) error {
 
 	var producerWG sync.WaitGroup
 	var writerWG sync.WaitGroup
+	producerDone := make(chan struct{})
 
 	producerWG.Add(1)
 	go func() {
@@ -112,11 +120,22 @@ func (p *RedisAdjacencyPipeline) Run(ctx context.Context) error {
 		}()
 	}
 
-	<-ctx.Done()
+	go func() {
+		producerWG.Wait()
+		close(producerDone)
+	}()
+
+	select {
+	case <-ctx.Done():
+	case <-producerDone:
+	}
 	producerWG.Wait()
 	close(workCh)
 	writerWG.Wait()
-	return ctx.Err()
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return nil
 }
 
 // Close releases pipeline resources.
@@ -146,6 +165,9 @@ func (p *RedisAdjacencyPipeline) readLoop(ctx context.Context, out chan<- []byte
 	for {
 		payload, err := p.consumer.Pop(ctx)
 		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return
+			}
 			if ctx.Err() != nil {
 				return
 			}
@@ -221,10 +243,49 @@ func (p *RedisAdjacencyPipeline) workerLoop(in <-chan []byte, out chan<- redisWo
 		if p.engine != nil {
 			event.IoaTags = p.engine.Apply(event)
 		}
+		if len(event.IoaTags) == 0 {
+			event.IoaTags = offlineEDRIOATags(event)
+		}
 
 		rows := p.mapper.Map(event)
 		out <- redisWorkItem{rows: rows, ioaEvents: extractIOAEvents(rows)}
 	}
+}
+
+func offlineEDRIOATags(event *models.Event) []models.IoaTag {
+	if event == nil || event.Raw == nil {
+		return nil
+	}
+	risk := strings.ToLower(strings.TrimSpace(rawString(event.Raw, "risk_level")))
+	if risk == "" || risk == "notice" {
+		return nil
+	}
+	name := strings.TrimSpace(rawString(event.Raw, "alert_name"))
+	if name == "" {
+		name = strings.TrimSpace(rawString(event.Raw, "name_key"))
+	}
+	if name == "" {
+		name = "offline-edr-ioa"
+	}
+	tactic := strings.TrimSpace(rawString(event.Raw, "attack.tactic"))
+	technique := strings.TrimSpace(rawString(event.Raw, "attack.technique"))
+	return []models.IoaTag{{
+		Name:      name,
+		Severity:  risk,
+		Tactic:    tactic,
+		Technique: technique,
+	}}
+}
+
+func rawString(raw map[string]interface{}, key string) string {
+	if raw == nil {
+		return ""
+	}
+	v, ok := raw[key]
+	if !ok || v == nil {
+		return ""
+	}
+	return strings.TrimSpace(fmt.Sprintf("%v", v))
 }
 
 func (p *RedisAdjacencyPipeline) writeLoop(in <-chan redisWorkItem) {

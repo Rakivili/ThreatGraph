@@ -23,10 +23,10 @@ func Parse(data []byte) (*models.Event, error) {
 	}
 
 	event.EventID = getInt(raw, "winlog.event_id", "event.code", "event_id")
-	event.AgentID = getString(raw, "agent.id", "agent_id")
+	event.AgentID = getString(raw, "agent.id", "agent_id", "client_id")
 	event.Hostname = getString(raw, "host.name", "host.hostname", "hostname")
 	event.Channel = getString(raw, "winlog.channel")
-	event.RecordID = getString(raw, "winlog.record_id")
+	event.RecordID = getString(raw, "winlog.record_id", "ext_detection_id", "@hash", "rm_log_uuid")
 
 	if v, ok := getPath(raw, "winlog.event_data"); ok {
 		if m, ok := v.(map[string]interface{}); ok {
@@ -38,10 +38,34 @@ func Parse(data []byte) (*models.Event, error) {
 			event.Timestamp = t
 		}
 	}
+	if event.Timestamp.IsZero() {
+		if ts := firstRawString(raw,
+			"@timestamp",
+			"time",
+			"t_detect_time",
+			"t",
+		); ts != "" {
+			if t, ok := parseUtcTime(ts); ok {
+				event.Timestamp = t
+			}
+		}
+	}
 	if len(event.Fields) == 0 {
 		logger.Warnf("Missing winlog.event_data (event_id=%d, record_id=%s)", event.EventID, event.RecordID)
 	}
 	return event, nil
+}
+
+func firstRawString(raw map[string]interface{}, keys ...string) string {
+	for _, k := range keys {
+		if v, ok := raw[k]; ok && v != nil {
+			s := strings.TrimSpace(fmt.Sprintf("%v", v))
+			if s != "" {
+				return s
+			}
+		}
+	}
+	return ""
 }
 
 func parseUtcTime(value string) (time.Time, bool) {
