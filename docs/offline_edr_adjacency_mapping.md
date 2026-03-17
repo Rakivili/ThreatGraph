@@ -18,19 +18,60 @@
 
 ---
 
-## 2. 离线 EDR 路径判定
+## 2. 邻接表语义
+
+- 每条 `record_type = edge` 的邻接记录，**一定有两个顶点**：
+  - `vertex_id`
+  - `adjacent_id`
+- 语义上统一读作：
+  - `vertex_id -> adjacent_id`
+
+当前 mapper 里实际会产出的顶点类型有：
+
+- `ProcessVertex`
+- `FilePathVertex`
+- `RegistryKeyVertex`
+- `RegistryValueVertex`
+- `NetworkVertex`
+- `DomainVertex`
+
+### 2.1 顶点 key 生成规则
+
+| 顶点类型 | key 生成规则 |
+|---|---|
+| `ProcessVertex` | `proc:{host_key}:{guid}` |
+| `FilePathVertex` | `path:{host_key}:{path}` |
+| `RegistryKeyVertex` | `regkey:{host_key}:{keyname}` |
+| `RegistryValueVertex` | `regval:{host_key}:{keyname}|{valuename}` |
+| `NetworkVertex` | `net:{ip}` 或 `net:{ip}:{port}` |
+| `DomainVertex` | `domain:{domain}` |
+
+其中：
+
+- `host_key` = `client_id`（优先） / `AgentID` / `Hostname`
+- `guid / path / keyname / valuename / domain / ip` 都按当前 mapper 的规则转为小写后入 key
+
+---
+
+## 3. 离线 EDR 路径判定
 
 若 `Raw["risk_level"]` 存在，则进入离线 EDR 映射：
 
 - `risk_level == notice`
-  - 仅处理 `operation == CreateProcess`
+  - 仅处理 `operation == CreateProcess AND fltrname == CommonCreateProcess`
+  - 以及 `operation == WriteComplete AND fltrname == WriteNewFile.ExcuteFile`
   - 其它 notice 事件直接忽略（不产邻接）
 - `risk_level != notice`
   - 走 non-notice 映射
 
 ---
 
-## 3. notice + CreateProcess 映射
+## 4. notice + CreateProcess 映射
+
+处理以下 notice 子类型：
+
+- `operation = CreateProcess AND fltrname = CommonCreateProcess`
+- `operation = WriteComplete AND fltrname = WriteNewFile.ExcuteFile`
 
 ### 3.1 主进程链
 
@@ -47,12 +88,26 @@
 ### 3.3 产出
 
 - `ParentOfEdge`: `parent_proc -> child_proc`
-- `ProcessCPEdge`（若有 `processcpuuid`）: `cp_proc -> creator_proc`
+- `ProcessCPEdge`（若有 `processcpuuid`）: `cp_proc -> child_proc`
 - `RPCTriggerEdge`（若有 `rpcprocessuuid`）: `rpc_proc -> creator_proc`
+
+### 4. notice + WriteNewFile.ExcuteFile
+
+固定字段：
+
+- 主体进程：`processuuid`
+- 主体镜像：`process`
+- 目标文件：`file`
+
+产出：
+
+- `FileWriteEdge`: `subject_proc -> file_path`
+- `ProcessCPEdge`（若有 `processcpuuid`）: `cp_proc -> subject_proc`
+- `RPCTriggerEdge`（若有 `rpcprocessuuid`）: `rpc_proc -> subject_proc`
 
 ---
 
-## 4. non-notice 映射
+## 5. non-notice 映射
 
 ### 4.1 主体（subject）
 
@@ -74,7 +129,7 @@
 
 ---
 
-## 5. Sysmon EventID 映射（当前）
+## 6. Sysmon EventID 映射（当前）
 
 `Map(event)` 中已支持：
 
@@ -90,7 +145,7 @@
 
 ---
 
-## 6. IOA 标签挂载规则（当前）
+## 7. IOA 标签挂载规则（当前）
 
 默认边会继承 `event.IoaTags`，但以下边类型明确排除：
 
@@ -101,11 +156,7 @@
 
 ---
 
-## 7. 顶点 ID 规则
+## 8. 备注
 
-- 进程：`proc:{host_key}:{guid}`
-- 路径：`path:{host_key}:{path}`
-- 域名：`domain:{domain}`
-- 网络：`net:{ip}` 或 `net:{ip}:{port}`
-
-其中 `{host_key}` 为第 1 节中的 host 选择结果（优先 `client_id`）。
+- 上述顶点 key 规则适用于当前已实现 mapper。
+- 如果后续新增 `NamedPipeVertex` / `ThreadVertex` 等类型，需要同步更新本文档。

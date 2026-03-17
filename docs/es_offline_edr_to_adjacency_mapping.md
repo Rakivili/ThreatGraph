@@ -14,8 +14,9 @@
 
 当前离线 EDR 映射只处理两类日志：
 
-1. `risk_level = notice AND operation = CreateProcess`
-2. `risk_level != notice`
+1. `risk_level = notice AND operation = CreateProcess AND fltrname = CommonCreateProcess`
+2. `risk_level = notice AND operation = WriteComplete AND fltrname = WriteNewFile.ExcuteFile`
+3. `risk_level != notice`
 
 额外规则：
 
@@ -35,7 +36,41 @@
 
 ---
 
-## 3. 时间与基础字段映射
+## 3. 邻接表语义
+
+- 每条 `record_type = edge` 的邻接记录，**一定有两个顶点**：
+  - `vertex_id`
+  - `adjacent_id`
+- 统一按 `vertex_id -> adjacent_id` 理解边方向。
+
+当前 ES -> adjacency 路径下会实际产出的顶点类型有：
+
+- `ProcessVertex`
+- `FilePathVertex`
+- `RegistryKeyVertex`
+- `RegistryValueVertex`
+- `NetworkVertex`
+- `DomainVertex`
+
+### 3.1 顶点 key 生成规则
+
+| 顶点类型 | key 生成规则 |
+|---|---|
+| `ProcessVertex` | `proc:{host_key}:{guid}` |
+| `FilePathVertex` | `path:{host_key}:{path}` |
+| `RegistryKeyVertex` | `regkey:{host_key}:{keyname}` |
+| `RegistryValueVertex` | `regval:{host_key}:{keyname}|{valuename}` |
+| `NetworkVertex` | `net:{ip}` 或 `net:{ip}:{port}` |
+| `DomainVertex` | `domain:{domain}` |
+
+其中：
+
+- `host_key` = `client_id`（优先） / `AgentID` / `Hostname`
+- `guid / path / keyname / valuename / domain / ip` 都按当前 mapper 的规则转为小写后入 key
+
+---
+
+## 4. 时间与基础字段映射
 
 | ES 字段 | ThreatGraph 字段 |
 |---|---|
@@ -44,13 +79,23 @@
 | `ext_detection_id` / `@hash` / `rm_log_uuid` | `event.RecordID` |
 | `_source` 原文 | `event.Raw` |
 
+离线 EDR 生成 `IoaTag` 时：
+
+| ES 字段 | IoaTag 字段 |
+|---|---|
+| `ext_process_rule_id` | `IoaTag.ID` |
+| `alert_name`（空则 `name_key`） | `IoaTag.Name` |
+| `risk_level` | `IoaTag.Severity` |
+| `attack.tactic` | `IoaTag.Tactic` |
+| `attack.technique` | `IoaTag.Technique` |
+
 ---
 
-## 4. notice 事件映射
+## 5. notice 事件映射
 
 ### 4.1 notice + CreateProcess
 
-只处理 `operation = CreateProcess`。
+只处理 `operation = CreateProcess AND fltrname = CommonCreateProcess`。
 
 #### 字段映射
 
@@ -66,12 +111,32 @@
 #### 产出边/顶点
 
 - `ParentOfEdge`: `creator_proc -> child_proc`
-- `ProcessCPEdge`: `processcpuuid -> creator_proc`（仅当 `processcpuuid` 存在）
+- `ProcessCPEdge`: `processcpuuid -> child_proc`（仅当 `processcpuuid` 存在）
 - `RPCTriggerEdge`: `rpcprocessuuid -> creator_proc`（仅当 `rpcprocessuuid` 存在且与主体不同）
+
+### 4.2 notice + WriteNewFile.ExcuteFile
+
+只处理 `operation = WriteComplete AND fltrname.keyword = WriteNewFile.ExcuteFile`。
+
+#### 固定字段
+
+| ES 字段 | 邻接用途 |
+|---|---|
+| `processuuid` | 主体进程 |
+| `process` | 主体镜像路径 |
+| `file` | 目标文件路径 |
+| `processcpuuid` | 可选 ProcessCP 因果来源 |
+| `rpcprocessuuid` | 可选 RPC 因果来源 |
+
+#### 产出边
+
+- `FileWriteEdge`: `subject_proc -> file_path`
+- `ProcessCPEdge`: `processcpuuid -> subject_proc`（仅当 `processcpuuid` 存在）
+- `RPCTriggerEdge`: `rpcprocessuuid -> subject_proc`（仅当 `rpcprocessuuid` 存在且与主体不同）
 
 ---
 
-## 5. non-notice 事件映射
+## 6. non-notice 事件映射
 
 non-notice 事件默认以：
 
@@ -91,6 +156,7 @@ non-notice 事件默认以：
 
 - `processcp/rpcprocess` **无 UUID 不关联**
 - 若 `processuuid == rpcprocessuuid`（忽略大小写和 `{}`），则不建 `RPCTriggerEdge`
+- `ProcessCPEdge` / `RPCTriggerEdge` 的 `ts` 始终取自当前这条原始日志本身的时间（即当前 event 的 `@timestamp`）
 
 ### 5.2 subject -> subject
 
@@ -99,6 +165,29 @@ non-notice 事件默认以：
 | `targetprocessuuid` / `TargetProcessGuid` | `TargetProcessEdge`: `subject_proc -> target_proc` |
 
 `targetprocess` 仅用于目标进程顶点 data。
+
+对于 `DS0009.Process.Modification` 中的特殊检测：
+
+- `fltrname = ObOpenProcess`
+- `fltrname = ShellcodeExecute`
+- `fltrname = Hollowing`
+
+固定规则：
+
+- `ObOpenProcess`：无论日志里是否存在 `targetprocessuuid`，都强制使用 `objectuuid` 作为 `targetprocessuuid`，并使用 `object` 作为目标进程镜像路径
+- `fltrname = ShellcodeExecute`
+- `fltrname = Hollowing`
+
+无论日志里是否存在 `targetprocessuuid`，都强制使用 `processuuid` 作为 `targetprocessuuid`。
+
+对于 `DS0009.Process.Modification` 中的：
+
+- `fltrname = CreateRemoteThread`
+
+当前按固定规则处理：
+
+- `targetprocessuuid` 视为必有字段
+- 若缺失，则按脏数据跳过，不做 fallback
 
 ### 5.3 subject -> file
 
@@ -148,7 +237,7 @@ non-notice 事件默认以：
 
 ---
 
-## 6. 不挂 IOA 的边类型
+## 7. 不挂 IOA 的边类型
 
 以下边类型不会继承 `event.IoaTags`：
 
@@ -164,7 +253,7 @@ non-notice 事件默认以：
 
 ---
 
-## 7. 当前已忽略或未建模项
+## 8. 当前已忽略或未建模项
 
 - `PortAttack`（non-notice）直接忽略
 - 其它 notice 事件（除 `CreateProcess`）当前不建模
@@ -172,7 +261,7 @@ non-notice 事件默认以：
 
 ---
 
-## 8. 主要代码位置
+## 9. 主要代码位置
 
 - `config/config.go`
 - `cmd/threatgraph/main.go`
