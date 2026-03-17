@@ -82,8 +82,11 @@ func (m *Mapper) mapEDROffline(event *models.Event) ([]*models.AdjacencyRow, boo
 	}
 	operation := strings.TrimSpace(edrField(event, "operation"))
 	if risk == "notice" {
-		if strings.EqualFold(operation, "CreateProcess") {
+		if strings.EqualFold(operation, "CreateProcess") && strings.EqualFold(strings.TrimSpace(edrField(event, "fltrname")), "CommonCreateProcess") {
 			return m.mapEDRNoticeProcessCreate(event), true
+		}
+		if strings.EqualFold(operation, "WriteComplete") && strings.EqualFold(strings.TrimSpace(edrField(event, "fltrname")), "WriteNewFile.ExcuteFile") {
+			return m.mapEDRNoticeWriteNewFileExecuteFile(event), true
 		}
 		return nil, true
 	}
@@ -141,10 +144,38 @@ func (m *Mapper) mapEDRNoticeProcessCreate(event *models.Event) []*models.Adjace
 		}
 	}
 
+	rows = m.appendOfflineProcessCPEdges(rows, event, childID)
 	if creatorID != "" {
-		rows = m.appendOfflineCauseEdges(rows, event, creatorID)
+		rows = m.appendOfflineRPCTriggerEdges(rows, event, creatorID)
 	}
 
+	return rows
+}
+
+func (m *Mapper) mapEDRNoticeWriteNewFileExecuteFile(event *models.Event) []*models.AdjacencyRow {
+	host := pickHost(event)
+	subjectGUID := firstField(event, "ProcessGuid", "processuuid")
+	targetPath := firstField(event, "file", "filepath", "filename", "TargetFilename")
+	if host == "" || subjectGUID == "" || targetPath == "" {
+		return nil
+	}
+	subjectID := processVertexID(host, subjectGUID)
+	if subjectID == "" {
+		return nil
+	}
+	pathID := filePathVertexID(host, targetPath)
+	if pathID == "" {
+		return nil
+	}
+
+	rows := make([]*models.AdjacencyRow, 0, 4)
+	if m.writeVertexRows {
+		rows = append(rows, vertexRow("ProcessVertex", subjectID, event, processVertexDataFromRaw(event, "process", "command_line")))
+		rows = append(rows, vertexRow("FilePathVertex", pathID, event, nil))
+	}
+	rows = append(rows, edgeRow("FileWriteEdge", subjectID, pathID, event, nil, m.includeEdgeData))
+	rows = m.appendOfflineProcessCPEdges(rows, event, subjectID)
+	rows = m.appendOfflineRPCTriggerEdges(rows, event, subjectID)
 	return rows
 }
 
@@ -171,7 +202,8 @@ func (m *Mapper) mapEDRNonNotice(event *models.Event) []*models.AdjacencyRow {
 		}))
 	}
 
-	rows = m.appendOfflineCauseEdges(rows, event, subjectID)
+	rows = m.appendOfflineProcessCPEdges(rows, event, subjectID)
+	rows = m.appendOfflineRPCTriggerEdges(rows, event, subjectID)
 	rows = m.appendOfflineTargetProcessEdges(rows, event, subjectID)
 	rows = m.appendOfflineFileEdges(rows, event, subjectID)
 	rows = m.appendOfflineModuleEdges(rows, event, subjectID)
@@ -181,12 +213,11 @@ func (m *Mapper) mapEDRNonNotice(event *models.Event) []*models.AdjacencyRow {
 	return rows
 }
 
-func (m *Mapper) appendOfflineCauseEdges(rows []*models.AdjacencyRow, event *models.Event, targetProcID string) []*models.AdjacencyRow {
+func (m *Mapper) appendOfflineProcessCPEdges(rows []*models.AdjacencyRow, event *models.Event, targetProcID string) []*models.AdjacencyRow {
 	host := pickHost(event)
 	if targetProcID == "" || host == "" {
 		return rows
 	}
-	targetGUID := normalizeGUIDForCompare(firstField(event, "ProcessGuid", "processuuid", "newprocessuuid"))
 
 	if cpGUID := strings.TrimSpace(edrField(event, "processcpuuid")); cpGUID != "" {
 		cpID := processVertexID(host, cpGUID)
@@ -197,6 +228,16 @@ func (m *Mapper) appendOfflineCauseEdges(rows []*models.AdjacencyRow, event *mod
 			rows = append(rows, edgeRow("ProcessCPEdge", cpID, targetProcID, event, nil, m.includeEdgeData))
 		}
 	}
+
+	return rows
+}
+
+func (m *Mapper) appendOfflineRPCTriggerEdges(rows []*models.AdjacencyRow, event *models.Event, targetProcID string) []*models.AdjacencyRow {
+	host := pickHost(event)
+	if targetProcID == "" || host == "" {
+		return rows
+	}
+	targetGUID := normalizeGUIDForCompare(firstField(event, "ProcessGuid", "processuuid", "newprocessuuid"))
 
 	if rpcGUID := strings.TrimSpace(edrField(event, "rpcprocessuuid")); rpcGUID != "" {
 		if targetGUID != "" && normalizeGUIDForCompare(rpcGUID) == targetGUID {
@@ -216,16 +257,16 @@ func (m *Mapper) appendOfflineCauseEdges(rows []*models.AdjacencyRow, event *mod
 
 func (m *Mapper) appendOfflineTargetProcessEdges(rows []*models.AdjacencyRow, event *models.Event, subjectID string) []*models.AdjacencyRow {
 	host := pickHost(event)
-	targetGUID := firstField(event, "TargetProcessGuid", "targetprocessuuid")
+	targetGUID := offlineTargetProcessGUID(event)
 	if host == "" || subjectID == "" || targetGUID == "" {
 		return rows
 	}
 	targetID := processVertexID(host, targetGUID)
-	if targetID == "" || targetID == subjectID {
+	if targetID == "" {
 		return rows
 	}
 	if m.writeVertexRows {
-		rows = append(rows, vertexRow("ProcessVertex", targetID, event, processVertexDataFromRaw(event, "targetprocess", "")))
+		rows = append(rows, vertexRow("ProcessVertex", targetID, event, offlineTargetProcessData(event)))
 	}
 	rows = append(rows, edgeRow("TargetProcessEdge", subjectID, targetID, event, nil, m.includeEdgeData))
 	return rows
@@ -680,6 +721,29 @@ func registryValueData(event *models.Event, keyName, valueName string) map[strin
 		return nil
 	}
 	return data
+}
+
+func offlineTargetProcessGUID(event *models.Event) string {
+	fltrName := strings.TrimSpace(edrField(event, "fltrname"))
+	if strings.EqualFold(fltrName, "ObOpenProcess") {
+		return firstField(event, "objectuuid")
+	}
+	if strings.EqualFold(fltrName, "ShellcodeExecute") || strings.EqualFold(fltrName, "Hollowing") {
+		return firstField(event, "ProcessGuid", "processuuid")
+	}
+	targetGUID := firstField(event, "TargetProcessGuid", "targetprocessuuid")
+	if strings.TrimSpace(targetGUID) != "" {
+		return targetGUID
+	}
+	return ""
+}
+
+func offlineTargetProcessData(event *models.Event) map[string]interface{} {
+	fltrName := strings.TrimSpace(edrField(event, "fltrname"))
+	if strings.EqualFold(fltrName, "ObOpenProcess") {
+		return processVertexDataFromRaw(event, "object", "")
+	}
+	return processVertexDataFromRaw(event, "targetprocess", "")
 }
 
 func normalizeGUIDForCompare(v string) string {

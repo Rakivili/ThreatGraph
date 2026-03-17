@@ -119,6 +119,7 @@ func TestMapOfflineEDRNoticeOnlyKeepsCreateProcess(t *testing.T) {
 		Raw: map[string]interface{}{
 			"risk_level":       "notice",
 			"operation":        "CreateProcess",
+			"fltrname":         "CommonCreateProcess",
 			"processuuid":      "{PARENT}",
 			"processcp":        `C:\Windows\System32\services.exe`,
 			"processcpuuid":    "{CP}",
@@ -150,12 +151,18 @@ func TestMapOfflineEDRNoticeOnlyKeepsCreateProcess(t *testing.T) {
 		}
 		if r.Type == "ProcessCPEdge" {
 			hasCP = true
+			if !r.Timestamp.Equal(noticeCreate.Timestamp) {
+				t.Fatalf("expected ProcessCPEdge timestamp to match source event, got %s want %s", r.Timestamp, noticeCreate.Timestamp)
+			}
 			if len(r.IoaTags) != 0 {
 				t.Fatalf("expected ProcessCPEdge to drop ioa tags")
 			}
 		}
 		if r.Type == "RPCTriggerEdge" {
 			hasRPC = true
+			if !r.Timestamp.Equal(noticeCreate.Timestamp) {
+				t.Fatalf("expected RPCTriggerEdge timestamp to match source event, got %s want %s", r.Timestamp, noticeCreate.Timestamp)
+			}
 			if len(r.IoaTags) != 0 {
 				t.Fatalf("expected RPCTriggerEdge to drop ioa tags")
 			}
@@ -171,12 +178,54 @@ func TestMapOfflineEDRNoticeOnlyKeepsCreateProcess(t *testing.T) {
 		RecordID:  "notice-non-create-1",
 		Raw: map[string]interface{}{
 			"risk_level":  "notice",
-			"operation":   "TcpSend",
+			"operation":   "CreateProcess",
 			"processuuid": "{PROC}",
+			"fltrname":    "OtherCreateProcess",
 		},
 	}
 	if rows := m.Map(noticeNonCreate); len(rows) != 0 {
-		t.Fatalf("expected no rows for notice non-CreateProcess, got %d", len(rows))
+		t.Fatalf("expected no rows for notice CreateProcess without CommonCreateProcess fltrname, got %d", len(rows))
+	}
+
+	noticeWriteNewFile := &models.Event{
+		Timestamp: time.Date(2026, 3, 4, 15, 51, 0, 0, time.UTC),
+		AgentID:   "agent-edr",
+		RecordID:  "notice-write-new-file-1",
+		Raw: map[string]interface{}{
+			"client_id":      "AA0000119100000427",
+			"risk_level":     "notice",
+			"operation":      "WriteComplete",
+			"fltrname":       "WriteNewFile.ExcuteFile",
+			"processuuid":    "{SUBJ}",
+			"process":        `C:\Program Files\Tencent\Weixin\Weixin.exe`,
+			"command_line":   `C:\Program Files\Tencent\Weixin\Weixin.exe --scene=desktop`,
+			"file":           `C:\Users\Administrator\AppData\LocalLow\SogouPY\temp.dll`,
+			"processcpuuid":  "{CP}",
+			"processcp":      `C:\Windows\explorer.exe`,
+			"rpcprocessuuid": "{RPC}",
+			"rpcprocess":     `C:\Windows\svchost.exe`,
+		},
+	}
+	rows = m.Map(noticeWriteNewFile)
+	if len(rows) == 0 {
+		t.Fatalf("expected rows for notice WriteNewFile.ExcuteFile")
+	}
+	var hasFileWrite bool
+	for _, r := range rows {
+		if r == nil || r.RecordType != "edge" {
+			continue
+		}
+		switch r.Type {
+		case "FileWriteEdge":
+			hasFileWrite = true
+		case "ProcessCPEdge", "RPCTriggerEdge":
+			if !r.Timestamp.Equal(noticeWriteNewFile.Timestamp) {
+				t.Fatalf("expected cp/rpc edge timestamp to match source event, got %s want %s", r.Timestamp, noticeWriteNewFile.Timestamp)
+			}
+		}
+	}
+	if !hasFileWrite {
+		t.Fatalf("expected FileWriteEdge for notice WriteNewFile.ExcuteFile")
 	}
 }
 
@@ -211,8 +260,14 @@ func TestMapOfflineEDRNonNoticeAddsProcessCPAndRPCTrigger(t *testing.T) {
 		switch r.Type {
 		case "RPCTriggerEdge":
 			hasRPCTrigger = true
+			if !r.Timestamp.Equal(e.Timestamp) {
+				t.Fatalf("expected RPCTriggerEdge timestamp to match source event, got %s want %s", r.Timestamp, e.Timestamp)
+			}
 		case "ProcessCPEdge":
 			hasCPEdge = true
+			if !r.Timestamp.Equal(e.Timestamp) {
+				t.Fatalf("expected ProcessCPEdge timestamp to match source event, got %s want %s", r.Timestamp, e.Timestamp)
+			}
 		}
 	}
 
@@ -388,4 +443,70 @@ func TestMapOfflineEDRNonNoticeAddsSubjectObjectEdges(t *testing.T) {
 			t.Fatalf("expected edge type %s to be present", typ)
 		}
 	}
+}
+
+func TestMapOfflineEDRProcessModificationShellcodeExecuteAlwaysSelfTargets(t *testing.T) {
+	m := NewMapper(MapperOptions{WriteVertexRows: false, IncludeEdgeData: false})
+	e := &models.Event{
+		Timestamp: time.Date(2026, 3, 4, 16, 10, 0, 0, time.UTC),
+		RecordID:  "shellcode-self-target",
+		Raw: map[string]interface{}{
+			"client_id":         "AA0000119100000427",
+			"risk_level":        "high",
+			"datasource":        "DS0009.Process.Modification",
+			"operation":         "AdvancedDetect",
+			"fltrname":          "ShellcodeExecute",
+			"processuuid":       "{SELF}",
+			"targetprocessuuid": "{OTHER}",
+			"process":           `C:\Windows\explorer.exe`,
+		},
+	}
+
+	rows := m.Map(e)
+	if len(rows) == 0 {
+		t.Fatalf("expected rows for ShellcodeExecute self-target case")
+	}
+	for _, r := range rows {
+		if r == nil || r.RecordType != "edge" || r.Type != "TargetProcessEdge" {
+			continue
+		}
+		if r.AdjacentID != "proc:aa0000119100000427:{self}" {
+			t.Fatalf("expected self target proc id, got %s", r.AdjacentID)
+		}
+		return
+	}
+	t.Fatalf("expected TargetProcessEdge for ShellcodeExecute")
+}
+
+func TestMapOfflineEDRProcessModificationHollowingAlwaysSelfTargets(t *testing.T) {
+	m := NewMapper(MapperOptions{WriteVertexRows: false, IncludeEdgeData: false})
+	e := &models.Event{
+		Timestamp: time.Date(2026, 3, 4, 16, 11, 0, 0, time.UTC),
+		RecordID:  "hollowing-self-target",
+		Raw: map[string]interface{}{
+			"client_id":         "AA0000119100000427",
+			"risk_level":        "high",
+			"datasource":        "DS0009.Process.Modification",
+			"operation":         "AdvancedDetect",
+			"fltrname":          "Hollowing",
+			"processuuid":       "{SELF2}",
+			"targetprocessuuid": "{OTHER2}",
+			"process":           `C:\Windows\explorer.exe`,
+		},
+	}
+
+	rows := m.Map(e)
+	if len(rows) == 0 {
+		t.Fatalf("expected rows for Hollowing self-target case")
+	}
+	for _, r := range rows {
+		if r == nil || r.RecordType != "edge" || r.Type != "TargetProcessEdge" {
+			continue
+		}
+		if r.AdjacentID != "proc:aa0000119100000427:{self2}" {
+			t.Fatalf("expected self target proc id, got %s", r.AdjacentID)
+		}
+		return
+	}
+	t.Fatalf("expected TargetProcessEdge for Hollowing")
 }
