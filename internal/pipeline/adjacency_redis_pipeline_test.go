@@ -8,16 +8,17 @@ import (
 
 func TestOfflineEDRIOATags(t *testing.T) {
 	e := &models.Event{Raw: map[string]interface{}{
-		"risk_level":       "high",
-		"alert_name":       "可疑注册表修改",
-		"attack.tactic":    "persistence",
-		"attack.technique": "T1547",
+		"ext_process_rule_id": "1614638745636573184",
+		"risk_level":          "high",
+		"alert_name":          "可疑注册表修改",
+		"attack.tactic":       "persistence",
+		"attack.technique":    "T1547",
 	}}
 	tags := offlineEDRIOATags(e)
 	if len(tags) != 1 {
 		t.Fatalf("expected one tag, got %d", len(tags))
 	}
-	if tags[0].Name != "可疑注册表修改" || tags[0].Severity != "high" || tags[0].Tactic != "persistence" || tags[0].Technique != "T1547" {
+	if tags[0].ID != "1614638745636573184" || tags[0].Name != "可疑注册表修改" || tags[0].Severity != "high" || tags[0].Tactic != "persistence" || tags[0].Technique != "T1547" {
 		t.Fatalf("unexpected tag: %#v", tags[0])
 	}
 }

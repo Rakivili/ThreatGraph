@@ -267,9 +267,11 @@ func offlineEDRIOATags(event *models.Event) []models.IoaTag {
 	if name == "" {
 		name = "offline-edr-ioa"
 	}
+	ruleID := strings.TrimSpace(rawString(event.Raw, "ext_process_rule_id"))
 	tactic := strings.TrimSpace(rawString(event.Raw, "attack.tactic"))
 	technique := strings.TrimSpace(rawString(event.Raw, "attack.technique"))
 	return []models.IoaTag{{
+		ID:        ruleID,
 		Name:      name,
 		Severity:  risk,
 		Tactic:    tactic,
