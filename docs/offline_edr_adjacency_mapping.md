@@ -88,7 +88,7 @@
 ### 3.3 产出
 
 - `ParentOfEdge`: `parent_proc -> child_proc`
-- `ProcessCPEdge`（若有 `processcpuuid`）: `cp_proc -> child_proc`
+- `ProcessCPEdge`（若有 `processcpuuid`）: `cp_proc -> creator_proc`
 - `RPCTriggerEdge`（若有 `rpcprocessuuid`）: `rpc_proc -> creator_proc`
 
 ### 4. notice + WriteNewFile.ExcuteFile
