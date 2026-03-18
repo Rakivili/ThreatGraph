@@ -144,7 +144,9 @@ func (m *Mapper) mapEDRNoticeProcessCreate(event *models.Event) []*models.Adjace
 		}
 	}
 
-	rows = m.appendOfflineProcessCPEdges(rows, event, childID)
+	if creatorID != "" {
+		rows = m.appendOfflineProcessCPEdges(rows, event, creatorID)
+	}
 	if creatorID != "" {
 		rows = m.appendOfflineRPCTriggerEdges(rows, event, creatorID)
 	}

@@ -138,6 +138,13 @@ func TestMapOfflineEDRNoticeOnlyKeepsCreateProcess(t *testing.T) {
 		t.Fatalf("expected rows for notice CreateProcess")
 	}
 
+	hostKey := pickHost(noticeCreate)
+	if hostKey == "" {
+		t.Fatalf("expected host key for notice CreateProcess")
+	}
+	parentID := processVertexID(hostKey, "{PARENT}")
+	cpID := processVertexID(hostKey, "{CP}")
+
 	var hasParentEdge, hasCP, hasRPC bool
 	for _, r := range rows {
 		if r == nil || r.RecordType != "edge" {
@@ -153,6 +160,9 @@ func TestMapOfflineEDRNoticeOnlyKeepsCreateProcess(t *testing.T) {
 			hasCP = true
 			if !r.Timestamp.Equal(noticeCreate.Timestamp) {
 				t.Fatalf("expected ProcessCPEdge timestamp to match source event, got %s want %s", r.Timestamp, noticeCreate.Timestamp)
+			}
+			if r.VertexID != cpID || r.AdjacentID != parentID {
+				t.Fatalf("expected ProcessCPEdge %s -> %s, got %s -> %s", cpID, parentID, r.VertexID, r.AdjacentID)
 			}
 			if len(r.IoaTags) != 0 {
 				t.Fatalf("expected ProcessCPEdge to drop ioa tags")
