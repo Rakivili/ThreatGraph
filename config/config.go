@@ -41,6 +41,7 @@ type InputConfig struct {
 // PipelineConfig controls pipeline behavior.
 type PipelineConfig struct {
 	Workers       int           `yaml:"workers"`
+	WriteWorkers  int           `yaml:"write_workers"`
 	BatchSize     int           `yaml:"batch_size"`
 	FlushInterval time.Duration `yaml:"flush_interval"`
 }
@@ -61,17 +62,22 @@ type RedisConfig struct {
 }
 
 type ElasticsearchConfig struct {
-	URL        string            `yaml:"url"`
-	Username   string            `yaml:"username"`
-	Password   string            `yaml:"password"`
-	Index      string            `yaml:"index"`
-	Query      string            `yaml:"query"`
-	BatchSize  int               `yaml:"batch_size"`
-	Scroll     time.Duration     `yaml:"scroll"`
-	Timeout    time.Duration     `yaml:"timeout"`
-	Headers    map[string]string `yaml:"headers"`
-	CACertPath string            `yaml:"ca_cert_path"`
-	Insecure   bool              `yaml:"insecure"`
+	URL              string            `yaml:"url"`
+	Username         string            `yaml:"username"`
+	Password         string            `yaml:"password"`
+	Index            string            `yaml:"index"`
+	Query            string            `yaml:"query"`
+	Slices           int               `yaml:"slices"`
+	TimeShards       int               `yaml:"time_shards"`
+	TimeShardMinutes int               `yaml:"time_shard_minutes"`
+	TimeShardWorkers int               `yaml:"time_shard_workers"`
+	BatchSize        int               `yaml:"batch_size"`
+	Scroll           time.Duration     `yaml:"scroll"`
+	Timeout          time.Duration     `yaml:"timeout"`
+	Headers          map[string]string `yaml:"headers"`
+	CACertPath       string            `yaml:"ca_cert_path"`
+	Insecure         bool              `yaml:"insecure"`
+	RunOnce          bool              `yaml:"run_once"`
 }
 
 // OutputConfig controls output.
@@ -108,6 +114,7 @@ type ClickHouseOutputConfig struct {
 	URL      string            `yaml:"url"`
 	Database string            `yaml:"database"`
 	Table    string            `yaml:"table"`
+	Format   string            `yaml:"format"`
 	Username string            `yaml:"username"`
 	Password string            `yaml:"password"`
 	Timeout  time.Duration     `yaml:"timeout"`

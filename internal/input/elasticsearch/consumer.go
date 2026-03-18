@@ -22,6 +22,8 @@ type Config struct {
 	Password   string
 	Index      string
 	Query      string
+	SliceID    int
+	SliceMax   int
 	BatchSize  int
 	Scroll     time.Duration
 	Timeout    time.Duration
@@ -84,6 +86,12 @@ func NewConsumer(cfg Config) (*Consumer, error) {
 	}
 	if _, ok := query["sort"]; !ok {
 		query["sort"] = []interface{}{"_doc"}
+	}
+	if cfg.SliceMax > 1 {
+		query["slice"] = map[string]interface{}{
+			"id":  cfg.SliceID,
+			"max": cfg.SliceMax,
+		}
 	}
 
 	tlsConfig := &tls.Config{InsecureSkipVerify: cfg.Insecure}

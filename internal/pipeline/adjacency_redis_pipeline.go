@@ -30,6 +30,7 @@ type RedisAdjacencyPipeline struct {
 	ioaWriter     IOAWriter
 	rawWriter     RawWriter
 	workers       int
+	writeWorkers  int
 	batchSize     int
 	flushInterval time.Duration
 	rawBatchSize  int
@@ -41,8 +42,13 @@ type redisWorkItem struct {
 	ioaEvents []*models.IOAEvent
 }
 
+type writeBatch struct {
+	rows      []*models.AdjacencyRow
+	ioaEvents []*models.IOAEvent
+}
+
 // NewRedisAdjacencyPipeline creates a pipeline for Redis adjacency output.
-func NewRedisAdjacencyPipeline(consumer MessageConsumer, engine rules.Engine, mapper *adjacency.Mapper, writer AdjacencyWriter, ioaWriter IOAWriter, rawWriter RawWriter, workers, batchSize int, flushInterval time.Duration, rawBatchSize int, rawFlushInterval time.Duration) *RedisAdjacencyPipeline {
+func NewRedisAdjacencyPipeline(consumer MessageConsumer, engine rules.Engine, mapper *adjacency.Mapper, writer AdjacencyWriter, ioaWriter IOAWriter, rawWriter RawWriter, workers, writeWorkers, batchSize int, flushInterval time.Duration, rawBatchSize int, rawFlushInterval time.Duration) *RedisAdjacencyPipeline {
 	return &RedisAdjacencyPipeline{
 		consumer:      consumer,
 		engine:        engine,
@@ -51,6 +57,7 @@ func NewRedisAdjacencyPipeline(consumer MessageConsumer, engine rules.Engine, ma
 		ioaWriter:     ioaWriter,
 		rawWriter:     rawWriter,
 		workers:       workers,
+		writeWorkers:  writeWorkers,
 		batchSize:     batchSize,
 		flushInterval: flushInterval,
 		rawBatchSize:  rawBatchSize,
@@ -68,6 +75,9 @@ func (p *RedisAdjacencyPipeline) Run(ctx context.Context) error {
 	if p.batchSize <= 0 {
 		p.batchSize = 1000
 	}
+	if p.writeWorkers <= 0 {
+		p.writeWorkers = 1
+	}
 	if p.flushInterval <= 0 {
 		p.flushInterval = 2 * time.Second
 	}
@@ -80,6 +90,7 @@ func (p *RedisAdjacencyPipeline) Run(ctx context.Context) error {
 
 	msgCh := make(chan []byte, p.workers*4)
 	workCh := make(chan redisWorkItem, p.workers*4)
+	batchCh := make(chan writeBatch, p.writeWorkers*2)
 	var rawCh chan []byte
 	if p.rawWriter != nil {
 		rawCh = make(chan []byte, p.workers*8)
@@ -110,8 +121,17 @@ func (p *RedisAdjacencyPipeline) Run(ctx context.Context) error {
 	writerWG.Add(1)
 	go func() {
 		defer writerWG.Done()
-		p.writeLoop(workCh)
+		p.batchLoop(workCh, batchCh)
+		close(batchCh)
 	}()
+
+	for i := 0; i < p.writeWorkers; i++ {
+		writerWG.Add(1)
+		go func() {
+			defer writerWG.Done()
+			p.writeLoop(batchCh)
+		}()
+	}
 	if rawCh != nil {
 		writerWG.Add(1)
 		go func() {
@@ -253,23 +273,23 @@ func (p *RedisAdjacencyPipeline) workerLoop(in <-chan []byte, out chan<- redisWo
 }
 
 func offlineEDRIOATags(event *models.Event) []models.IoaTag {
-	if event == nil || event.Raw == nil {
+	if event == nil {
 		return nil
 	}
-	risk := strings.ToLower(strings.TrimSpace(rawString(event.Raw, "risk_level")))
+	risk := strings.ToLower(strings.TrimSpace(rawString(event, "risk_level")))
 	if risk == "" || risk == "notice" {
 		return nil
 	}
-	name := strings.TrimSpace(rawString(event.Raw, "alert_name"))
+	name := strings.TrimSpace(rawString(event, "alert_name"))
 	if name == "" {
-		name = strings.TrimSpace(rawString(event.Raw, "name_key"))
+		name = strings.TrimSpace(rawString(event, "name_key"))
 	}
 	if name == "" {
 		name = "offline-edr-ioa"
 	}
-	ruleID := strings.TrimSpace(rawString(event.Raw, "ext_process_rule_id"))
-	tactic := strings.TrimSpace(rawString(event.Raw, "attack.tactic"))
-	technique := strings.TrimSpace(rawString(event.Raw, "attack.technique"))
+	ruleID := strings.TrimSpace(rawString(event, "ext_process_rule_id"))
+	tactic := strings.TrimSpace(rawString(event, "attack.tactic"))
+	technique := strings.TrimSpace(rawString(event, "attack.technique"))
 	return []models.IoaTag{{
 		ID:        ruleID,
 		Name:      name,
@@ -279,18 +299,26 @@ func offlineEDRIOATags(event *models.Event) []models.IoaTag {
 	}}
 }
 
-func rawString(raw map[string]interface{}, key string) string {
-	if raw == nil {
+func rawString(event *models.Event, key string) string {
+	if event == nil {
 		return ""
 	}
-	v, ok := raw[key]
-	if !ok || v == nil {
-		return ""
+	if event.Lookup != nil {
+		if v, ok := event.Lookup[key]; ok {
+			return strings.TrimSpace(v)
+		}
 	}
-	return strings.TrimSpace(fmt.Sprintf("%v", v))
+	if event.Raw != nil {
+		v, ok := event.Raw[key]
+		if !ok || v == nil {
+			return ""
+		}
+		return strings.TrimSpace(fmt.Sprintf("%v", v))
+	}
+	return ""
 }
 
-func (p *RedisAdjacencyPipeline) writeLoop(in <-chan redisWorkItem) {
+func (p *RedisAdjacencyPipeline) batchLoop(in <-chan redisWorkItem, out chan<- writeBatch) {
 	ticker := time.NewTicker(p.flushInterval)
 	defer ticker.Stop()
 
@@ -298,38 +326,12 @@ func (p *RedisAdjacencyPipeline) writeLoop(in <-chan redisWorkItem) {
 	var batchIOAEvents []*models.IOAEvent
 
 	flush := func() {
-		if len(batchRows) > 0 {
-			for attempt := 1; attempt <= 3; attempt++ {
-				if err := p.writer.WriteRows(batchRows); err != nil {
-					logger.Errorf("Failed to write adjacency rows (attempt %d/3): %v", attempt, err)
-					if attempt == 3 {
-						logger.Errorf("Dropping %d adjacency rows after retries", len(batchRows))
-						batchRows = nil
-						break
-					}
-					time.Sleep(1 * time.Second)
-					continue
-				}
-				batchRows = nil
-				break
-			}
+		if len(batchRows) == 0 && len(batchIOAEvents) == 0 {
+			return
 		}
-		if p.ioaWriter != nil && len(batchIOAEvents) > 0 {
-			for attempt := 1; attempt <= 3; attempt++ {
-				if err := p.ioaWriter.WriteEvents(batchIOAEvents); err != nil {
-					logger.Errorf("Failed to write IOA events (attempt %d/3): %v", attempt, err)
-					if attempt == 3 {
-						logger.Errorf("Dropping %d IOA events after retries", len(batchIOAEvents))
-						batchIOAEvents = nil
-						break
-					}
-					time.Sleep(1 * time.Second)
-					continue
-				}
-				batchIOAEvents = nil
-				break
-			}
-		}
+		out <- writeBatch{rows: batchRows, ioaEvents: batchIOAEvents}
+		batchRows = nil
+		batchIOAEvents = nil
 	}
 
 	for {
@@ -349,6 +351,39 @@ func (p *RedisAdjacencyPipeline) writeLoop(in <-chan redisWorkItem) {
 			}
 			if len(batchRows) >= p.batchSize {
 				flush()
+			}
+		}
+	}
+}
+
+func (p *RedisAdjacencyPipeline) writeLoop(in <-chan writeBatch) {
+	for batch := range in {
+		if len(batch.rows) > 0 {
+			for attempt := 1; attempt <= 3; attempt++ {
+				if err := p.writer.WriteRows(batch.rows); err != nil {
+					logger.Errorf("Failed to write adjacency rows (attempt %d/3): %v", attempt, err)
+					if attempt == 3 {
+						logger.Errorf("Dropping %d adjacency rows after retries", len(batch.rows))
+						break
+					}
+					time.Sleep(1 * time.Second)
+					continue
+				}
+				break
+			}
+		}
+		if p.ioaWriter != nil && len(batch.ioaEvents) > 0 {
+			for attempt := 1; attempt <= 3; attempt++ {
+				if err := p.ioaWriter.WriteEvents(batch.ioaEvents); err != nil {
+					logger.Errorf("Failed to write IOA events (attempt %d/3): %v", attempt, err)
+					if attempt == 3 {
+						logger.Errorf("Dropping %d IOA events after retries", len(batch.ioaEvents))
+						break
+					}
+					time.Sleep(1 * time.Second)
+					continue
+				}
+				break
 			}
 		}
 	}

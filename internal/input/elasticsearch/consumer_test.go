@@ -88,3 +88,25 @@ func TestConsumerPopSearchAndScroll(t *testing.T) {
 		t.Fatalf("expected scroll to be used")
 	}
 }
+
+func TestNewConsumerInjectsSliceIntoQuery(t *testing.T) {
+	c, err := NewConsumer(Config{
+		URL:      "https://example.local:9200",
+		Index:    "edr-offline-*",
+		Query:    `{"query":{"match_all":{}}}`,
+		SliceID:  2,
+		SliceMax: 4,
+		Insecure: true,
+	})
+	if err != nil {
+		t.Fatalf("NewConsumer failed: %v", err)
+	}
+	defer c.Close()
+	slice, ok := c.query["slice"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected slice query to be injected")
+	}
+	if slice["id"] != 2 || slice["max"] != 4 {
+		t.Fatalf("unexpected slice payload: %#v", slice)
+	}
+}

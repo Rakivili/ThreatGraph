@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -35,6 +36,7 @@ import (
 	"threatgraph/internal/pipeline"
 	"threatgraph/internal/rules"
 	"threatgraph/internal/service"
+	"threatgraph/internal/transform/sysmon"
 	"threatgraph/pkg/models"
 )
 
@@ -121,9 +123,21 @@ func applyDefaults(cfg *config.Config) {
 	if cfg.ThreatGraph.Input.Elasticsearch.Timeout <= 0 {
 		cfg.ThreatGraph.Input.Elasticsearch.Timeout = 30 * time.Second
 	}
+	if cfg.ThreatGraph.Input.Elasticsearch.Slices <= 0 {
+		cfg.ThreatGraph.Input.Elasticsearch.Slices = 1
+	}
+	if cfg.ThreatGraph.Input.Elasticsearch.TimeShards <= 0 {
+		cfg.ThreatGraph.Input.Elasticsearch.TimeShards = 1
+	}
+	if cfg.ThreatGraph.Input.Elasticsearch.TimeShardWorkers <= 0 {
+		cfg.ThreatGraph.Input.Elasticsearch.TimeShardWorkers = 4
+	}
 
 	if cfg.ThreatGraph.Pipeline.Workers <= 0 {
 		cfg.ThreatGraph.Pipeline.Workers = 8
+	}
+	if cfg.ThreatGraph.Pipeline.WriteWorkers <= 0 {
+		cfg.ThreatGraph.Pipeline.WriteWorkers = 1
 	}
 	if cfg.ThreatGraph.Pipeline.BatchSize <= 0 {
 		cfg.ThreatGraph.Pipeline.BatchSize = 1000
@@ -157,6 +171,9 @@ func applyDefaults(cfg *config.Config) {
 	}
 	if cfg.ThreatGraph.Output.ClickHouse.Table == "" {
 		cfg.ThreatGraph.Output.ClickHouse.Table = "adjacency"
+	}
+	if strings.TrimSpace(cfg.ThreatGraph.Output.ClickHouse.Format) == "" {
+		cfg.ThreatGraph.Output.ClickHouse.Format = "json_each_row"
 	}
 
 	if cfg.ThreatGraph.Serve.Analyze.ClickHouse.Database == "" {
@@ -203,56 +220,52 @@ func runProducer(args []string) {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 	applyDefaults(cfg)
+	sysmon.ResetStats()
 
 	if err := logger.Init(cfg.ThreatGraph.Logging.Enabled, cfg.ThreatGraph.Logging.Level, cfg.ThreatGraph.Logging.File, cfg.ThreatGraph.Logging.Console); err != nil {
 		log.Fatalf("Failed to initialize logger: %v", err)
+	}
+	if strings.EqualFold(strings.TrimSpace(cfg.ThreatGraph.Input.Mode), "elasticsearch") && (cfg.ThreatGraph.Input.Elasticsearch.TimeShards > 1 || cfg.ThreatGraph.Input.Elasticsearch.TimeShardMinutes > 0) && os.Getenv("THREATGRAPH_TIME_SHARD_CHILD") != "1" {
+		if err := runTimeShardedProducer(configPath, cfg); err != nil {
+			logger.Errorf("Failed to run time-sharded producer: %v", err)
+			log.Fatalf("Failed to run time-sharded producer: %v", err)
+		}
+		return
 	}
 
 	logger.Infof("ThreatGraph starting")
 	logger.Infof("Config loaded from: %s", configPath)
 
-	var consumer pipeline.MessageConsumer
-	switch strings.ToLower(strings.TrimSpace(cfg.ThreatGraph.Input.Mode)) {
-	case "", "redis":
-		consumer, err = inputredis.NewConsumer(inputredis.Config{
-			Addr:         cfg.ThreatGraph.Input.Redis.Addr,
-			Password:     cfg.ThreatGraph.Input.Redis.Password,
-			DB:           cfg.ThreatGraph.Input.Redis.DB,
-			Key:          cfg.ThreatGraph.Input.Redis.Key,
-			BlockTimeout: cfg.ThreatGraph.Input.Redis.BlockTimeout,
-		})
-		if err != nil {
-			logger.Errorf("Failed to create Redis consumer: %v", err)
-			log.Fatalf("Failed to create Redis consumer: %v", err)
+	sliceCount := 1
+	inputMode := strings.ToLower(strings.TrimSpace(cfg.ThreatGraph.Input.Mode))
+	if inputMode == "" {
+		inputMode = "redis"
+	}
+	if inputMode == "elasticsearch" {
+		sliceCount = cfg.ThreatGraph.Input.Elasticsearch.Slices
+		if sliceCount <= 0 {
+			sliceCount = 1
 		}
+	}
+	if sliceCount > 1 {
+		if strings.ToLower(strings.TrimSpace(cfg.ThreatGraph.Output.Mode)) != "clickhouse" {
+			log.Fatalf("elasticsearch slices > 1 require clickhouse adjacency output")
+		}
+		if cfg.ThreatGraph.ReplayCapture.Enabled {
+			log.Fatalf("elasticsearch slices > 1 do not support replay_capture.enabled")
+		}
+		if cfg.ThreatGraph.IOA.Enabled && strings.ToLower(strings.TrimSpace(cfg.ThreatGraph.IOA.Output.Mode)) == "file" {
+			log.Fatalf("elasticsearch slices > 1 require clickhouse IOA output or ioa.disabled")
+		}
+	}
+	if inputMode == "redis" {
 		logger.Infof("Input mode: redis (%s key=%s)", cfg.ThreatGraph.Input.Redis.Addr, cfg.ThreatGraph.Input.Redis.Key)
-	case "elasticsearch":
-		consumer, err = inputelasticsearch.NewConsumer(inputelasticsearch.Config{
-			URL:        cfg.ThreatGraph.Input.Elasticsearch.URL,
-			Username:   cfg.ThreatGraph.Input.Elasticsearch.Username,
-			Password:   cfg.ThreatGraph.Input.Elasticsearch.Password,
-			Index:      cfg.ThreatGraph.Input.Elasticsearch.Index,
-			Query:      cfg.ThreatGraph.Input.Elasticsearch.Query,
-			BatchSize:  cfg.ThreatGraph.Input.Elasticsearch.BatchSize,
-			Scroll:     cfg.ThreatGraph.Input.Elasticsearch.Scroll,
-			Timeout:    cfg.ThreatGraph.Input.Elasticsearch.Timeout,
-			Headers:    cfg.ThreatGraph.Input.Elasticsearch.Headers,
-			CACertPath: cfg.ThreatGraph.Input.Elasticsearch.CACertPath,
-			Insecure:   cfg.ThreatGraph.Input.Elasticsearch.Insecure,
-		})
-		if err != nil {
-			logger.Errorf("Failed to create Elasticsearch consumer: %v", err)
-			log.Fatalf("Failed to create Elasticsearch consumer: %v", err)
-		}
+	} else if sliceCount > 1 {
+		logger.Infof("Input mode: elasticsearch (%s index=%s slices=%d)", cfg.ThreatGraph.Input.Elasticsearch.URL, cfg.ThreatGraph.Input.Elasticsearch.Index, sliceCount)
+	} else {
 		logger.Infof("Input mode: elasticsearch (%s index=%s)", cfg.ThreatGraph.Input.Elasticsearch.URL, cfg.ThreatGraph.Input.Elasticsearch.Index)
-	default:
-		log.Fatalf("Unknown input mode: %s", cfg.ThreatGraph.Input.Mode)
 	}
 
-	mapper := adjacency.NewMapper(adjacency.MapperOptions{
-		WriteVertexRows: cfg.ThreatGraph.Graph.WriteVertexRows,
-		IncludeEdgeData: cfg.ThreatGraph.Graph.IncludeEdgeData,
-	})
 	var engine rules.Engine
 	if cfg.ThreatGraph.Rules.Enabled {
 		if strings.TrimSpace(cfg.ThreatGraph.Rules.Path) == "" {
@@ -277,61 +290,138 @@ func runProducer(args []string) {
 		}
 	}
 
+	pipes := make([]*pipeline.RedisAdjacencyPipeline, 0, sliceCount)
+	for sliceID := 0; sliceID < sliceCount; sliceID++ {
+		pipe, err := newProducerPipeline(cfg, engine, sliceID, sliceCount)
+		if err != nil {
+			logger.Errorf("Failed to create producer slice %d/%d: %v", sliceID+1, sliceCount, err)
+			log.Fatalf("Failed to create producer pipeline: %v", err)
+		}
+		pipes = append(pipes, pipe)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if strings.EqualFold(inputMode, "elasticsearch") && cfg.ThreatGraph.Input.Elasticsearch.RunOnce {
+		logger.Infof("Run-once enabled for elasticsearch input")
+	}
+
+	var wg sync.WaitGroup
+	doneCh := make(chan struct{})
+	errCh := make(chan error, len(pipes))
+	for i, pipe := range pipes {
+		wg.Add(1)
+		go func(idx int, p *pipeline.RedisAdjacencyPipeline) {
+			defer wg.Done()
+			if err := p.Run(ctx); err != nil && err != context.Canceled {
+				errCh <- fmt.Errorf("slice %d: %w", idx, err)
+			}
+		}(i, pipe)
+	}
+	go func() {
+		wg.Wait()
+		close(doneCh)
+	}()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	select {
+	case err := <-errCh:
+		logger.Errorf("Pipeline error: %v", err)
+		cancel()
+		<-doneCh
+	case <-doneCh:
+	case <-sigCh:
+		logger.Infof("Shutting down")
+		cancel()
+		<-doneCh
+	}
+	for _, pipe := range pipes {
+		if err := pipe.Close(); err != nil {
+			logger.Errorf("Error closing pipeline: %v", err)
+		}
+	}
+	sysmon.LogStats()
+	logger.Infof("ThreatGraph stopped")
+}
+
+func newProducerPipeline(cfg *config.Config, engine rules.Engine, sliceID, sliceCount int) (*pipeline.RedisAdjacencyPipeline, error) {
+	var consumer pipeline.MessageConsumer
+	var err error
+	inputMode := strings.ToLower(strings.TrimSpace(cfg.ThreatGraph.Input.Mode))
+	switch inputMode {
+	case "", "redis":
+		consumer, err = inputredis.NewConsumer(inputredis.Config{
+			Addr:         cfg.ThreatGraph.Input.Redis.Addr,
+			Password:     cfg.ThreatGraph.Input.Redis.Password,
+			DB:           cfg.ThreatGraph.Input.Redis.DB,
+			Key:          cfg.ThreatGraph.Input.Redis.Key,
+			BlockTimeout: cfg.ThreatGraph.Input.Redis.BlockTimeout,
+		})
+	case "elasticsearch":
+		consumer, err = inputelasticsearch.NewConsumer(inputelasticsearch.Config{
+			URL:        cfg.ThreatGraph.Input.Elasticsearch.URL,
+			Username:   cfg.ThreatGraph.Input.Elasticsearch.Username,
+			Password:   cfg.ThreatGraph.Input.Elasticsearch.Password,
+			Index:      cfg.ThreatGraph.Input.Elasticsearch.Index,
+			Query:      cfg.ThreatGraph.Input.Elasticsearch.Query,
+			SliceID:    sliceID,
+			SliceMax:   sliceCount,
+			BatchSize:  cfg.ThreatGraph.Input.Elasticsearch.BatchSize,
+			Scroll:     cfg.ThreatGraph.Input.Elasticsearch.Scroll,
+			Timeout:    cfg.ThreatGraph.Input.Elasticsearch.Timeout,
+			Headers:    cfg.ThreatGraph.Input.Elasticsearch.Headers,
+			CACertPath: cfg.ThreatGraph.Input.Elasticsearch.CACertPath,
+			Insecure:   cfg.ThreatGraph.Input.Elasticsearch.Insecure,
+		})
+	default:
+		return nil, fmt.Errorf("unknown input mode: %s", cfg.ThreatGraph.Input.Mode)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	mapper := adjacency.NewMapper(adjacency.MapperOptions{
+		WriteVertexRows: cfg.ThreatGraph.Graph.WriteVertexRows,
+		IncludeEdgeData: cfg.ThreatGraph.Graph.IncludeEdgeData,
+	})
+
 	var adjWriter pipeline.AdjacencyWriter
 	switch cfg.ThreatGraph.Output.Mode {
 	case "file":
-		w, err := adjacencyjson.NewWriter(cfg.ThreatGraph.Output.File.Path)
-		if err != nil {
-			logger.Errorf("Failed to create adjacency file writer: %v", err)
-			log.Fatalf("Failed to create adjacency file writer: %v", err)
-		}
-		adjWriter = w
-		logger.Infof("Output mode: file (%s)", cfg.ThreatGraph.Output.File.Path)
+		adjWriter, err = adjacencyjson.NewWriter(cfg.ThreatGraph.Output.File.Path)
 	case "http":
-		w, err := adjacencyhttp.NewWriter(adjacencyhttp.Config{
+		adjWriter, err = adjacencyhttp.NewWriter(adjacencyhttp.Config{
 			URL:     cfg.ThreatGraph.Output.HTTP.URL,
 			Timeout: cfg.ThreatGraph.Output.HTTP.Timeout,
 			Headers: cfg.ThreatGraph.Output.HTTP.Headers,
 		})
-		if err != nil {
-			logger.Errorf("Failed to create adjacency HTTP writer: %v", err)
-			log.Fatalf("Failed to create adjacency HTTP writer: %v", err)
-		}
-		adjWriter = w
-		logger.Infof("Output mode: http (%s)", cfg.ThreatGraph.Output.HTTP.URL)
 	case "clickhouse":
-		w, err := adjacencyclickhouse.NewWriter(adjacencyclickhouse.Config{
+		adjWriter, err = adjacencyclickhouse.NewWriter(adjacencyclickhouse.Config{
 			URL:      cfg.ThreatGraph.Output.ClickHouse.URL,
 			Database: cfg.ThreatGraph.Output.ClickHouse.Database,
 			Table:    cfg.ThreatGraph.Output.ClickHouse.Table,
+			Format:   cfg.ThreatGraph.Output.ClickHouse.Format,
 			Username: cfg.ThreatGraph.Output.ClickHouse.Username,
 			Password: cfg.ThreatGraph.Output.ClickHouse.Password,
 			Timeout:  cfg.ThreatGraph.Output.ClickHouse.Timeout,
 			Headers:  cfg.ThreatGraph.Output.ClickHouse.Headers,
 		})
-		if err != nil {
-			logger.Errorf("Failed to create adjacency ClickHouse writer: %v", err)
-			log.Fatalf("Failed to create adjacency ClickHouse writer: %v", err)
-		}
-		adjWriter = w
-		logger.Infof("Output mode: clickhouse (%s/%s.%s)", cfg.ThreatGraph.Output.ClickHouse.URL, cfg.ThreatGraph.Output.ClickHouse.Database, cfg.ThreatGraph.Output.ClickHouse.Table)
 	default:
-		log.Fatalf("Unknown output mode: %s", cfg.ThreatGraph.Output.Mode)
+		return nil, fmt.Errorf("unknown output mode: %s", cfg.ThreatGraph.Output.Mode)
+	}
+	if err != nil {
+		return nil, err
 	}
 
 	var ioaWriter pipeline.IOAWriter
 	if cfg.ThreatGraph.IOA.Enabled {
 		switch cfg.ThreatGraph.IOA.Output.Mode {
 		case "file":
-			w, err := ioajson.NewWriter(cfg.ThreatGraph.IOA.Output.File.Path)
-			if err != nil {
-				logger.Errorf("Failed to create IOA file writer: %v", err)
-				log.Fatalf("Failed to create IOA file writer: %v", err)
-			}
-			ioaWriter = w
-			logger.Infof("IOA output mode: file (%s)", cfg.ThreatGraph.IOA.Output.File.Path)
+			ioaWriter, err = ioajson.NewWriter(cfg.ThreatGraph.IOA.Output.File.Path)
 		case "clickhouse":
-			w, err := ioaclickhouse.NewWriter(ioaclickhouse.Config{
+			ioaWriter, err = ioaclickhouse.NewWriter(ioaclickhouse.Config{
 				URL:      cfg.ThreatGraph.IOA.Output.ClickHouse.URL,
 				Database: cfg.ThreatGraph.IOA.Output.ClickHouse.Database,
 				Table:    cfg.ThreatGraph.IOA.Output.ClickHouse.Table,
@@ -340,29 +430,26 @@ func runProducer(args []string) {
 				Timeout:  cfg.ThreatGraph.IOA.Output.ClickHouse.Timeout,
 				Headers:  cfg.ThreatGraph.IOA.Output.ClickHouse.Headers,
 			})
-			if err != nil {
-				logger.Errorf("Failed to create IOA ClickHouse writer: %v", err)
-				log.Fatalf("Failed to create IOA ClickHouse writer: %v", err)
-			}
-			ioaWriter = w
-			logger.Infof("IOA output mode: clickhouse (%s/%s.%s)", cfg.ThreatGraph.IOA.Output.ClickHouse.URL, cfg.ThreatGraph.IOA.Output.ClickHouse.Database, cfg.ThreatGraph.IOA.Output.ClickHouse.Table)
 		default:
-			log.Fatalf("Unknown IOA output mode: %s", cfg.ThreatGraph.IOA.Output.Mode)
+			return nil, fmt.Errorf("unknown IOA output mode: %s", cfg.ThreatGraph.IOA.Output.Mode)
+		}
+		if err != nil {
+			return nil, err
 		}
 	}
 
 	var rawWriter pipeline.RawWriter
 	if cfg.ThreatGraph.ReplayCapture.Enabled {
-		w, err := rawjson.NewWriter(cfg.ThreatGraph.ReplayCapture.File.Path)
+		rawWriter, err = rawjson.NewWriter(cfg.ThreatGraph.ReplayCapture.File.Path)
 		if err != nil {
-			logger.Errorf("Failed to create raw replay writer: %v", err)
-			log.Fatalf("Failed to create raw replay writer: %v", err)
+			return nil, err
 		}
-		rawWriter = w
-		logger.Infof("Raw replay capture enabled: %s", cfg.ThreatGraph.ReplayCapture.File.Path)
 	}
 
-	pipe := pipeline.NewRedisAdjacencyPipeline(
+	if sliceCount > 1 {
+		logger.Infof("Starting producer slice %d/%d -> %s.%s", sliceID+1, sliceCount, cfg.ThreatGraph.Output.ClickHouse.Database, cfg.ThreatGraph.Output.ClickHouse.Table)
+	}
+	return pipeline.NewRedisAdjacencyPipeline(
 		consumer,
 		engine,
 		mapper,
@@ -370,34 +457,12 @@ func runProducer(args []string) {
 		ioaWriter,
 		rawWriter,
 		cfg.ThreatGraph.Pipeline.Workers,
+		cfg.ThreatGraph.Pipeline.WriteWorkers,
 		cfg.ThreatGraph.Pipeline.BatchSize,
 		cfg.ThreatGraph.Pipeline.FlushInterval,
 		cfg.ThreatGraph.ReplayCapture.BatchSize,
 		cfg.ThreatGraph.ReplayCapture.FlushInterval,
-	)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	go func() {
-		if err := pipe.Run(ctx); err != nil && err != context.Canceled {
-			logger.Errorf("Pipeline error: %v", err)
-		}
-	}()
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	<-sigCh
-
-	logger.Infof("Shutting down")
-	cancel()
-	time.Sleep(1 * time.Second)
-
-	if err := pipe.Close(); err != nil {
-		logger.Errorf("Error closing pipeline: %v", err)
-	}
-
-	logger.Infof("ThreatGraph stopped")
+	), nil
 }
 
 func runAnalyzer(args []string) int {

@@ -674,6 +674,11 @@ func edrField(event *models.Event, key string) string {
 	if event == nil {
 		return ""
 	}
+	if event.Lookup != nil {
+		if v, ok := event.Lookup[key]; ok {
+			return v
+		}
+	}
 	if event.Raw != nil {
 		if v, ok := event.Raw[key]; ok {
 			if s := strings.TrimSpace(fmt.Sprintf("%v", v)); s != "" {

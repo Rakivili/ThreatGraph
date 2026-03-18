@@ -14,6 +14,7 @@ type Event struct {
 	Channel   string                 `json:"channel,omitempty"`
 	RecordID  string                 `json:"record_id,omitempty"`
 	Fields    map[string]interface{} `json:"fields"`
+	Lookup    map[string]string      `json:"-"`
 	IoaTags   []IoaTag               `json:"ioa_tags,omitempty"`
 
 	Raw map[string]interface{} `json:"-"`
@@ -22,6 +23,9 @@ type Event struct {
 // Field returns a field value.
 func (e *Event) Field(name string) string {
 	if e == nil || e.Fields == nil {
+		if e != nil && e.Lookup != nil {
+			return e.Lookup[name]
+		}
 		return ""
 	}
 	if v, ok := e.Fields[name]; ok {
@@ -47,6 +51,9 @@ func (e *Event) Field(name string) string {
 		default:
 			return fmt.Sprintf("%v", val)
 		}
+	}
+	if e.Lookup != nil {
+		return e.Lookup[name]
 	}
 	return ""
 }
