@@ -11,6 +11,7 @@ import (
 
 	"threatgraph/internal/graph/adjacency"
 	"threatgraph/internal/logger"
+	"threatgraph/internal/metrics"
 	"threatgraph/internal/transform/sysmon"
 	"threatgraph/pkg/models"
 )
@@ -195,6 +196,7 @@ func (p *RedisAdjacencyPipeline) readLoop(ctx context.Context, out chan<- []byte
 		if payload == nil {
 			continue
 		}
+		metrics.EventsConsumed.Inc()
 		if rawOut != nil {
 			rawOut <- payload
 		}
@@ -251,16 +253,21 @@ func (p *RedisAdjacencyPipeline) workerLoop(in <-chan []byte, out chan<- redisWo
 	for payload := range in {
 		event, err := sysmon.Parse(payload)
 		if err != nil {
+			metrics.EventsParseErrors.Inc()
 			logger.Warnf("Failed to parse sysmon event: %v", err)
 			continue
 		}
+		metrics.EventsParsed.Inc()
 
 		enrichDerivedFields(event)
 
 		event.IoaTags = offlineEDRIOATags(event)
 
 		rows := p.mapper.Map(event)
-		out <- redisWorkItem{rows: rows, ioaEvents: extractIOAEvents(rows)}
+		ioaEvents := extractIOAEvents(rows)
+		metrics.AdjacencyRowsProduced.Add(float64(len(rows)))
+		metrics.IOAEventsProduced.Add(float64(len(ioaEvents)))
+		out <- redisWorkItem{rows: rows, ioaEvents: ioaEvents}
 	}
 }
 
@@ -321,6 +328,7 @@ func (p *RedisAdjacencyPipeline) batchLoop(in <-chan redisWorkItem, out chan<- w
 		if len(batchRows) == 0 && len(batchIOAEvents) == 0 {
 			return
 		}
+		metrics.BatchSize.Observe(float64(len(batchRows)))
 		out <- writeBatch{rows: batchRows, ioaEvents: batchIOAEvents}
 		batchRows = nil
 		batchIOAEvents = nil
@@ -351,17 +359,26 @@ func (p *RedisAdjacencyPipeline) batchLoop(in <-chan redisWorkItem, out chan<- w
 func (p *RedisAdjacencyPipeline) writeLoop(in <-chan writeBatch) {
 	for batch := range in {
 		if len(batch.rows) > 0 {
+			metrics.BatchWritesTotal.Inc()
+			start := time.Now()
+			var failed bool
 			for attempt := 1; attempt <= 3; attempt++ {
 				if err := p.writer.WriteRows(batch.rows); err != nil {
 					logger.Errorf("Failed to write adjacency rows (attempt %d/3): %v", attempt, err)
 					if attempt == 3 {
 						logger.Errorf("Dropping %d adjacency rows after retries", len(batch.rows))
+						metrics.BatchWriteErrors.Inc()
+						metrics.BatchWriteDropped.Add(float64(len(batch.rows)))
+						failed = true
 						break
 					}
 					time.Sleep(1 * time.Second)
 					continue
 				}
 				break
+			}
+			if !failed {
+				metrics.BatchWriteDuration.Observe(time.Since(start).Seconds())
 			}
 		}
 		if p.ioaWriter != nil && len(batch.ioaEvents) > 0 {

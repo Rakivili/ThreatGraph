@@ -33,3 +33,8 @@ threatgraph:
       # Optional:
       # format: row_binary
       # timeout: 5s
+
+  # Optional Prometheus endpoint.
+  metrics:
+    enabled: false
+    addr: ":9091"

@@ -22,6 +22,13 @@ type ThreatGraphConfig struct {
 	IOA           IOAConfig           `yaml:"ioa"`
 	ReplayCapture ReplayCaptureConfig `yaml:"replay_capture"`
 	Logging       LoggingConfig       `yaml:"logging"`
+	Metrics       MetricsConfig       `yaml:"metrics"`
+}
+
+// MetricsConfig controls the Prometheus metrics endpoint.
+type MetricsConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Addr    string `yaml:"addr"`
 }
 
 // GraphConfig controls raw adjacency graph emission.
