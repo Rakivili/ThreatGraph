@@ -13,6 +13,7 @@ import (
 	"threatgraph/internal/analyzer"
 	"threatgraph/internal/input/clickhouse"
 	"threatgraph/internal/logger"
+	"threatgraph/internal/metrics"
 	"threatgraph/internal/pipeline"
 	"threatgraph/pkg/models"
 )
@@ -122,6 +123,8 @@ func (s *AnalyzeService) Run(ctx context.Context) error {
 }
 
 func (s *AnalyzeService) poll(ctx context.Context) {
+	metrics.PollCycles.Inc()
+
 	now := time.Now()
 	batch, err := s.reader.ReadIOABatch(s.checkpoint, s.checkpointRID, s.batchSize)
 	if err != nil {
@@ -131,6 +134,8 @@ func (s *AnalyzeService) poll(ctx context.Context) {
 	if len(batch) == 0 {
 		return
 	}
+
+	metrics.IOABatchSize.Observe(float64(len(batch)))
 
 	hosts, bounds := groupIOAByHost(batch)
 	logger.Infof("AnalyzeService: ioa_batch=%d hosts=%d", len(batch), len(hosts))
@@ -174,12 +179,23 @@ func (s *AnalyzeService) poll(ctx context.Context) {
 		}
 	}
 
+	s.mu.Lock()
+	metrics.StateMapSeenSize.Set(float64(len(s.seen)))
+	s.mu.Unlock()
+	s.snapshotsMu.Lock()
+	metrics.StateMapScoredSize.Set(float64(len(s.scoredByHostRoot)))
+	metrics.StateMapIncidentsSize.Set(float64(len(s.incByHostRoot)))
+	s.snapshotsMu.Unlock()
+
 	last := batch[len(batch)-1]
 	s.checkpoint = last.Timestamp
 	s.checkpointRID = strings.TrimSpace(last.RecordID)
 }
 
 func (s *AnalyzeService) analyzeHost(host string, since, until time.Time, batchIOA []*models.IOAEvent) error {
+	metrics.HostsAnalyzed.Inc()
+	hostStart := time.Now()
+
 	rows, err := s.reader.ReadRows(host, since, until)
 	if err != nil {
 		return fmt.Errorf("read rows host=%s: %w", host, err)
@@ -192,6 +208,7 @@ func (s *AnalyzeService) analyzeHost(host string, since, until time.Time, batchI
 	if len(iips) == 0 {
 		return nil
 	}
+	metrics.IIPGraphsBuilt.Add(float64(len(iips)))
 
 	processed := processedFromIIPs(iips)
 	coveredBatchIOA, batchIOATotal, batchIIPRoots := countCoveredBatchIOA(host, batchIOA, processed)
@@ -207,16 +224,27 @@ func (s *AnalyzeService) analyzeHost(host string, since, until time.Time, batchI
 		logger.Errorf("AnalyzeService: failed to write compatibility outputs host=%s: %v", host, err)
 	}
 
+	for _, inc := range incidents {
+		sev := inc.Severity
+		if sev == "" {
+			sev = "unknown"
+		}
+		metrics.IncidentsGenerated.WithLabelValues(sev).Inc()
+	}
+
 	novelCount := 0
 	if len(incidents) > 0 {
 		novel := s.filterNovel(incidents, until)
 		novelCount = len(novel)
 		if novelCount > 0 {
+			metrics.NovelIncidentsEmitted.Add(float64(novelCount))
 			if err := s.incidentOut.WriteIncidents(novel); err != nil {
 				return fmt.Errorf("write incidents host=%s: %w", host, err)
 			}
 		}
 	}
+
+	metrics.HostAnalysisDuration.Observe(time.Since(hostStart).Seconds())
 
 	coveragePct := 0.0
 	if batchIOATotal > 0 {

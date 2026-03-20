@@ -57,6 +57,10 @@ threatgraph:
     file: ""
     console: true
 
+  metrics:
+    enabled: true
+    addr: ":9091"
+
   # ── serve side (poll ClickHouse → incremental analysis) ─────────
 
   serve:

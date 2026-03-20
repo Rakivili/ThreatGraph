@@ -33,6 +33,7 @@ import (
 	"threatgraph/internal/output/ioaclickhouse"
 	"threatgraph/internal/output/ioajson"
 	"threatgraph/internal/output/rawjson"
+	"threatgraph/internal/metrics"
 	"threatgraph/internal/pipeline"
 	"threatgraph/internal/service"
 	"threatgraph/internal/transform/sysmon"
@@ -210,6 +211,10 @@ func applyDefaults(cfg *config.Config) {
 	if cfg.ThreatGraph.Logging.Level == "" {
 		cfg.ThreatGraph.Logging.Level = "info"
 	}
+
+	if cfg.ThreatGraph.Metrics.Addr == "" {
+		cfg.ThreatGraph.Metrics.Addr = ":9091"
+	}
 }
 
 func runProducer(args []string) {
@@ -230,6 +235,13 @@ func runProducer(args []string) {
 	if err := logger.Init(cfg.ThreatGraph.Logging.Enabled, cfg.ThreatGraph.Logging.Level, cfg.ThreatGraph.Logging.File, cfg.ThreatGraph.Logging.Console); err != nil {
 		log.Fatalf("Failed to initialize logger: %v", err)
 	}
+
+	if cfg.ThreatGraph.Metrics.Enabled {
+		metrics.StartServer(cfg.ThreatGraph.Metrics.Addr)
+		logger.Infof("Prometheus metrics enabled on %s", cfg.ThreatGraph.Metrics.Addr)
+		defer metrics.StopServer()
+	}
+
 	if strings.EqualFold(strings.TrimSpace(cfg.ThreatGraph.Input.Mode), "elasticsearch") && cfg.ThreatGraph.Input.Elasticsearch.HostPrefilter {
 		if err := runHostPrefilteredProducer(cfg); err != nil {
 			logger.Errorf("Failed to run host-prefiltered producer: %v", err)
@@ -712,6 +724,12 @@ func runServe(args []string) {
 
 	if err := logger.Init(cfg.ThreatGraph.Logging.Enabled, cfg.ThreatGraph.Logging.Level, cfg.ThreatGraph.Logging.File, cfg.ThreatGraph.Logging.Console); err != nil {
 		log.Fatalf("Failed to initialize logger: %v", err)
+	}
+
+	if cfg.ThreatGraph.Metrics.Enabled {
+		metrics.StartServer(cfg.ThreatGraph.Metrics.Addr)
+		logger.Infof("Prometheus metrics enabled on %s", cfg.ThreatGraph.Metrics.Addr)
+		defer metrics.StopServer()
 	}
 
 	logger.Infof("ThreatGraph serve starting")

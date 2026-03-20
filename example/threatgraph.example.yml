@@ -52,3 +52,7 @@ threatgraph:
     level: info
     file: ""
     console: true
+
+  metrics:
+    enabled: false
+    addr: ":9091"
