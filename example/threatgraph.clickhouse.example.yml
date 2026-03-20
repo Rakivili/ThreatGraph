@@ -10,13 +10,17 @@ threatgraph:
       # the default prefilter + payload query automatically.
       since: 2026-03-04T00:00:00Z
       until: 2026-03-05T00:00:00Z
+      # Optional (recommended for remote ES): pin an explicit query with
+      # _source field filtering to reduce network payload.
+      # query: >-
+      #   {"_source":{"includes":["@timestamp","time","t_detect_time","t","event_id","client_id","ext_detection_id","@hash","rm_log_uuid","risk_level","operation","fltrname","alert_name","name_key","ext_process_rule_id","attack.tactic","attack.technique","ProcessGuid","newprocessuuid","new_process_uuid","Image","newprocess","new_process","CommandLine","new_command_line","newcommandline","ParentProcessGuid","processuuid","parent_processuuid","ParentImage","process","parent_process","ParentCommandLine","command_line","file","filepath","filename","TargetFilename","processcpuuid","rpcprocessuuid","newimage","moduleilpath","modulename","keyname","registry_path","reg_path","valuename","value_name","valuetype","DestinationIp","remoteip","dstip","DestinationPort","remoteport","dstport","objectuuid","TargetProcessGuid","targetprocessuuid","targetprocess","object","winlog.event_id","winlog.channel","winlog.record_id","winlog.event_data","agent.id","host.name","host.hostname","event.code"]},"query":{"bool":{"filter":[{"range":{"@timestamp":{"gte":"2026-03-04T00:00:00Z","lt":"2026-03-05T00:00:00Z"}}}],"should":[{"bool":{"must":[{"term":{"risk_level":"notice"}},{"term":{"operation":"CreateProcess"}},{"term":{"fltrname.keyword":"CommonCreateProcess"}}]}},{"bool":{"must":[{"term":{"risk_level":"notice"}},{"term":{"operation":"WriteComplete"}},{"term":{"fltrname.keyword":"WriteNewFile.ExcuteFile"}}]}},{"bool":{"must":[{"exists":{"field":"risk_level"}}],"must_not":[{"term":{"risk_level":"notice"}}]}}],"minimum_should_match":1}}}
       # Enable two-stage filtering:
       # 1) discover non-notice candidate hosts
       # 2) pull full payload only for discovered hosts
       host_prefilter: true
       # Optional tuning:
       # host_batch_size: 50
-      # host_batch_workers: 4
+      # host_batch_workers: 2
 
       # Optional if your ES cert chain is private:
       # ca_cert_path: /path/to/ca.pem

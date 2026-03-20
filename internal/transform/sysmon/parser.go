@@ -270,7 +270,7 @@ func MissingWinlogEventDataCount() uint64 {
 
 func LogStats() {
 	if n := MissingWinlogEventDataCount(); n > 0 {
-		logger.Infof("Sysmon parser saw %d event(s) without winlog.event_data", n)
+		logger.Infof("Parser saw %d event(s) without winlog.event_data (offline flattened fields are still supported)", n)
 	}
 }
 

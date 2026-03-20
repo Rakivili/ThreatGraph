@@ -74,7 +74,7 @@ func applyDefaults(cfg *config.Config) {
 		cfg.ThreatGraph.Input.Redis.BlockTimeout = 5 * time.Second
 	}
 	if cfg.ThreatGraph.Input.Elasticsearch.BatchSize <= 0 {
-		cfg.ThreatGraph.Input.Elasticsearch.BatchSize = 1000
+		cfg.ThreatGraph.Input.Elasticsearch.BatchSize = 2000
 	}
 	if cfg.ThreatGraph.Input.Elasticsearch.Scroll <= 0 {
 		cfg.ThreatGraph.Input.Elasticsearch.Scroll = 5 * time.Minute
@@ -89,7 +89,7 @@ func applyDefaults(cfg *config.Config) {
 		cfg.ThreatGraph.Input.Elasticsearch.HostBatchSize = 50
 	}
 	if cfg.ThreatGraph.Input.Elasticsearch.HostBatchWorkers <= 0 {
-		cfg.ThreatGraph.Input.Elasticsearch.HostBatchWorkers = 4
+		cfg.ThreatGraph.Input.Elasticsearch.HostBatchWorkers = 2
 	}
 	if cfg.ThreatGraph.Input.Elasticsearch.TimeShards <= 0 {
 		cfg.ThreatGraph.Input.Elasticsearch.TimeShards = 1

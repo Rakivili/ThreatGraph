@@ -354,8 +354,10 @@ func (c *Consumer) Pop(ctx context.Context) ([]byte, error) {
 	if len(c.buffer) == 0 {
 		var err error
 		if !c.started {
-			c.started = true
 			err = c.search(ctx)
+			if err == nil {
+				c.started = true
+			}
 		} else {
 			err = c.scrollNext(ctx)
 		}

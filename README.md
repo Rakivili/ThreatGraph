@@ -75,7 +75,7 @@ make
 
 二进制输出：`bin/threatgraph`（Windows 下为 `bin/threatgraph.exe`）。
 
-### 一键离线流程（produce + analyze + HTML）
+### 一键离线流程（produce + analyze + subgraph + viewer）
 
 ```bash
 make offline
@@ -86,7 +86,19 @@ make offline
 - `output/offline/iip.jsonl`
 - `output/offline/tpg.jsonl`
 - `output/offline/incidents.jsonl`
+- `output/offline/incident_subgraphs/subgraph_*.jsonl`
+- `output/offline/incident_subgraphs/summary.jsonl`
 - `output/offline/report.html`
+
+`report.html` 由以下两步生成（与 Ubuntu 侧流程一致）：
+
+1. `python3 tools/build_incident_subgraphs.py`（按 incident 构建子图 JSON）
+2. `python3 tools/make_viewer.py`（将子图打包为自包含 HTML）
+
+兼容别名脚本：
+
+- `tools/buildincidentsubgraph.py` -> `tools/build_incident_subgraphs.py`
+- `tools/makeviewer.py` -> `tools/make_viewer.py`
 
 常用覆盖参数（按需传入）：
 
@@ -94,9 +106,14 @@ make offline
 make offline \
   OFFLINE_CONFIG=threatgraph.yml \
   OFFLINE_OUT_DIR=output/offline_20260320 \
-  OFFLINE_INCIDENT_MIN_SEQ=2 \
-  OFFLINE_REPORT_TITLE="ThreatGraph Offline Report"
+  OFFLINE_INCIDENT_MIN_SEQ=2
 ```
+
+说明：
+
+- `make offline` 会自动从 `OFFLINE_CONFIG` 读取
+  - `threatgraph.output.clickhouse.(url/database/table)`（用于 subgraph 构建）
+  - `threatgraph.input.elasticsearch.(url/username/password/index/ca_cert_path)`（用于 viewer 进程元数据补全）
 
 ---
 

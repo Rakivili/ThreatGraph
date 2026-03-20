@@ -44,7 +44,7 @@ func runHostPrefilteredProducer(cfg *config.Config) error {
 	batches := chunkStrings(hosts, cfg.ThreatGraph.Input.Elasticsearch.HostBatchSize)
 	workers := cfg.ThreatGraph.Input.Elasticsearch.HostBatchWorkers
 	if workers <= 0 {
-		workers = 4
+		workers = 2
 	}
 	if workers > len(batches) {
 		workers = len(batches)

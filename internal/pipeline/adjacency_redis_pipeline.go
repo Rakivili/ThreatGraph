@@ -7,6 +7,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"threatgraph/internal/graph/adjacency"
@@ -21,7 +22,7 @@ type MessageConsumer interface {
 	Close() error
 }
 
-// RedisAdjacencyPipeline consumes Redis events and writes adjacency rows.
+// RedisAdjacencyPipeline consumes events and writes adjacency rows.
 type RedisAdjacencyPipeline struct {
 	consumer      MessageConsumer
 	mapper        *adjacency.Mapper
@@ -34,6 +35,12 @@ type RedisAdjacencyPipeline struct {
 	flushInterval time.Duration
 	rawBatchSize  int
 	rawFlushIntvl time.Duration
+
+	consumedEvents uint64
+	parsedEvents   uint64
+	parseErrors    uint64
+	mappedRows     uint64
+	writtenRows    uint64
 }
 
 type redisWorkItem struct {
@@ -46,7 +53,7 @@ type writeBatch struct {
 	ioaEvents []*models.IOAEvent
 }
 
-// NewRedisAdjacencyPipeline creates a pipeline for Redis adjacency output.
+// NewRedisAdjacencyPipeline creates a pipeline for adjacency output.
 func NewRedisAdjacencyPipeline(consumer MessageConsumer, mapper *adjacency.Mapper, writer AdjacencyWriter, ioaWriter IOAWriter, rawWriter RawWriter, workers, writeWorkers, batchSize int, flushInterval time.Duration, rawBatchSize int, rawFlushInterval time.Duration) *RedisAdjacencyPipeline {
 	return &RedisAdjacencyPipeline{
 		consumer:      consumer,
@@ -65,7 +72,8 @@ func NewRedisAdjacencyPipeline(consumer MessageConsumer, mapper *adjacency.Mappe
 
 // Run starts the pipeline loop.
 func (p *RedisAdjacencyPipeline) Run(ctx context.Context) error {
-	logger.Infof("Redis adjacency pipeline started")
+	logger.Infof("Adjacency pipeline started")
+	startedAt := time.Now()
 
 	if p.workers <= 0 {
 		p.workers = 8
@@ -97,6 +105,8 @@ func (p *RedisAdjacencyPipeline) Run(ctx context.Context) error {
 	var producerWG sync.WaitGroup
 	var writerWG sync.WaitGroup
 	producerDone := make(chan struct{})
+	progressDone := make(chan struct{})
+	go p.progressLoop(progressDone, startedAt)
 
 	producerWG.Add(1)
 	go func() {
@@ -150,6 +160,8 @@ func (p *RedisAdjacencyPipeline) Run(ctx context.Context) error {
 	producerWG.Wait()
 	close(workCh)
 	writerWG.Wait()
+	close(progressDone)
+	p.logRunSummary(time.Since(startedAt))
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
@@ -189,13 +201,14 @@ func (p *RedisAdjacencyPipeline) readLoop(ctx context.Context, out chan<- []byte
 			if ctx.Err() != nil {
 				return
 			}
-			logger.Errorf("Failed to pop redis message: %v", err)
+			logger.Errorf("Failed to pop input message: %v", err)
 			time.Sleep(500 * time.Millisecond)
 			continue
 		}
 		if payload == nil {
 			continue
 		}
+		atomic.AddUint64(&p.consumedEvents, 1)
 		metrics.EventsConsumed.Inc()
 		if rawOut != nil {
 			rawOut <- payload
@@ -253,10 +266,12 @@ func (p *RedisAdjacencyPipeline) workerLoop(in <-chan []byte, out chan<- redisWo
 	for payload := range in {
 		event, err := sysmon.Parse(payload)
 		if err != nil {
+			atomic.AddUint64(&p.parseErrors, 1)
 			metrics.EventsParseErrors.Inc()
 			logger.Warnf("Failed to parse sysmon event: %v", err)
 			continue
 		}
+		atomic.AddUint64(&p.parsedEvents, 1)
 		metrics.EventsParsed.Inc()
 
 		enrichDerivedFields(event)
@@ -265,6 +280,7 @@ func (p *RedisAdjacencyPipeline) workerLoop(in <-chan []byte, out chan<- redisWo
 
 		rows := p.mapper.Map(event)
 		ioaEvents := extractIOAEvents(rows)
+		atomic.AddUint64(&p.mappedRows, uint64(len(rows)))
 		metrics.AdjacencyRowsProduced.Add(float64(len(rows)))
 		metrics.IOAEventsProduced.Add(float64(len(ioaEvents)))
 		out <- redisWorkItem{rows: rows, ioaEvents: ioaEvents}
@@ -378,6 +394,7 @@ func (p *RedisAdjacencyPipeline) writeLoop(in <-chan writeBatch) {
 				break
 			}
 			if !failed {
+				atomic.AddUint64(&p.writtenRows, uint64(len(batch.rows)))
 				metrics.BatchWriteDuration.Observe(time.Since(start).Seconds())
 			}
 		}
@@ -396,6 +413,64 @@ func (p *RedisAdjacencyPipeline) writeLoop(in <-chan writeBatch) {
 			}
 		}
 	}
+}
+
+func (p *RedisAdjacencyPipeline) progressLoop(done <-chan struct{}, startedAt time.Time) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	var lastConsumed uint64
+	var lastParsed uint64
+	var lastRows uint64
+	var lastWritten uint64
+
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			consumed, parsed, parseErr, rows, written := p.snapshotStats()
+			deltaConsumed := consumed - lastConsumed
+			deltaParsed := parsed - lastParsed
+			deltaRows := rows - lastRows
+			deltaWritten := written - lastWritten
+			lastConsumed = consumed
+			lastParsed = parsed
+			lastRows = rows
+			lastWritten = written
+			logger.Infof(
+				"Pipeline progress elapsed=%s pulled=%d (+%d) parsed=%d (+%d) mapped_rows=%d (+%d) written_rows=%d (+%d) parse_errors=%d",
+				time.Since(startedAt).Truncate(time.Second),
+				consumed, deltaConsumed,
+				parsed, deltaParsed,
+				rows, deltaRows,
+				written, deltaWritten,
+				parseErr,
+			)
+		}
+	}
+}
+
+func (p *RedisAdjacencyPipeline) snapshotStats() (consumed, parsed, parseErr, rows, written uint64) {
+	consumed = atomic.LoadUint64(&p.consumedEvents)
+	parsed = atomic.LoadUint64(&p.parsedEvents)
+	parseErr = atomic.LoadUint64(&p.parseErrors)
+	rows = atomic.LoadUint64(&p.mappedRows)
+	written = atomic.LoadUint64(&p.writtenRows)
+	return
+}
+
+func (p *RedisAdjacencyPipeline) logRunSummary(elapsed time.Duration) {
+	consumed, parsed, parseErr, rows, written := p.snapshotStats()
+	logger.Infof(
+		"Pipeline summary elapsed=%s pulled=%d parsed=%d mapped_rows=%d written_rows=%d parse_errors=%d",
+		elapsed.Truncate(time.Millisecond),
+		consumed,
+		parsed,
+		rows,
+		written,
+		parseErr,
+	)
 }
 
 func extractIOAEvents(rows []*models.AdjacencyRow) []*models.IOAEvent {
