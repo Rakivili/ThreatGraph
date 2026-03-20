@@ -21,7 +21,6 @@ import (
 	"threatgraph/internal/graph/adjacency"
 	inputclickhouse "threatgraph/internal/input/clickhouse"
 	inputelasticsearch "threatgraph/internal/input/elasticsearch"
-	inputredis "threatgraph/internal/input/redis"
 	"threatgraph/internal/logger"
 	"threatgraph/internal/metrics"
 	"threatgraph/internal/output/adjacencyclickhouse"
@@ -61,17 +60,8 @@ func findConfigFile(configArg string) string {
 }
 
 func applyDefaults(cfg *config.Config) {
-	if cfg.ThreatGraph.Input.Redis.Addr == "" {
-		cfg.ThreatGraph.Input.Redis.Addr = "127.0.0.1:6379"
-	}
 	if cfg.ThreatGraph.Input.Mode == "" {
-		cfg.ThreatGraph.Input.Mode = "redis"
-	}
-	if cfg.ThreatGraph.Input.Redis.Key == "" {
-		cfg.ThreatGraph.Input.Redis.Key = "sysmon_events"
-	}
-	if cfg.ThreatGraph.Input.Redis.BlockTimeout == 0 {
-		cfg.ThreatGraph.Input.Redis.BlockTimeout = 5 * time.Second
+		cfg.ThreatGraph.Input.Mode = "elasticsearch"
 	}
 	if cfg.ThreatGraph.Input.Elasticsearch.BatchSize <= 0 {
 		cfg.ThreatGraph.Input.Elasticsearch.BatchSize = 2000
@@ -313,7 +303,7 @@ func runProducer(args []string) {
 	sliceCount := 1
 	inputMode := strings.ToLower(strings.TrimSpace(cfg.ThreatGraph.Input.Mode))
 	if inputMode == "" {
-		inputMode = "redis"
+		inputMode = "elasticsearch"
 	}
 	if inputMode == "elasticsearch" {
 		sliceCount = cfg.ThreatGraph.Input.Elasticsearch.Slices
@@ -332,15 +322,13 @@ func runProducer(args []string) {
 			log.Fatalf("elasticsearch slices > 1 require clickhouse IOA output or ioa.disabled")
 		}
 	}
-	if inputMode == "redis" {
-		logger.Infof("Input mode: redis (%s key=%s)", cfg.ThreatGraph.Input.Redis.Addr, cfg.ThreatGraph.Input.Redis.Key)
-	} else if sliceCount > 1 {
+	if sliceCount > 1 {
 		logger.Infof("Input mode: elasticsearch (%s index=%s slices=%d)", cfg.ThreatGraph.Input.Elasticsearch.URL, cfg.ThreatGraph.Input.Elasticsearch.Index, sliceCount)
 	} else {
 		logger.Infof("Input mode: elasticsearch (%s index=%s)", cfg.ThreatGraph.Input.Elasticsearch.URL, cfg.ThreatGraph.Input.Elasticsearch.Index)
 	}
 
-	pipes := make([]*pipeline.RedisAdjacencyPipeline, 0, sliceCount)
+	pipes := make([]*pipeline.AdjacencyPipeline, 0, sliceCount)
 	for sliceID := 0; sliceID < sliceCount; sliceID++ {
 		pipe, err := newProducerPipeline(cfg, sliceID, sliceCount, nil)
 		if err != nil {
@@ -362,7 +350,7 @@ func runProducer(args []string) {
 	errCh := make(chan error, len(pipes))
 	for i, pipe := range pipes {
 		wg.Add(1)
-		go func(idx int, p *pipeline.RedisAdjacencyPipeline) {
+		go func(idx int, p *pipeline.AdjacencyPipeline) {
 			defer wg.Done()
 			if err := p.Run(ctx); err != nil && err != context.Canceled {
 				errCh <- fmt.Errorf("slice %d: %w", idx, err)
@@ -396,20 +384,12 @@ func runProducer(args []string) {
 	logger.Infof("ThreatGraph stopped")
 }
 
-func newProducerPipeline(cfg *config.Config, sliceID, sliceCount int, hostFilter []string) (*pipeline.RedisAdjacencyPipeline, error) {
+func newProducerPipeline(cfg *config.Config, sliceID, sliceCount int, hostFilter []string) (*pipeline.AdjacencyPipeline, error) {
 	var consumer pipeline.MessageConsumer
 	var err error
 	inputMode := strings.ToLower(strings.TrimSpace(cfg.ThreatGraph.Input.Mode))
 	switch inputMode {
-	case "", "redis":
-		consumer, err = inputredis.NewConsumer(inputredis.Config{
-			Addr:         cfg.ThreatGraph.Input.Redis.Addr,
-			Password:     cfg.ThreatGraph.Input.Redis.Password,
-			DB:           cfg.ThreatGraph.Input.Redis.DB,
-			Key:          cfg.ThreatGraph.Input.Redis.Key,
-			BlockTimeout: cfg.ThreatGraph.Input.Redis.BlockTimeout,
-		})
-	case "elasticsearch":
+	case "", "elasticsearch":
 		consumer, err = inputelasticsearch.NewConsumer(inputelasticsearch.Config{
 			URL:        cfg.ThreatGraph.Input.Elasticsearch.URL,
 			Username:   cfg.ThreatGraph.Input.Elasticsearch.Username,
@@ -500,7 +480,7 @@ func newProducerPipeline(cfg *config.Config, sliceID, sliceCount int, hostFilter
 	if sliceCount > 1 {
 		logger.Infof("Starting producer slice %d/%d -> %s.%s", sliceID+1, sliceCount, cfg.ThreatGraph.Output.ClickHouse.Database, cfg.ThreatGraph.Output.ClickHouse.Table)
 	}
-	return pipeline.NewRedisAdjacencyPipeline(
+	return pipeline.NewAdjacencyPipeline(
 		consumer,
 		mapper,
 		adjWriter,

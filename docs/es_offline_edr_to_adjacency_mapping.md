@@ -326,4 +326,4 @@ threatgraph:
 - `internal/input/elasticsearch/consumer.go`
 - `internal/transform/sysmon/parser.go`
 - `internal/graph/adjacency/mapper.go`
-- `internal/pipeline/adjacency_redis_pipeline.go`
+- `internal/pipeline/adjacency_pipeline.go`

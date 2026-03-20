@@ -40,7 +40,6 @@ type GraphConfig struct {
 // InputConfig controls the input reader.
 type InputConfig struct {
 	Mode          string              `yaml:"mode"`
-	Redis         RedisConfig         `yaml:"redis"`
 	Elasticsearch ElasticsearchConfig `yaml:"elasticsearch"`
 }
 
@@ -56,15 +55,6 @@ type PipelineConfig struct {
 type RulesConfig struct {
 	Enabled bool   `yaml:"enabled"`
 	Path    string `yaml:"path"`
-}
-
-// RedisConfig controls Redis input.
-type RedisConfig struct {
-	Addr         string        `yaml:"addr"`
-	Password     string        `yaml:"password"`
-	DB           int           `yaml:"db"`
-	Key          string        `yaml:"key"`
-	BlockTimeout time.Duration `yaml:"block_timeout"`
 }
 
 type ElasticsearchConfig struct {

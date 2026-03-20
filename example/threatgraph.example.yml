@@ -1,11 +1,17 @@
 threatgraph:
   input:
-    redis:
-      addr: 127.0.0.1:6379
+    mode: elasticsearch
+    elasticsearch:
+      url: https://127.0.0.1:9200
+      username: elastic
       password: ""
-      db: 0
-      key: sysmon_events
-      block_timeout: 5s
+      index: edr-offline-ls-*
+      since: 2026-03-04T00:00:00Z
+      until: 2026-03-05T00:00:00Z
+      host_prefilter: true
+      batch_size: 2000
+      scroll: 5m
+      timeout: 30s
 
   pipeline:
     workers: 8

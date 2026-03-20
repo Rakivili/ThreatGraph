@@ -23,7 +23,7 @@
 
 ## 2. 事件证据层（IOA 生成）
 
-当前主链路下，`produce` worker 会调用 `offlineEDRIOATags(...)`（`internal/pipeline/adjacency_redis_pipeline.go`）生成 IOA 标签。
+当前主链路下，`produce` worker 会调用 `offlineEDRIOATags(...)`（`internal/pipeline/adjacency_pipeline.go`）生成 IOA 标签。
 
 ### 字段映射
 

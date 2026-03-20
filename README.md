@@ -127,7 +127,7 @@ make offline \
 
 配置根结构在 `config/config.go`，核心段如下：
 
-- `threatgraph.input`：输入（`redis` / `elasticsearch`）
+- `threatgraph.input`：输入（当前只支持 `elasticsearch`）
 - `threatgraph.pipeline`：并发与批量参数
 - `threatgraph.graph`：邻接行精简开关
 - `threatgraph.output`：邻接输出
@@ -259,7 +259,7 @@ ClickHouse 输入（v10 常用）：
 
 ## IOA 标签来源（当前实现）
 
-`produce` worker 中使用 `offlineEDRIOATags(...)` 生成 IOA 标签（`internal/pipeline/adjacency_redis_pipeline.go`）：
+`produce` worker 中使用 `offlineEDRIOATags(...)` 生成 IOA 标签（`internal/pipeline/adjacency_pipeline.go`）：
 
 - `risk_level` 为空或 `notice` 时不生成 IOA 标签
 - `name` 优先 `alert_name`，其次 `name_key`，再退化为 `offline-edr-ioa`
@@ -281,6 +281,7 @@ ClickHouse 输入（v10 常用）：
 - `docs/detection_principles.md`
 - `docs/rapsheet_replication.md`
 - `docs/produce_min_metadata_checklist.md`
+- `docs/implementation_owner_review.md`
 - `docs/offline_edr_adjacency_mapping.md`
 - `docs/es_offline_edr_to_adjacency_mapping.md`
 - `docs/adjacency_table_schema.md`
