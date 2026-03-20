@@ -528,11 +528,14 @@ func runAnalyzer(args []string) int {
 	tacticalOutput := fs.String("tactical-output", "", "Optional tactical scored TPG JSONL output path")
 	incidentOutput := fs.String("incident-output", "", "Optional incident JSONL output path")
 	incidentMinSeq := fs.Int("incident-min-seq", 2, "Minimum sequence length for incident output")
+	subgraphOutputDir := fs.String("subgraph-output-dir", "", "Optional output directory for incident subgraph JSONL files")
+	subgraphSummaryOutput := fs.String("subgraph-summary-output", "", "Optional summary JSONL output path for incident subgraphs (default: <subgraph-output-dir>/summary.jsonl)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	if strings.TrimSpace(*tacticalOutput) == "" && strings.TrimSpace(*incidentOutput) == "" {
-		fmt.Fprintf(os.Stderr, "analyze requires at least one of --tactical-output or --incident-output\n")
+	subgraphDir := strings.TrimSpace(*subgraphOutputDir)
+	if strings.TrimSpace(*tacticalOutput) == "" && strings.TrimSpace(*incidentOutput) == "" && subgraphDir == "" {
+		fmt.Fprintf(os.Stderr, "analyze requires at least one of --tactical-output, --incident-output, or --subgraph-output-dir\n")
 		return 2
 	}
 
@@ -626,9 +629,25 @@ func runAnalyzer(args []string) int {
 				return 1
 			}
 		}
+		summaryPath := strings.TrimSpace(*subgraphSummaryOutput)
+		if subgraphDir != "" {
+			if err := os.MkdirAll(subgraphDir, 0755); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to prepare subgraph output directory: %v\n", err)
+				return 1
+			}
+			if summaryPath == "" {
+				summaryPath = filepath.Join(subgraphDir, "summary.jsonl")
+			}
+			if err := prepareJSONLinesFile(summaryPath); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to prepare subgraph summary output: %v\n", err)
+				return 1
+			}
+		}
 		totalRows := 0
 		totalIIPs := 0
 		totalIncidents := 0
+		totalSubgraphs := 0
+		allSubgraphSummaries := make([]analyzer.IncidentSubgraphSummary, 0, 256)
 		for _, host := range hosts {
 			hostRows, err := reader.ReadRows(host, since, until)
 			if err != nil {
@@ -655,16 +674,37 @@ func runAnalyzer(args []string) int {
 					return 1
 				}
 			}
-			if strings.TrimSpace(*incidentOutput) != "" {
+			if strings.TrimSpace(*incidentOutput) != "" || subgraphDir != "" {
 				hostIncidents := analyzer.BuildIncidents(hostScored, *incidentMinSeq)
 				totalIncidents += len(hostIncidents)
-				if err := appendJSONLines(*incidentOutput, hostIncidents); err != nil {
-					fmt.Fprintf(os.Stderr, "failed to append incidents: %v\n", err)
-					return 1
+				if strings.TrimSpace(*incidentOutput) != "" {
+					if err := appendJSONLines(*incidentOutput, hostIncidents); err != nil {
+						fmt.Fprintf(os.Stderr, "failed to append incidents: %v\n", err)
+						return 1
+					}
+				}
+				if subgraphDir != "" {
+					hostSummaries, err := analyzer.WriteIncidentSubgraphs(subgraphDir, host, hostRows, hostIncidents)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "failed to write subgraphs for host %s: %v\n", host, err)
+						return 1
+					}
+					totalSubgraphs += len(hostSummaries)
+					allSubgraphSummaries = append(allSubgraphSummaries, hostSummaries...)
 				}
 			}
 		}
-		if strings.TrimSpace(*incidentOutput) != "" {
+		if subgraphDir != "" {
+			if err := appendJSONLines(summaryPath, allSubgraphSummaries); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to append subgraph summaries: %v\n", err)
+				return 1
+			}
+		}
+		if strings.TrimSpace(*incidentOutput) != "" || subgraphDir != "" {
+			if subgraphDir != "" {
+				fmt.Printf("analyzed rows=%d iips=%d incidents=%d subgraphs=%d iip_output=%s subgraph_dir=%s summary_output=%s\n", totalRows, totalIIPs, totalIncidents, totalSubgraphs, *output, subgraphDir, summaryPath)
+				return 0
+			}
 			fmt.Printf("analyzed rows=%d iips=%d incidents=%d iip_output=%s\n", totalRows, totalIIPs, totalIncidents, *output)
 			return 0
 		}
@@ -693,12 +733,69 @@ func runAnalyzer(args []string) int {
 			fmt.Fprintf(os.Stderr, "failed to write incidents: %v\n", err)
 			return 1
 		}
+		if subgraphDir != "" {
+			summaryPath := strings.TrimSpace(*subgraphSummaryOutput)
+			if summaryPath == "" {
+				summaryPath = filepath.Join(subgraphDir, "summary.jsonl")
+			}
+			if err := prepareJSONLinesFile(summaryPath); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to prepare subgraph summary output: %v\n", err)
+				return 1
+			}
+			rowsByHost := make(map[string][]*models.AdjacencyRow, 64)
+			incidentsByHost := make(map[string][]analyzer.Incident, 64)
+			for _, row := range rows {
+				host := rowHost(row)
+				if host == "" {
+					continue
+				}
+				rowsByHost[host] = append(rowsByHost[host], row)
+			}
+			for _, inc := range incidents {
+				host := strings.TrimSpace(inc.Host)
+				if host == "" {
+					continue
+				}
+				incidentsByHost[host] = append(incidentsByHost[host], inc)
+			}
+			allSubgraphSummaries := make([]analyzer.IncidentSubgraphSummary, 0, len(incidents))
+			totalSubgraphs := 0
+			for host, hostIncidents := range incidentsByHost {
+				hostSummaries, err := analyzer.WriteIncidentSubgraphs(subgraphDir, host, rowsByHost[host], hostIncidents)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "failed to write subgraphs for host %s: %v\n", host, err)
+					return 1
+				}
+				totalSubgraphs += len(hostSummaries)
+				allSubgraphSummaries = append(allSubgraphSummaries, hostSummaries...)
+			}
+			if err := appendJSONLines(summaryPath, allSubgraphSummaries); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to append subgraph summaries: %v\n", err)
+				return 1
+			}
+			fmt.Printf("analyzed rows=%d iips=%d incidents=%d subgraphs=%d iip_output=%s subgraph_dir=%s summary_output=%s\n", len(rows), len(iips), len(incidents), totalSubgraphs, *output, subgraphDir, summaryPath)
+			return 0
+		}
 		fmt.Printf("analyzed rows=%d iips=%d incidents=%d iip_output=%s\n", len(rows), len(iips), len(incidents), *output)
 		return 0
+	}
+	if subgraphDir != "" {
+		fmt.Fprintf(os.Stderr, "analyze --subgraph-output-dir requires --incident-output for file source\n")
+		return 2
 	}
 
 	fmt.Printf("analyzed rows=%d iips=%d iip_output=%s\n", len(rows), len(iips), *output)
 	return 0
+}
+
+func rowHost(row *models.AdjacencyRow) string {
+	if row == nil {
+		return ""
+	}
+	if v := strings.TrimSpace(row.AgentID); v != "" {
+		return v
+	}
+	return strings.TrimSpace(row.Hostname)
 }
 
 func splitCSV(v string) []string {

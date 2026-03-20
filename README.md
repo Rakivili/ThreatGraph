@@ -90,9 +90,9 @@ make offline
 - `output/offline/incident_subgraphs/summary.jsonl`
 - `output/offline/report.html`
 
-`report.html` 由以下两步生成（与 Ubuntu 侧流程一致）：
+`report.html` 由以下两步生成：
 
-1. `python3 tools/build_incident_subgraphs.py`（按 incident 构建子图 JSON）
+1. `analyze --subgraph-output-dir ...`（直接复用内存中的 host 邻接表写出子图 JSON）
 2. `python3 tools/make_viewer.py`（将子图打包为自包含 HTML）
 
 兼容别名脚本：
@@ -112,7 +112,7 @@ make offline \
 说明：
 
 - `make offline` 会自动从 `OFFLINE_CONFIG` 读取
-  - `threatgraph.output.clickhouse.(url/database/table)`（用于 subgraph 构建）
+  - `threatgraph.output.clickhouse.(url/database/table)`（用于 `analyze --source clickhouse` 读取邻接表）
   - `threatgraph.input.elasticsearch.(url/username/password/index/ca_cert_path)`（用于 viewer 进程元数据补全）
 
 ---
@@ -246,14 +246,16 @@ ClickHouse 输入（v10 常用）：
   --output output/offline/iip.jsonl \
   --tactical-output output/offline/tpg.jsonl \
   --incident-output output/offline/incidents.jsonl \
-  --incident-min-seq 2
+  --incident-min-seq 2 \
+  --subgraph-output-dir output/offline/incident_subgraphs
 ```
 
 注意：
 
 - `--source=clickhouse` 必须提供 `--config`。
 - `--since/--until` 可选；未传时会回退读取 `input.elasticsearch.since/until`。
-- 至少要给 `--tactical-output` 或 `--incident-output` 之一。
+- 至少要给 `--tactical-output` / `--incident-output` / `--subgraph-output-dir` 之一。
+- `--subgraph-summary-output` 可选；默认写到 `<subgraph-output-dir>/summary.jsonl`。
 
 ## IOA 标签来源（当前实现）
 
