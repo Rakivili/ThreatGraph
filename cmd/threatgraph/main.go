@@ -160,6 +160,16 @@ func applyDefaults(cfg *config.Config) {
 	}
 }
 
+func metricsEnabled(cfg *config.Config) bool {
+	if cfg == nil {
+		return false
+	}
+	if cfg.ThreatGraph.Metrics.Enabled == nil {
+		return false
+	}
+	return *cfg.ThreatGraph.Metrics.Enabled
+}
+
 func ensureDefaultElasticsearchQuery(cfg *config.Config) error {
 	if cfg == nil {
 		return nil
@@ -276,7 +286,7 @@ func runProducer(args []string) {
 		log.Fatalf("Failed to initialize logger: %v", err)
 	}
 
-	if cfg.ThreatGraph.Metrics.Enabled {
+	if metricsEnabled(cfg) {
 		metrics.StartServer(cfg.ThreatGraph.Metrics.Addr)
 		logger.Infof("Prometheus metrics enabled on %s", cfg.ThreatGraph.Metrics.Addr)
 		defer metrics.StopServer()

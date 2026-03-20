@@ -27,7 +27,7 @@ type ThreatGraphConfig struct {
 
 // MetricsConfig controls the Prometheus metrics endpoint.
 type MetricsConfig struct {
-	Enabled bool   `yaml:"enabled"`
+	Enabled *bool  `yaml:"enabled"`
 	Addr    string `yaml:"addr"`
 }
 
