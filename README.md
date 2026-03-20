@@ -1,352 +1,125 @@
 # ThreatGraph
 
-ThreatGraph 是一个面向 Sysmon / 离线 EDR 数据集的图安全分析引擎，支持三种运行模式：
+ThreatGraph 是一个面向 Sysmon / 离线 EDR 事件的图分析引擎，提供四个主命令：
 
-- `produce`：并发消费日志、规则打标、写入原始邻接图（JSONL / HTTP / ClickHouse）
-- `analyze`：基于本地 JSONL 或 ClickHouse 邻接表执行一次性批量分析 `IIP -> TPG -> Killchain 评分 -> Incident`
-- `serve`：准实时增量分析——轮询 ClickHouse IOA 表发现活跃主机，按需拉取邻接数据做增量分析并输出 incident
+- `produce`：把输入事件转换为邻接表（`JSONL` / `HTTP` / `ClickHouse`）。
+- `analyze`：离线批量分析，输出 `IIP / TPG / Incident`。
+- `serve`：从 ClickHouse 的 `ioa_events` 增量轮询，做准实时分析。
+- `explain-incident`：对单个 incident 回溯窗口并重建 IIP/TPG 细节。
 
-## 项目介绍
+---
 
-ThreatGraph 的设计参考了 RapSheet 论文中的分析思路，并结合实际工程场景实现为可持续运行的检测系统。
+## 当前分支状态（重要）
 
-核心能力：
+本 README 以当前代码行为为准（`feature/incident-subgraph-clickhouse-svg`）：
 
-- 以 Sysmon 事件构建时序图
-- 基于 IOA 证据提取 IIP，并进一步构建 TPG
-- 对攻击阶段链路进行评分，输出可追溯的 incident
+- `produce` 主链路当前**不走 Sigma 引擎**，IOA 标签来自离线 EDR 字段映射。
+- ES 查询语句有固定配置入口：`threatgraph.input.elasticsearch.query`（JSON 字符串）。
+- `host_prefilter=true` 时，会先发现主机，再按主机批次回拉事件（见下文查询机制）。
+- `run_once` 对 ES 输入目前主要是兼容字段；ES 消费本身是 scroll 读完即结束。
 
-## 检测思路
+---
 
-ThreatGraph 采用“规则命中 + 图时序分析”联合判断：
+## 架构总览
 
-- 规则层：IOA 标签用于标记证据边（当前主线来源为离线 EDR 告警字段）
-- 图层：在时间约束和可达关系下还原攻击路径
-- 输出层：以 root、关键 IOA、TPG 序列为核心给出 incident 结果
+### 1) 离线批处理（推荐 v10）
 
-核心原则：
+`Elasticsearch -> produce -> ClickHouse(adjacency) -> analyze -> incidents`
 
-- 证据优先：先保留规则命中证据，再做图级关联与裁剪
-- 时序约束：仅保留满足时间一致性的传播路径
-- 因果约束：关注可达关系与阶段衔接，避免孤立事件误判
-- 可解释性优先：Incident 必须能回溯到 root、关键 IOA 与关键路径
-- 工程可运行：允许规则层存在一定噪声，但通过路径裁剪、阶段评分与上下文聚合控制误报，并在吞吐与存储受限场景下保持持续分析能力
+适合离线数据回放与全量分析。
 
-简而言之：规则回答“看到了什么”，图分析回答“这些行为是否构成同一条攻击链”。
+### 2) 准实时增量
 
-论文复刻说明：`docs/rapsheet_replication.md`
+`produce -> ClickHouse(adjacency + ioa_events) -> serve -> incidents`
 
-Produce 压缩清单：`docs/produce_min_metadata_checklist.md`
+`serve` 会维护 `ioa_processed` 去重标记，避免重复计算。
 
-## 运行模型
+---
 
-### produce
+## 检测原理（简版）
 
-`produce` 负责基础构图，不做最终 incident 判定。当前主路径已经不是 Redis 实时流，而是**离线 ES 数据集回扫**。
+ThreatGraph 当前主线是“事件证据 -> 时序因果图 -> 战术序列评分 -> incident”：
 
-数据流：
+1. **证据提取（IOA）**
+   - 在 `produce` 中，从离线 EDR 字段生成 `ioa_tags`（`risk_level/alert_name/name_key/ext_process_rule_id/attack.*`）。
+   - 仅 `record_type=edge` 且 `ioa_tags` 非空的边会进入后续告警事件集合。
 
-1) 从 Redis 或 Elasticsearch 取消息（当前离线主路径通常是 Elasticsearch）
-2) 解析事件并规范化为 `Event`
-3) 对离线 EDR 优先走固定字段 envelope + `Lookup map[string]string` 快路径
-4) 对离线 EDR 直接使用事件自带的告警字段生成 IOA 标签
-5) 映射为邻接表行（append-only）
-6) 输出邻接表（JSONL / HTTP / ClickHouse）
-7) 可选输出 IOA 事件（JSONL 或 ClickHouse）
-8) 可选落盘原始消息（重放用）
+2. **图建模（Adjacency）**
+   - 统一有向边：`vertex_id -> adjacent_id`，按 `ts + record_id` 排序。
+   - 运行时可只落最小元信息（`write_vertex_rows=false` + `include_edge_data=false`），降低 I/O。
 
-说明：
+3. **IIP 构建（初始感染点子图）**
+   - 对每个 host 的告警边按时间排序。
+   - 通过“最近可达早期告警”分配 seed，得到每个 IIP root。
+   - 从 seed 前向扩展，只保留能到达告警的路径（`can_reach_alert`），裁剪噪声边。
 
-- `SameParentDir` 由 `dirname(Image)` 与 `dirname(ImageLoaded)` 比较得到（忽略大小写）
-- 在保留的兼容路径里，仍可使用 `SameParentDir: true` 约束同目录侧加载场景
-- 对离线 ES 数据集，当前推荐固定主键来源：
-  - `ts = @timestamp`
-  - `host = client_id`
-  - `agent_id = client_id`
-  - `record_id = ext_detection_id`
-- 当前 `v10` 离线 ES 主路径默认**不再经过 Sigma 引擎**。IOA 标签直接来自事件字段：
-  - `risk_level`
-  - `alert_name` / `name_key`
-  - `ext_process_rule_id`
-  - `attack.tactic`
-  - `attack.technique`
+4. **TPG 构建（战术图）**
+   - 顶点 = IIP 内告警事件。
+   - 序列边 = 同主机时间链 + IIP 路径上的因果告警对（happens-before 近似）。
 
-#### v10 查询与 host prefilter（按当前代码）
+5. **战术评分与优先级**
+   - 在 TPG 上执行 DAG DP：先最大化 `sequence_length`，再最大化风险得分。
+   - 评分融合 `severity`、`tactic`、`technique`，并对重复规则命中做对数抑制。
+   - `incident-min-seq` 用于过滤过短序列，输出 `incident` 供 SOC 分诊。
 
-当前 `v10` 的 `produce` 主路径是“两阶段”，但**不是把 Phase 2 的事件条件硬编码在程序里**，而是：
+更详细说明见：`docs/detection_principles.md`。
 
-1. **发现 infected hosts（代码内置）**
-   - 基于配置里的时间窗过滤（来自 `input.elasticsearch.query` 的 filter）
-   - 追加 `must_not risk_level=notice`
-   - 追加 `must_not operation=PortAttack`
-   - 以 `client_id.keyword` 做 composite 聚合
-   - 仅保留 `uniq(ext_process_rule_id.keyword) > 1` 的 host
+---
 
-2. **按 host batch 回拉事件（基于你的查询模板）**
-   - 在原始 `input.elasticsearch.query` 上注入 `terms client_id.keyword in [host batch]`
-   - 对“non-notice 分支”额外注入 `must_not operation=PortAttack`
-   - 其余 notice/non-notice 事件条件由你在 `query` 里定义
+## 快速开始（v10）
 
-### analyze（批量离线）
+### 前置条件
 
-`analyze` 从本地 JSONL 或 ClickHouse 执行一次性分析：
+- Go 1.24+（见 `go.mod`）
+- 可访问的 ClickHouse HTTP 端口（默认 `8123`）
+- （可选）Elasticsearch（离线 EDR 回放时需要）
 
-1) 从邻接表 JSONL 或 ClickHouse 表读取图数据
-2) 构建 IIP 子图（时间约束反向判定 + `can_reach_alert` 裁剪）
-3) 从 IIP 子图构建 TPG（时间链 + 同路径因果补边）
-4) 在 TPG 上做 DAG DP 评分（长度优先、分数次优）
-5) 生成 incident 输出
-
-### serve（准实时增量）
-
-`serve` 以常驻进程方式做 IOA 微批处理（micro-batch），并按需拉取邻接窗口数据做验证分析：
-
-```
-[produce --output=clickhouse]  常驻写入
-    ├→ ClickHouse adjacency 表
-    └→ ClickHouse ioa_events 表
-
-[serve]  每 interval 触发一次
-    ① 读取一批未处理 IOA（按 ts + record_id 游标）
-    ② 按 host 聚合本批 IOA，计算每个 host 的分析窗口
-    ③ SELECT * FROM adjacency WHERE host = ? AND ts BETWEEN host_min_ts-window AND now()
-    ④ BuildIIPGraphs → BuildScoredTPGs → BuildIncidents（复用现有分析链路）
-    ⑤ 若某个 IIP 子图覆盖了同批其他 IOA，则这些 IOA 直接视为已处理（不再重复计算）
-    ⑥ 将已覆盖 IOA 写入 ioa_processed（避免后续批次重复计算）
-    ⑦ 输出 incidents（JSONL 或 Webhook），推进游标
-```
-
-关键参数（均可配置）：
-
-- `window`：邻接数据回看窗口，默认 2h
-- `interval`：处理周期，默认 30s
-- `batch_size`：每批 IOA 数量，默认 1000
-- `workers`：并发主机分析数，默认 4
-- `min_seq`：最小 kill-chain 序列长度，默认 2
-- `adjacency_table` / `ioa_table` / `processed_table`：ClickHouse 表名
-
-同一 host 的同一批 IOA 会做“子图覆盖去重”：某个 IOA 已被先前计算出的 IIP 子图覆盖时，本批内后续不再重复作为 seed 计算。
-
-`serve` 日志中的关键批次指标：
-
-- `batch_ioa`：该 host 在当前微批内的 IOA 条数
-- `covered_ioa` / `coverage`：本批 IOA 被 IIP 覆盖并标记 processed 的条数/比例
-- `batch_iips`：本批 IOA 实际映射到的 IIP root 数
-- `window_iips`：当前分析窗口（`window`）内构建出的 IIP 总数（历史上下文）
-- `backward` / `forward`：IIP 构建阶段的回溯/前向遍历次数
-
-注意：`window_iips` 不是“本批次 IIP 数”，它通常会大于 `batch_ioa`。
-
-IIP 回溯的核心加速来自分析运行时从原始边派生的反向邻接索引。
-事实来源始终是 append-only 邻接表。
-
-## 图模型
-
-顶点（`vertex_id` 前缀）：
-
-- `proc:` 进程实例
-- `path:` 文件路径
-- `net:` 网络端点（ip:port）
-- `domain:` 域名
-
-边为有向边，带 `ts`。分析时按时间约束构造 time-respecting paths。
-
-## 快速开始
+### 构建
 
 ```bash
 make
 ```
 
-### 离线模式（JSONL）
+二进制输出：`bin/threatgraph`（Windows 下为 `bin/threatgraph.exe`）。
 
-```bash
-# 实时构图
-./bin/threatgraph produce threatgraph.yml
+---
 
-# 一次性分析
-./bin/threatgraph analyze \
-  --input output/adjacency.min.jsonl \
-  --output output/iip_graphs.latest.jsonl \
-  --tactical-output output/scored_tpg.latest.jsonl \
-  --incident-output output/incidents.latest.min2.jsonl \
-  --incident-min-seq 2
-```
+## 配置文件
 
-### 准实时模式（ClickHouse，推荐）
+默认会按以下顺序查找配置：
 
-```bash
-# 进程 1：produce 写入 ClickHouse
-./bin/threatgraph produce example/threatgraph.serve.example.yml
+1. 命令行传入路径（如 `./bin/threatgraph produce xxx.yml`）
+2. 当前目录 `threatgraph.yml`
+3. 可执行文件同目录 `threatgraph.yml`
 
-# 进程 2：serve 按 IOA 微批增量分析
-./bin/threatgraph serve example/threatgraph.serve.example.yml
-```
+配置根结构在 `config/config.go`，核心段如下：
 
-`serve` 启动后按 interval 拉取一批未处理 IOA（`ts+record_id` 游标），按 host 聚合后拉邻接窗口并运行分析链路，最后写入 incident 与已处理标记。
+- `threatgraph.input`：输入（`redis` / `elasticsearch`）
+- `threatgraph.pipeline`：并发与批量参数
+- `threatgraph.graph`：邻接行精简开关
+- `threatgraph.output`：邻接输出
+- `threatgraph.ioa`：IOA 事件输出
+- `threatgraph.serve`：增量分析参数
 
-当 `serve.incident.mode=file` 时，会在同目录额外维护两份 analyze 兼容快照：
-
-- `incidents.latest.min2.jsonl`（当前增量状态下的 incident 快照）
-- `scored_tpg.latest.jsonl`（当前增量状态下的 scored TPG 快照）
-
-这样 Flask 等消费端可以直接复用 analyze 时代的文件名，不需要再额外跑一次离线 analyze。
-
-示例配置：
-
-- `example/threatgraph.example.yml` — 纯 JSONL 模式
-- `example/threatgraph.clickhouse.example.yml` — IOA 写 ClickHouse
-- `example/threatgraph.serve.example.yml` — produce + serve 全 ClickHouse 模式
-
-## Sigma 规则说明（当前状态）
-
-`internal/rules/sigma_engine.go` 仍保留在仓库中，但**当前主线 `produce` 代码未接入 Sigma 引擎**。
-
-也就是说：
-
-- `threatgraph.rules.enabled/path` 目前在主路径不生效（保留为历史兼容配置位）
-- 现在边上的 `ioa_tags` 来源于离线 EDR 事件字段映射（例如 `risk_level/alert_name/ext_process_rule_id/attack.*`）
-
-如果后续重新接入 Sigma，再单独更新本节并补充实际启用方式。
-
-## Analyze 用法（批量离线）
-
-```bash
-./bin/threatgraph analyze \
-  --input output/adjacency.min.jsonl \
-  --output output/iip_graphs.latest.jsonl \
-  --tactical-output output/scored_tpg.latest.jsonl \
-  --incident-output output/incidents.latest.min2.jsonl \
-  --incident-min-seq 2
-```
-
-注意：`analyze` 运行时至少需要指定 `--tactical-output` 或 `--incident-output` 之一。
-
-常用参数：
-
-- `--output`：IIP graph JSONL 输出
-- `--tactical-output`：TPG + 评分输出
-- `--incident-output`：incident 输出
-- `--incident-min-seq`：incident 最小序列长度阈值（默认 `2`）
-
-对于万级主机或需要持续运行的场景，推荐使用 `serve` 子命令替代手动循环调用 `analyze`。
-
-## Incident 深度提取（TPG 详情）
-
-`serve` 输出的 incident 是 SOC 归并摘要，不包含完整 TPG 顶点/时间线。可使用内置命令按 incident 反查邻接窗口并重建 IIP/TPG：
-
-```bash
-./bin/threatgraph explain-incident \
-  --config threatgraph.ubuntu.yml \
-  --incident-file output/incidents.serve.jsonl \
-  --index -1 \
-  --out output/incident_explain.latest.json
-```
-
-输出文件包含：
-
-- `incident`：原始 incident 摘要
-- `iip`：匹配到的 IIP 子图（`alert_events` + `edges`）
-- `tpg`：重建后的 TPG（`vertices` + `sequence_edges`）
-- `score`：当前评分结果（sequence/risk/tactic coverage）
-- `timeline`：按时间展开的 IOA 顶点序列（含规则名、tactic、technique）
-
-## 关键配置片段
-
-### IOA 输出
-
-```yaml
-threatgraph:
-  ioa:
-    enabled: true
-    output:
-      mode: file # file | clickhouse
-      file:
-        path: output/ioa_events.jsonl
-```
-
-### 原始消息重放落盘
-
-```yaml
-threatgraph:
-  replay_capture:
-    enabled: true
-    file:
-      path: output/raw_events.jsonl
-    batch_size: 1000
-  flush_interval: 2s
-```
-
-### 低成本原始图模式（推荐）
-
-```yaml
-threatgraph:
-  graph:
-    write_vertex_rows: false
-    include_edge_data: false
-```
-
-- `write_vertex_rows=false`：仅写 edge 行，显著降低邻接表体积；当前 `analyze/serve` 路径按边重建图，不依赖 vertex 行。
-- `include_edge_data=false`：不在边上写入完整 Sysmon 字段，显著降低落盘体积。
-- 建议保留边级 `ioa_tags`（无论来源于 Sigma 兼容路径或离线 EDR 告警字段）用于后续 `analyze` 的 IIP/TPG 构建与评分。
-
-### Serve 模式配置
-
-```yaml
-threatgraph:
-  serve:
-    analyze:
-      window: 2h
-      interval: 30s
-      batch_size: 1000
-      min_seq: 2
-      workers: 4
-      adjacency_table: adjacency
-      ioa_table: ioa_events
-      processed_table: ioa_processed
-      clickhouse:
-        url: http://127.0.0.1:8123
-        database: threatgraph
-    incident:
-      mode: file   # file | http
-      file:
-        path: output/incidents.jsonl
-```
-
-### 邻接表输出到 ClickHouse
-
-```yaml
-threatgraph:
-  output:
-    mode: clickhouse
-    clickhouse:
-      url: http://127.0.0.1:8123
-      database: threatgraph
-      table: adjacency
-      format: row_binary
-      username: default
-      password: ""
-      timeout: 5s
-```
-
-`format` 支持：
-
-- `json_each_row`：兼容模式，直观但较慢
-- `row_binary`：当前推荐，吞吐更高
-
-### 离线 ES -> ClickHouse（当前主路径）
-
-当前离线回放推荐配置：
+### v10 推荐配置片段（离线 ES -> ClickHouse）
 
 ```yaml
 threatgraph:
   input:
     mode: elasticsearch
     elasticsearch:
+      url: https://127.0.0.1:9200
+      index: edr-offline-ls-*
+      query: '{"query":{"bool":{"filter":[{"range":{"@timestamp":{"gte":"2026-03-04T00:00:00Z","lt":"2026-03-05T00:00:00Z"}}}],"should":[{"bool":{"must":[{"term":{"risk_level":"notice"}},{"term":{"operation":"CreateProcess"}},{"term":{"fltrname.keyword":"CommonCreateProcess"}}]}},{"bool":{"must":[{"term":{"risk_level":"notice"}},{"term":{"operation":"WriteComplete"}},{"term":{"fltrname.keyword":"WriteNewFile.ExcuteFile"}}]}},{"bool":{"must":[{"exists":{"field":"risk_level"}}],"must_not":[{"term":{"risk_level":"notice"}}]}}],"minimum_should_match":1}}}'
       host_prefilter: true
       host_batch_size: 50
       host_batch_workers: 4
-      # run_once: true  # currently compatibility flag (ES input is one-shot by default)
+      batch_size: 2000
+      scroll: 5m
+      timeout: 60s
+      run_once: true
   pipeline:
+    workers: 8
     write_workers: 2
     batch_size: 20000
     flush_interval: 5s
@@ -354,109 +127,56 @@ threatgraph:
     write_vertex_rows: false
     include_edge_data: false
   output:
+    mode: clickhouse
     clickhouse:
+      url: http://127.0.0.1:8123
+      database: threatgraph
+      table: adjacency_offline_full_20260304_v10
       format: row_binary
+  ioa:
+    enabled: false
 ```
 
-含义：
+---
 
-- `host_prefilter=true`：先发现 infected host，再按 host batch 回拉事件
-- `host_batch_size=50`：每批最多 50 台 host
-- `host_batch_workers=4`：最多 4 个 batch 并发
-- `write_vertex_rows=false`：只写 edge 行，减少邻接表膨胀
-- `format=row_binary`：ClickHouse 写入使用 `RowBinary`
+## Elasticsearch 查询机制（回答“是否有固定配置文件”）
 
-## 傻瓜版：produce / analyze / HTML 怎么跑
+有。主查询模板来自：
 
-下面假设你已经有：
+- `threatgraph.input.elasticsearch.query`
 
-- Elasticsearch 离线数据集：`edr-offline-ls-*`
-- ClickHouse：`http://127.0.0.1:8123`
-- 配置文件：`config_full_v10.yml`
+实现细节（`internal/input/elasticsearch/consumer.go`）：
 
-### 1. 先跑 produce
+1. 若 `query` 为空，默认使用 `match_all`。
+2. 若缺少 `size/sort`，自动注入：
+   - `size = batch_size`
+   - `sort = ["_doc"]`
+3. 若设置 `slices > 1`，自动注入 ES slice 参数。
+4. 若 `host_prefilter=true`：
+   - Phase 1：基于你的 `query.bool.filter` 发现候选 host，并附加：
+     - `exists risk_level`
+     - `must_not risk_level=notice`
+     - `must_not operation=PortAttack`
+     - `cardinality(ext_process_rule_id.keyword) > 1`
+   - Phase 2：在原始查询模板上注入 `terms client_id.keyword in [host batch]`
+   - 对 non-notice 分支额外注入 `must_not operation=PortAttack`
 
-```bash
-./bin/threatgraph produce config_full_v10.yml
-```
+所以：查询“骨架”在配置里，程序只做必要注入，不是完全硬编码。
 
-它会做两阶段处理：
+---
 
-1. 先找 infected host
-2. 再按 host batch 回拉事件并写入 ClickHouse 邻接表
+## ClickHouse 表
 
-默认输出表：
-
-- `threatgraph.adjacency_offline_full_20260304_v10`
-
-### 2. 再跑 analyze
-
-```bash
-./bin/threatgraph analyze \
-  --source clickhouse \
-  --config threatgraph.ubuntu.yml \
-  --adjacency-table adjacency_offline_full_20260304_v10 \
-  --since 2026-03-04T00:00:00Z \
-  --until 2026-03-05T00:00:00Z \
-  --output output/iip_ch_full_20260304_v10.jsonl \
-  --tactical-output output/tpg_ch_full_20260304_v10.jsonl \
-  --incident-output output/incidents_ch_full_20260304_v10.jsonl \
-  --incident-min-seq 2
-```
-
-会生成：
-
-- `output/iip_ch_full_20260304_v10.jsonl`
-- `output/tpg_ch_full_20260304_v10.jsonl`
-- `output/incidents_ch_full_20260304_v10.jsonl`
-
-### 3. 最后生成 HTML viewer
-
-先生成每个 incident 的子图：
-
-```bash
-python3 tools/build_incident_subgraphs.py \
-  --incidents output/incidents_ch_full_20260304_v10.jsonl \
-  --iip output/iip_ch_full_20260304_v10.jsonl \
-  --ch-url http://127.0.0.1:8123 \
-  --ch-db threatgraph \
-  --ch-table adjacency_offline_full_20260304_v10 \
-  --out-dir output/incident_subgraphs_v10
-```
-
-再生成 HTML：
-
-```bash
-python3 tools/make_viewer.py \
-  --all-in-dir output/incident_subgraphs_v10 \
-  --out output/viewer_v10.html \
-  --es-url https://127.0.0.1:9200 \
-  --es-user elastic \
-  --es-pass <PASSWORD> \
-  --es-ca /home/ubuntu/elasticsearch-8.15.0/config/certs/http_ca.crt \
-  --es-index edr-offline-ls-*
-```
-
-最终产物：
-
-- `output/viewer_v10.html`
-
-如果在本地打开，建议用简单 HTTP 服务，不要直接双击 `file://`：
-
-```bash
-python -m http.server 8000
-```
-
-然后浏览器打开：
-
-- `http://127.0.0.1:8000/viewer_v10.html`
-
-## ClickHouse 建表
+### 必需表（离线 analyze）
 
 ```bash
 clickhouse-client --query "CREATE DATABASE IF NOT EXISTS threatgraph"
+clickhouse-client < migrations/001_adjacency.sql
+```
 
-# IOA 事件表
+### 必需表（serve 增量）
+
+```bash
 clickhouse-client --query "
 CREATE TABLE IF NOT EXISTS threatgraph.ioa_events (
   ts DateTime64(3),
@@ -475,139 +195,129 @@ ORDER BY (host, ts, name, record_id)
 TTL ts + INTERVAL 14 DAY
 "
 
-# 邻接表（serve 模式必需）
-clickhouse-client < migrations/001_adjacency.sql
-
-# 已处理 IOA 映射表（serve 去重与增量必需）
-clickhouse-client --query "
-CREATE TABLE IF NOT EXISTS threatgraph.ioa_processed (
-  ts DateTime64(3),
-  host String,
-  record_id String,
-  name String,
-  iip_root String,
-  iip_ts DateTime64(3),
-  processed_at DateTime64(3)
-)
-ENGINE = MergeTree
-PARTITION BY toDate(ts)
-ORDER BY (host, ts, name, record_id)
-TTL ts + INTERVAL 14 DAY
-"
+clickhouse-client < migrations/002_ioa_processed.sql
 ```
 
-## 可视化
+---
 
-脚本：`tools/visualize_adjacency.py`
+## 命令说明
+
+### `produce`
 
 ```bash
-python tools/visualize_adjacency.py \
-  --input output/adjacency.min.jsonl \
-  --render simple-svg \
-  --layout tree \
-  --rankdir TB \
-  --focus 'proc:host:{guid}' \
-  --start-ts '2026-02-27T15:43:02.066Z'
+./bin/threatgraph produce threatgraph.yml
 ```
 
-## Incident 页面（Flask）
+兼容旧调用方式（不写子命令）：
 
 ```bash
-TG_PORT=5050 python3 tools/incident_viewer_flask.py
-```
-
-默认读取以下文件（可用环境变量覆盖）：
-
-- `output/incidents.latest.min2.jsonl`
-- `output/scored_tpg.latest.jsonl`
-- `output/adjacency.min.jsonl`
-
-访问：`http://127.0.0.1:5050/`
-
-页面支持：
-
-- Incident 详情（Root + IOA 顶点上下文）
-- TPG 规则/ATT&CK 聚合、TPG 顶点与序列边
-- 基于 root 的 IIP 子图 SVG（可强制刷新）
-
-## 离线 ES 主路径（当前推荐）
-
-当前离线回放推荐路径如下：
-
-1. `produce` 从 `edr-offline-ls-*` 读取离线 EDR 数据集
-2. 使用 `time_shard_minutes + time_shard_workers` 按时间窗口切任务
-3. 并发写入 ClickHouse adjacency 表
-4. 再使用 `analyze --source clickhouse` 从邻接表读取并生成 `IIP / TPG / incident`
-
-对离线 ES 数据集，当前推荐固定主键来源：
-
-- `ts = @timestamp`
-- `host = client_id`
-- `agent_id = client_id`
-- `record_id = ext_detection_id`
-
-推荐配置片段：
-
-```yaml
-threatgraph:
-  input:
-    mode: elasticsearch
-    elasticsearch:
-      # run_once: true  # currently compatibility flag (ES input is one-shot by default)
-      time_shard_minutes: 30
-      time_shard_workers: 4
-  pipeline:
-    write_workers: 2
-    batch_size: 20000
-    flush_interval: 5s
-  graph:
-    write_vertex_rows: false
-    include_edge_data: false
-  output:
-    mode: clickhouse
-    clickhouse:
-      format: row_binary
+./bin/threatgraph threatgraph.yml
 ```
 
 说明：
 
-- `time_shard_minutes=30`：把大时间范围切成 30 分钟窗口任务
-- `time_shard_workers=4`：父进程最多同时拉起 4 个子进程抢占窗口任务
-- `write_workers=2`：单个 produce 进程内部开启多个写协程
-- `write_vertex_rows=false`：仅写 edge 行，减少邻接表膨胀
-- `format=row_binary`：ClickHouse 写入采用 `RowBinary`
+- `input.mode=elasticsearch` + `host_prefilter=true`：优先走 host 预筛选模式。
+- 若启用 `time_shards` / `time_shard_minutes`，会分片生成子配置并并发子进程执行。
+- 两者同时开时，当前代码优先 `host_prefilter`。
 
-## 离线数据集已测性能（当前基线）
+### `analyze`
 
-以下数字来自 `192.168.120.134` 上对 `2026-03-04` 离线 EDR 数据集的实测。
+文件输入：
 
-### produce 基线（v5）
+```bash
+./bin/threatgraph analyze \
+  --source file \
+  --input output/adjacency.jsonl \
+  --output output/iip_graphs.jsonl \
+  --tactical-output output/scored_tpg.jsonl \
+  --incident-output output/incidents.min2.jsonl \
+  --incident-min-seq 2
+```
 
-- ES 命中：`10,291,175` 条
-- 邻接表行数：`49,223,796` 条
-- 总耗时：`3254s`（约 `54.2 分钟`）
+ClickHouse 输入（v10 常用）：
 
-### produce 优化试验（2 分钟采样）
+```bash
+./bin/threatgraph analyze \
+  --source clickhouse \
+  --config threatgraph.yml \
+  --adjacency-table adjacency_offline_full_20260304_v10 \
+  --since 2026-03-04T00:00:00Z \
+  --until 2026-03-05T00:00:00Z \
+  --output output/iip_ch_full_20260304_v10.jsonl \
+  --tactical-output output/tpg_ch_full_20260304_v10.jsonl \
+  --incident-output output/incidents_ch_full_20260304_v10.jsonl \
+  --incident-min-seq 2
+```
 
-- `v7`（4 slices，同表，`write_workers=1`）
-  - `789,696 rows / 2 min`
-  - `95,895 uniq(record_id) / 2 min`
-- `v7`（4 slices，同表，`write_workers=2`）
-  - `864,722 rows / 2 min`
-  - `105,356 uniq(record_id) / 2 min`
-- `v8`（4 个 6 小时时间分片，同表）
-  - `1,094,823 rows / 2 min`
-  - `148,350 uniq(record_id) / 2 min`
-- `v8`（30 分钟窗口任务队列，4 worker，同表）
-  - `1,581,494 rows / 2 min`
-  - `282,927 uniq(record_id) / 2 min`
+注意：
 
-### analyze 基线（v5）
+- `--source=clickhouse` 必须提供 `--config --since --until`。
+- 至少要给 `--tactical-output` 或 `--incident-output` 之一。
 
-- 输入表：`adjacency_offline_full_20260304_v5`
-- 表总行数：`49,223,796`
-- 表磁盘占用：`348.72 MiB`
-- 实际参与 analyze 的 host：`85`
-- 总耗时：`25.84s`
-- 平均每台 host：`0.304s`
-- 峰值 RSS：`130,064 KB`（约 `127 MiB`）
+### `serve`
+
+```bash
+./bin/threatgraph serve threatgraph.yml
+```
+
+`serve` 读取 `threatgraph.serve.analyze` 配置，循环：
+
+- 拉取未处理 IOA 批次（`ioa_events` - `ioa_processed`）
+- 按 host 取邻接窗口（`adjacency_table`）
+- 执行 IIP/TPG/Incident
+- 写 incident 输出并标记 processed
+
+当 `serve.incident.mode=file` 时，会额外维护两个兼容快照：
+
+- `incidents.latest.min2.jsonl`
+- `scored_tpg.latest.jsonl`
+
+### `explain-incident`
+
+```bash
+./bin/threatgraph explain-incident \
+  --config threatgraph.yml \
+  --incident-file output/incidents_ch_full_20260304_v10.jsonl \
+  --index -1 \
+  --out output/incident_explain.latest.json
+```
+
+输出包含：
+
+- 原始 incident
+- 选中窗口
+- 匹配 IIP
+- 重建 TPG
+- 评分摘要
+- 时间线（包含 IOA 名称/战术/技术）
+
+---
+
+## IOA 标签来源（当前实现）
+
+`produce` worker 中使用 `offlineEDRIOATags(...)` 生成 IOA 标签（`internal/pipeline/adjacency_redis_pipeline.go`）：
+
+- `risk_level` 为空或 `notice` 时不生成 IOA 标签
+- `name` 优先 `alert_name`，其次 `name_key`，再退化为 `offline-edr-ioa`
+- `id` 来自 `ext_process_rule_id`
+- `tactic/technique` 来自 `attack.tactic` / `attack.technique`
+
+---
+
+## 已知限制与兼容性说明
+
+- `rules.enabled/path` 配置仍在，但当前 `produce` 主链路未接入 Sigma 引擎。
+- `run_once` 在 ES 输入下目前主要是兼容字段，实际结束条件是 scroll EOF。
+- `serve` 依赖 `ioa_events + ioa_processed`，若 `ioa.enabled=false` 则不能直接做增量链路。
+- `output.clickhouse.format` 仅邻接写入支持 `json_each_row` / `row_binary`；IOA 写入固定 `JSONEachRow`。
+
+---
+
+## 相关文档
+
+- `docs/detection_principles.md`
+- `docs/rapsheet_replication.md`
+- `docs/produce_min_metadata_checklist.md`
+- `docs/offline_edr_adjacency_mapping.md`
+- `docs/es_offline_edr_to_adjacency_mapping.md`
+- `docs/adjacency_table_schema.md`
