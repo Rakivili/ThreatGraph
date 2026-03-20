@@ -2,7 +2,7 @@
 
 本文档记录当前 `ThreatGraph/internal/graph/adjacency/mapper.go` 的已实现事件类型与字段映射。
 
-> 适用范围：离线 EDR 数据（`event.Raw`）与 Sysmon 事件（`event.EventID`）
+> 适用范围：离线 EDR 数据（当前优先走 `event.Lookup`，必要时 fallback 到 `event.Fields/event.Raw`）与 Sysmon 事件（`event.EventID`）
 
 ---
 
@@ -55,7 +55,7 @@
 
 ## 3. 离线 EDR 路径判定
 
-若 `Raw["risk_level"]` 存在，则进入离线 EDR 映射：
+若 `event.Lookup["risk_level"]`（或 fallback 字段）存在，则进入离线 EDR 映射：
 
 - `risk_level == notice`
   - 仅处理 `operation == CreateProcess AND fltrname == CommonCreateProcess`
@@ -160,3 +160,4 @@
 
 - 上述顶点 key 规则适用于当前已实现 mapper。
 - 如果后续新增 `NamedPipeVertex` / `ThreadVertex` 等类型，需要同步更新本文档。
+- 当前 offline parser 已改为固定字段 envelope + `Lookup map[string]string` 快路径，不再为离线 EDR 主路径构建完整 `Raw map[string]interface{}`；只有 `winlog.event_data` 仍会进入 `event.Fields` 供兼容逻辑使用。

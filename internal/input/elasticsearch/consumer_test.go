@@ -110,3 +110,115 @@ func TestNewConsumerInjectsSliceIntoQuery(t *testing.T) {
 		t.Fatalf("unexpected slice payload: %#v", slice)
 	}
 }
+
+func TestNewConsumerInjectsHostTermsFilter(t *testing.T) {
+	c, err := NewConsumer(Config{
+		URL:        "https://example.local:9200",
+		Index:      "edr-offline-*",
+		Query:      `{"query":{"bool":{"filter":[{"term":{"foo":"bar"}}],"should":[{"bool":{"must":[{"term":{"risk_level":"notice"}},{"term":{"operation":"CreateProcess"}}]}},{"bool":{"must":[{"term":{"risk_level":"notice"}},{"term":{"operation":"WriteComplete"}}]}},{"bool":{"must":[{"exists":{"field":"risk_level"}}],"must_not":[{"term":{"risk_level":"notice"}}]}}],"minimum_should_match":1}}}`,
+		HostFilter: []string{"h1", "h2"},
+		Insecure:   true,
+	})
+	if err != nil {
+		t.Fatalf("NewConsumer failed: %v", err)
+	}
+	defer c.Close()
+	queryNode := c.query["query"].(map[string]interface{})
+	boolNode := queryNode["bool"].(map[string]interface{})
+	filters := boolNode["filter"].([]interface{})
+	if len(filters) != 2 {
+		t.Fatalf("expected 2 filters, got %d", len(filters))
+	}
+	last := filters[1].(map[string]interface{})
+	terms := last["terms"].(map[string]interface{})
+	hosts := terms["client_id.keyword"].([]string)
+	if len(hosts) != 2 || hosts[0] != "h1" || hosts[1] != "h2" {
+		t.Fatalf("unexpected host filter: %#v", hosts)
+	}
+	shoulds := boolNode["should"].([]interface{})
+	nonNotice := shoulds[2].(map[string]interface{})["bool"].(map[string]interface{})
+	mustNot := nonNotice["must_not"].([]interface{})
+	if len(mustNot) != 2 {
+		t.Fatalf("expected non-notice branch must_not to include PortAttack, got %#v", mustNot)
+	}
+	term := mustNot[1].(map[string]interface{})["term"].(map[string]interface{})
+	if term["operation"] != "PortAttack" {
+		t.Fatalf("expected operation PortAttack exclusion, got %#v", term)
+	}
+}
+
+func TestDiscoverNonNoticeHostsPaginatesCompositeAgg(t *testing.T) {
+	call := 0
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/_search") {
+			http.NotFound(w, r)
+			return
+		}
+		call++
+		var body map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		aggs := body["aggs"].(map[string]interface{})
+		hostsAgg := aggs["hosts"].(map[string]interface{})
+		composite := hostsAgg["composite"].(map[string]interface{})
+		query := body["query"].(map[string]interface{})
+		boolNode := query["bool"].(map[string]interface{})
+		mustNot := boolNode["must_not"].([]interface{})
+		if len(mustNot) != 2 {
+			t.Fatalf("expected 2 must_not clauses, got %d", len(mustNot))
+		}
+		term0 := mustNot[0].(map[string]interface{})["term"].(map[string]interface{})
+		term1 := mustNot[1].(map[string]interface{})["term"].(map[string]interface{})
+		if term0["risk_level"] != "notice" {
+			t.Fatalf("expected must_not risk_level notice, got %#v", term0)
+		}
+		if term1["operation"] != "PortAttack" {
+			t.Fatalf("expected must_not operation PortAttack, got %#v", term1)
+		}
+		_, hasAfter := composite["after"]
+		if call == 1 && hasAfter {
+			t.Fatalf("first call should not include after")
+		}
+		if call == 2 && !hasAfter {
+			t.Fatalf("second call should include after")
+		}
+		if call == 1 {
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"aggregations": map[string]interface{}{
+					"hosts": map[string]interface{}{
+						"buckets": []map[string]interface{}{
+							{"key": map[string]interface{}{"client_id": "h1"}, "distinct_rules": map[string]interface{}{"value": 2}},
+							{"key": map[string]interface{}{"client_id": "h2"}, "distinct_rules": map[string]interface{}{"value": 1}},
+						},
+						"after_key": map[string]interface{}{"client_id": "h2"},
+					},
+				},
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"aggregations": map[string]interface{}{
+				"hosts": map[string]interface{}{
+					"buckets": []map[string]interface{}{{"key": map[string]interface{}{"client_id": "h3"}, "distinct_rules": map[string]interface{}{"value": 3}}},
+				},
+			},
+		})
+	}))
+	defer ts.Close()
+	hosts, err := DiscoverNonNoticeHosts(context.Background(), Config{
+		URL:      ts.URL,
+		Index:    "edr-offline-*",
+		Query:    `{"query":{"bool":{"filter":[{"range":{"@timestamp":{"gte":"2026-03-04T00:00:00Z","lt":"2026-03-05T00:00:00Z"}}}]}}}`,
+		Insecure: true,
+	})
+	if err != nil {
+		t.Fatalf("DiscoverNonNoticeHosts failed: %v", err)
+	}
+	if call != 2 {
+		t.Fatalf("expected 2 composite requests, got %d", call)
+	}
+	if strings.Join(hosts, ",") != "h1,h3" {
+		t.Fatalf("unexpected hosts: %#v", hosts)
+	}
+}

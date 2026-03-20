@@ -67,6 +67,9 @@ type ElasticsearchConfig struct {
 	Password         string            `yaml:"password"`
 	Index            string            `yaml:"index"`
 	Query            string            `yaml:"query"`
+	HostPrefilter    bool              `yaml:"host_prefilter"`
+	HostBatchSize    int               `yaml:"host_batch_size"`
+	HostBatchWorkers int               `yaml:"host_batch_workers"`
 	Slices           int               `yaml:"slices"`
 	TimeShards       int               `yaml:"time_shards"`
 	TimeShardMinutes int               `yaml:"time_shard_minutes"`

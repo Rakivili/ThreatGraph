@@ -22,6 +22,7 @@ type Config struct {
 	Password   string
 	Index      string
 	Query      string
+	HostFilter []string
 	SliceID    int
 	SliceMax   int
 	BatchSize  int
@@ -93,6 +94,10 @@ func NewConsumer(cfg Config) (*Consumer, error) {
 			"max": cfg.SliceMax,
 		}
 	}
+	if len(cfg.HostFilter) > 0 {
+		injectHostFilter(query, cfg.HostFilter)
+		injectExcludePortAttackOnNonNotice(query)
+	}
 
 	tlsConfig := &tls.Config{InsecureSkipVerify: cfg.Insecure}
 	if strings.TrimSpace(cfg.CACertPath) != "" {
@@ -124,6 +129,217 @@ func NewConsumer(cfg Config) (*Consumer, error) {
 		query:    query,
 		scroll:   durationToES(cfg.Scroll),
 	}, nil
+}
+
+func DiscoverNonNoticeHosts(ctx context.Context, cfg Config) ([]string, error) {
+	if strings.TrimSpace(cfg.URL) == "" {
+		return nil, fmt.Errorf("elasticsearch url is required")
+	}
+	if strings.TrimSpace(cfg.Index) == "" {
+		return nil, fmt.Errorf("elasticsearch index is required")
+	}
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = 30 * time.Second
+	}
+	query, err := buildNonNoticeDiscoveryQuery(cfg.Query)
+	if err != nil {
+		return nil, err
+	}
+	tlsConfig := &tls.Config{InsecureSkipVerify: cfg.Insecure}
+	if strings.TrimSpace(cfg.CACertPath) != "" {
+		ca, err := os.ReadFile(cfg.CACertPath)
+		if err != nil {
+			return nil, fmt.Errorf("read ca cert: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(ca) {
+			return nil, fmt.Errorf("append ca cert failed")
+		}
+		tlsConfig.RootCAs = pool
+	}
+	transport := &http.Transport{TLSClientConfig: tlsConfig}
+	headers := map[string]string{}
+	for k, v := range cfg.Headers {
+		headers[k] = v
+	}
+	base := strings.TrimRight(cfg.URL, "/")
+	endpoint := fmt.Sprintf("%s/%s", base, strings.TrimLeft(cfg.Index, "/"))
+	c := &Consumer{
+		endpoint: endpoint,
+		username: cfg.Username,
+		password: cfg.Password,
+		headers:  headers,
+		client:   &http.Client{Timeout: cfg.Timeout, Transport: transport},
+	}
+	return c.discoverHosts(ctx, query)
+}
+
+func buildNonNoticeDiscoveryQuery(raw string) (map[string]interface{}, error) {
+	query := map[string]interface{}{"query": map[string]interface{}{"bool": map[string]interface{}{"filter": []interface{}{}}}}
+	if strings.TrimSpace(raw) != "" {
+		var parsed map[string]interface{}
+		if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+			return nil, fmt.Errorf("invalid elasticsearch query json: %w", err)
+		}
+		if q, ok := parsed["query"].(map[string]interface{}); ok {
+			if b, ok := q["bool"].(map[string]interface{}); ok {
+				if filters, ok := b["filter"].([]interface{}); ok {
+					query["query"].(map[string]interface{})["bool"].(map[string]interface{})["filter"] = filters
+				}
+			}
+		}
+	}
+	boolNode := query["query"].(map[string]interface{})["bool"].(map[string]interface{})
+	filters := boolNode["filter"].([]interface{})
+	filters = append(filters, map[string]interface{}{"exists": map[string]interface{}{"field": "risk_level"}})
+	boolNode["filter"] = filters
+	boolNode["must_not"] = []interface{}{
+		map[string]interface{}{"term": map[string]interface{}{"risk_level": "notice"}},
+		map[string]interface{}{"term": map[string]interface{}{"operation": "PortAttack"}},
+	}
+	return query, nil
+}
+
+func (c *Consumer) discoverHosts(ctx context.Context, query map[string]interface{}) ([]string, error) {
+	var afterKey map[string]interface{}
+	hosts := make([]string, 0, 1024)
+	for {
+		bodyQuery := cloneMap(query)
+		bodyQuery["size"] = 0
+		bodyQuery["aggs"] = buildHostCompositeAgg(afterKey)
+		body, err := json.Marshal(bodyQuery)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := c.doJSON(ctx, http.MethodPost, c.endpoint+"/_search", body)
+		if err != nil {
+			return nil, err
+		}
+		var parsed struct {
+			Aggregations struct {
+				Hosts struct {
+					Buckets []struct {
+						Key struct {
+							ClientID string `json:"client_id"`
+						} `json:"key"`
+						DistinctRules struct {
+							Value float64 `json:"value"`
+						} `json:"distinct_rules"`
+					} `json:"buckets"`
+					AfterKey map[string]interface{} `json:"after_key"`
+				} `json:"hosts"`
+			} `json:"aggregations"`
+		}
+		if err := json.Unmarshal(resp, &parsed); err != nil {
+			return nil, err
+		}
+		for _, bucket := range parsed.Aggregations.Hosts.Buckets {
+			if bucket.Key.ClientID != "" && bucket.DistinctRules.Value > 1 {
+				hosts = append(hosts, bucket.Key.ClientID)
+			}
+		}
+		if len(parsed.Aggregations.Hosts.Buckets) == 0 || len(parsed.Aggregations.Hosts.AfterKey) == 0 {
+			break
+		}
+		afterKey = parsed.Aggregations.Hosts.AfterKey
+	}
+	return hosts, nil
+}
+
+func injectHostFilter(query map[string]interface{}, hosts []string) {
+	if len(hosts) == 0 {
+		return
+	}
+	queryNode, ok := query["query"].(map[string]interface{})
+	if !ok {
+		queryNode = map[string]interface{}{}
+		query["query"] = queryNode
+	}
+	boolNode, ok := queryNode["bool"].(map[string]interface{})
+	if !ok {
+		boolNode = map[string]interface{}{}
+		queryNode["bool"] = boolNode
+	}
+	filters, _ := boolNode["filter"].([]interface{})
+	filters = append(filters, map[string]interface{}{"terms": map[string]interface{}{"client_id.keyword": hosts}})
+	boolNode["filter"] = filters
+}
+
+func injectExcludePortAttackOnNonNotice(query map[string]interface{}) {
+	queryNode, ok := query["query"].(map[string]interface{})
+	if !ok {
+		return
+	}
+	boolNode, ok := queryNode["bool"].(map[string]interface{})
+	if !ok {
+		return
+	}
+	shoulds, ok := boolNode["should"].([]interface{})
+	if !ok {
+		return
+	}
+	for _, item := range shoulds {
+		branch, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		innerBool, ok := branch["bool"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		mustNot, _ := innerBool["must_not"].([]interface{})
+		hasRiskNoticeMustNot := false
+		hasPortAttackMustNot := false
+		for _, mn := range mustNot {
+			termWrap, ok := mn.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			term, ok := termWrap["term"].(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if term["risk_level"] == "notice" {
+				hasRiskNoticeMustNot = true
+			}
+			if term["operation"] == "PortAttack" {
+				hasPortAttackMustNot = true
+			}
+		}
+		if hasRiskNoticeMustNot && !hasPortAttackMustNot {
+			mustNot = append(mustNot, map[string]interface{}{"term": map[string]interface{}{"operation": "PortAttack"}})
+			innerBool["must_not"] = mustNot
+		}
+	}
+}
+
+func buildHostCompositeAgg(after map[string]interface{}) map[string]interface{} {
+	agg := map[string]interface{}{
+		"hosts": map[string]interface{}{
+			"composite": map[string]interface{}{
+				"size": 1000,
+				"sources": []interface{}{
+					map[string]interface{}{"client_id": map[string]interface{}{"terms": map[string]interface{}{"field": "client_id.keyword"}}},
+				},
+			},
+			"aggs": map[string]interface{}{
+				"distinct_rules": map[string]interface{}{
+					"cardinality": map[string]interface{}{"field": "ext_process_rule_id.keyword"},
+				},
+			},
+		},
+	}
+	if len(after) > 0 {
+		agg["hosts"].(map[string]interface{})["composite"].(map[string]interface{})["after"] = after
+	}
+	return agg
+}
+
+func cloneMap(src map[string]interface{}) map[string]interface{} {
+	b, _ := json.Marshal(src)
+	var dst map[string]interface{}
+	_ = json.Unmarshal(b, &dst)
+	return dst
 }
 
 func (c *Consumer) Pop(ctx context.Context) ([]byte, error) {

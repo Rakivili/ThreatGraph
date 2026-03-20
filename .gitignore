@@ -1,3 +1,8 @@
 threatgraph.yml
 bin/
 /output/
+tools/__pycache__/
+*.pyc
+threatgraph-linux-amd64
+perfprobe-linux-amd64
+NUL

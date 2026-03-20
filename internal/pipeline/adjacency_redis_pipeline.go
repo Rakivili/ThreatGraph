@@ -11,7 +11,6 @@ import (
 
 	"threatgraph/internal/graph/adjacency"
 	"threatgraph/internal/logger"
-	"threatgraph/internal/rules"
 	"threatgraph/internal/transform/sysmon"
 	"threatgraph/pkg/models"
 )
@@ -24,7 +23,6 @@ type MessageConsumer interface {
 // RedisAdjacencyPipeline consumes Redis events and writes adjacency rows.
 type RedisAdjacencyPipeline struct {
 	consumer      MessageConsumer
-	engine        rules.Engine
 	mapper        *adjacency.Mapper
 	writer        AdjacencyWriter
 	ioaWriter     IOAWriter
@@ -48,10 +46,9 @@ type writeBatch struct {
 }
 
 // NewRedisAdjacencyPipeline creates a pipeline for Redis adjacency output.
-func NewRedisAdjacencyPipeline(consumer MessageConsumer, engine rules.Engine, mapper *adjacency.Mapper, writer AdjacencyWriter, ioaWriter IOAWriter, rawWriter RawWriter, workers, writeWorkers, batchSize int, flushInterval time.Duration, rawBatchSize int, rawFlushInterval time.Duration) *RedisAdjacencyPipeline {
+func NewRedisAdjacencyPipeline(consumer MessageConsumer, mapper *adjacency.Mapper, writer AdjacencyWriter, ioaWriter IOAWriter, rawWriter RawWriter, workers, writeWorkers, batchSize int, flushInterval time.Duration, rawBatchSize int, rawFlushInterval time.Duration) *RedisAdjacencyPipeline {
 	return &RedisAdjacencyPipeline{
 		consumer:      consumer,
-		engine:        engine,
 		mapper:        mapper,
 		writer:        writer,
 		ioaWriter:     ioaWriter,
@@ -260,12 +257,7 @@ func (p *RedisAdjacencyPipeline) workerLoop(in <-chan []byte, out chan<- redisWo
 
 		enrichDerivedFields(event)
 
-		if p.engine != nil {
-			event.IoaTags = p.engine.Apply(event)
-		}
-		if len(event.IoaTags) == 0 {
-			event.IoaTags = offlineEDRIOATags(event)
-		}
+		event.IoaTags = offlineEDRIOATags(event)
 
 		rows := p.mapper.Map(event)
 		out <- redisWorkItem{rows: rows, ioaEvents: extractIOAEvents(rows)}
@@ -421,8 +413,8 @@ func extractIOAEvents(rows []*models.AdjacencyRow) []*models.IOAEvent {
 }
 
 func rowNames(row *models.AdjacencyRow) []string {
-	// IOA time-series rows must reflect Sigma engine hits only.
-	// Do not fall back to edge/data field names to avoid mixed sources.
+	// IOA time-series rows should only come from normalized ioa_tags
+	// to avoid mixing edge/data-derived names from different pipelines.
 	values := make([]string, 0, 4)
 	for _, tag := range row.IoaTags {
 		if n := strings.TrimSpace(tag.Name); n != "" {

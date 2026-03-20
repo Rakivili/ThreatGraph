@@ -34,7 +34,6 @@ import (
 	"threatgraph/internal/output/ioajson"
 	"threatgraph/internal/output/rawjson"
 	"threatgraph/internal/pipeline"
-	"threatgraph/internal/rules"
 	"threatgraph/internal/service"
 	"threatgraph/internal/transform/sysmon"
 	"threatgraph/pkg/models"
@@ -125,6 +124,12 @@ func applyDefaults(cfg *config.Config) {
 	}
 	if cfg.ThreatGraph.Input.Elasticsearch.Slices <= 0 {
 		cfg.ThreatGraph.Input.Elasticsearch.Slices = 1
+	}
+	if cfg.ThreatGraph.Input.Elasticsearch.HostBatchSize <= 0 {
+		cfg.ThreatGraph.Input.Elasticsearch.HostBatchSize = 50
+	}
+	if cfg.ThreatGraph.Input.Elasticsearch.HostBatchWorkers <= 0 {
+		cfg.ThreatGraph.Input.Elasticsearch.HostBatchWorkers = 4
 	}
 	if cfg.ThreatGraph.Input.Elasticsearch.TimeShards <= 0 {
 		cfg.ThreatGraph.Input.Elasticsearch.TimeShards = 1
@@ -225,6 +230,13 @@ func runProducer(args []string) {
 	if err := logger.Init(cfg.ThreatGraph.Logging.Enabled, cfg.ThreatGraph.Logging.Level, cfg.ThreatGraph.Logging.File, cfg.ThreatGraph.Logging.Console); err != nil {
 		log.Fatalf("Failed to initialize logger: %v", err)
 	}
+	if strings.EqualFold(strings.TrimSpace(cfg.ThreatGraph.Input.Mode), "elasticsearch") && cfg.ThreatGraph.Input.Elasticsearch.HostPrefilter {
+		if err := runHostPrefilteredProducer(cfg); err != nil {
+			logger.Errorf("Failed to run host-prefiltered producer: %v", err)
+			log.Fatalf("Failed to run host-prefiltered producer: %v", err)
+		}
+		return
+	}
 	if strings.EqualFold(strings.TrimSpace(cfg.ThreatGraph.Input.Mode), "elasticsearch") && (cfg.ThreatGraph.Input.Elasticsearch.TimeShards > 1 || cfg.ThreatGraph.Input.Elasticsearch.TimeShardMinutes > 0) && os.Getenv("THREATGRAPH_TIME_SHARD_CHILD") != "1" {
 		if err := runTimeShardedProducer(configPath, cfg); err != nil {
 			logger.Errorf("Failed to run time-sharded producer: %v", err)
@@ -266,33 +278,9 @@ func runProducer(args []string) {
 		logger.Infof("Input mode: elasticsearch (%s index=%s)", cfg.ThreatGraph.Input.Elasticsearch.URL, cfg.ThreatGraph.Input.Elasticsearch.Index)
 	}
 
-	var engine rules.Engine
-	if cfg.ThreatGraph.Rules.Enabled {
-		if strings.TrimSpace(cfg.ThreatGraph.Rules.Path) == "" {
-			logger.Warnf("Rules enabled but rules.path is empty; IOA tagging disabled")
-		} else {
-			sigmaEngine, stats, err := rules.NewSigmaEngine(cfg.ThreatGraph.Rules.Path)
-			if err != nil {
-				logger.Errorf("Failed to load Sigma rules from %s: %v", cfg.ThreatGraph.Rules.Path, err)
-				log.Fatalf("Failed to load Sigma rules: %v", err)
-			}
-			engine = sigmaEngine
-			logger.Infof("Sigma rules loaded: loaded=%d skipped_complex=%d skipped_datasource=%d skipped_invalid=%d files=%d",
-				stats.Loaded,
-				stats.SkippedComplex,
-				stats.SkippedDatasource,
-				stats.SkippedInvalid,
-				stats.TotalFiles,
-			)
-			if stats.Loaded == 0 {
-				logger.Warnf("No compatible Sigma rules loaded; IOA tagging is effectively disabled")
-			}
-		}
-	}
-
 	pipes := make([]*pipeline.RedisAdjacencyPipeline, 0, sliceCount)
 	for sliceID := 0; sliceID < sliceCount; sliceID++ {
-		pipe, err := newProducerPipeline(cfg, engine, sliceID, sliceCount)
+		pipe, err := newProducerPipeline(cfg, sliceID, sliceCount, nil)
 		if err != nil {
 			logger.Errorf("Failed to create producer slice %d/%d: %v", sliceID+1, sliceCount, err)
 			log.Fatalf("Failed to create producer pipeline: %v", err)
@@ -346,7 +334,7 @@ func runProducer(args []string) {
 	logger.Infof("ThreatGraph stopped")
 }
 
-func newProducerPipeline(cfg *config.Config, engine rules.Engine, sliceID, sliceCount int) (*pipeline.RedisAdjacencyPipeline, error) {
+func newProducerPipeline(cfg *config.Config, sliceID, sliceCount int, hostFilter []string) (*pipeline.RedisAdjacencyPipeline, error) {
 	var consumer pipeline.MessageConsumer
 	var err error
 	inputMode := strings.ToLower(strings.TrimSpace(cfg.ThreatGraph.Input.Mode))
@@ -366,6 +354,7 @@ func newProducerPipeline(cfg *config.Config, engine rules.Engine, sliceID, slice
 			Password:   cfg.ThreatGraph.Input.Elasticsearch.Password,
 			Index:      cfg.ThreatGraph.Input.Elasticsearch.Index,
 			Query:      cfg.ThreatGraph.Input.Elasticsearch.Query,
+			HostFilter: hostFilter,
 			SliceID:    sliceID,
 			SliceMax:   sliceCount,
 			BatchSize:  cfg.ThreatGraph.Input.Elasticsearch.BatchSize,
@@ -451,7 +440,6 @@ func newProducerPipeline(cfg *config.Config, engine rules.Engine, sliceID, slice
 	}
 	return pipeline.NewRedisAdjacencyPipeline(
 		consumer,
-		engine,
 		mapper,
 		adjWriter,
 		ioaWriter,
