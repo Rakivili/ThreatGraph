@@ -87,6 +87,16 @@ make offline
 - `output/offline/incidents.jsonl`
 - `output/offline/report.html`
 
+常用覆盖参数（按需传入）：
+
+```bash
+make offline \
+  OFFLINE_CONFIG=threatgraph.yml \
+  OFFLINE_OUT_DIR=output/offline_20260320 \
+  OFFLINE_INCIDENT_MIN_SEQ=2 \
+  OFFLINE_REPORT_TITLE="ThreatGraph Offline Report"
+```
+
 ---
 
 ## 配置文件
@@ -104,6 +114,11 @@ make offline
 - `threatgraph.graph`：邻接行精简开关
 - `threatgraph.output`：邻接输出
 - `threatgraph.ioa`：IOA 事件输出
+
+离线最小必填只需要两段：
+
+- `threatgraph.input.elasticsearch.since/until`
+- `threatgraph.output.clickhouse.(url/database/table)`
 
 ### 最小配置片段（离线 ES -> ClickHouse）
 
@@ -152,6 +167,11 @@ threatgraph:
    - 对 non-notice 分支额外注入 `must_not operation=PortAttack`
 
 所以：你可以只配置时间范围；程序会自动补默认查询骨架并做必要注入。
+
+查询骨架示意：
+
+- Phase 1（主机发现）：`query.bool.filter` 继承你的时间范围，并附加 `exists/must_not`，然后做 `composite(client_id.keyword)` 聚合，要求 `distinct_rules > 1`
+- Phase 2（主机回拉）：在原始查询 `query.bool.filter` 追加 `terms client_id.keyword`
 
 ---
 
@@ -204,10 +224,10 @@ ClickHouse 输入（v10 常用）：
 ./bin/threatgraph analyze \
   --source clickhouse \
   --config threatgraph.yml \
-  --adjacency-table adjacency_offline_demo \
-  --output output/iip_ch_full_20260304_v10.jsonl \
-  --tactical-output output/tpg_ch_full_20260304_v10.jsonl \
-  --incident-output output/incidents_ch_full_20260304_v10.jsonl \
+  --adjacency-table adjacency \
+  --output output/offline/iip.jsonl \
+  --tactical-output output/offline/tpg.jsonl \
+  --incident-output output/offline/incidents.jsonl \
   --incident-min-seq 2
 ```
 
