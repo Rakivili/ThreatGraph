@@ -1,43 +1,79 @@
 package main
 
 import (
+	"encoding/json"
 	"testing"
-	"time"
 
-	"threatgraph/internal/analyzer"
+	"threatgraph/config"
 )
 
-func TestSelectIncidentLatestWithFilter(t *testing.T) {
-	base := time.Date(2026, 3, 4, 14, 0, 0, 0, time.UTC)
-	incidents := []analyzer.Incident{
-		{Host: "h1", Root: "r1", IIPTS: base},
-		{Host: "h1", Root: "r2", IIPTS: base.Add(1 * time.Minute)},
-		{Host: "h2", Root: "r3", IIPTS: base.Add(2 * time.Minute)},
+func TestSplitCSVDedupTrimAndSkipEmpty(t *testing.T) {
+	got := splitCSV(" host-a,host-b,host-a , ,host-c")
+	want := []string{"host-a", "host-b", "host-c"}
+	if len(got) != len(want) {
+		t.Fatalf("splitCSV len=%d want=%d", len(got), len(want))
 	}
-
-	got, err := selectIncident(incidents, -1, "h1", "", time.Time{})
-	if err != nil {
-		t.Fatalf("selectIncident returned err: %v", err)
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("splitCSV[%d]=%q want=%q", i, got[i], want[i])
+		}
 	}
-	if got.Root != "r2" {
-		t.Fatalf("expected latest filtered root=r2, got=%s", got.Root)
+	if out := splitCSV("   "); len(out) != 0 {
+		t.Fatalf("splitCSV on empty input got=%v want=nil", out)
 	}
 }
 
-func TestPickIncidentIIPPrefersHostRootClosestTime(t *testing.T) {
-	base := time.Date(2026, 3, 4, 14, 0, 0, 0, time.UTC)
-	incident := analyzer.Incident{Host: "h1", Root: "root-a", IIPTS: base.Add(10 * time.Second)}
-	iips := []analyzer.IIPGraph{
-		{Host: "h1", Root: "root-a", IIPTS: base.Add(30 * time.Second)},
-		{Host: "h1", Root: "root-a", IIPTS: base.Add(11 * time.Second)},
-		{Host: "h1", Root: "root-b", IIPTS: base.Add(9 * time.Second)},
+func TestRunAnalyzerUnknownSource(t *testing.T) {
+	code := runAnalyzer([]string{
+		"--source", "postgres",
+		"--tactical-output", "output/test.scored.jsonl",
+	})
+	if code != 2 {
+		t.Fatalf("runAnalyzer exit code=%d want=2", code)
 	}
+}
 
-	got, err := pickIncidentIIP(iips, incident)
-	if err != nil {
-		t.Fatalf("pickIncidentIIP returned err: %v", err)
+func TestEnsureDefaultElasticsearchQueryBuildsFromRange(t *testing.T) {
+	cfg := &config.Config{
+		ThreatGraph: config.ThreatGraphConfig{
+			Input: config.InputConfig{
+				Mode: "elasticsearch",
+				Elasticsearch: config.ElasticsearchConfig{
+					Since: "2026-03-04T00:00:00Z",
+					Until: "2026-03-05T00:00:00Z",
+				},
+			},
+		},
 	}
-	if !got.IIPTS.Equal(base.Add(11 * time.Second)) {
-		t.Fatalf("expected closest matching iip ts, got=%s", got.IIPTS)
+	if err := ensureDefaultElasticsearchQuery(cfg); err != nil {
+		t.Fatalf("ensureDefaultElasticsearchQuery returned err: %v", err)
+	}
+	if cfg.ThreatGraph.Input.Elasticsearch.Query == "" {
+		t.Fatalf("query was not generated")
+	}
+	var q map[string]any
+	if err := json.Unmarshal([]byte(cfg.ThreatGraph.Input.Elasticsearch.Query), &q); err != nil {
+		t.Fatalf("generated query is not valid json: %v", err)
+	}
+}
+
+func TestEnsureDefaultElasticsearchQueryKeepsCustomQuery(t *testing.T) {
+	cfg := &config.Config{
+		ThreatGraph: config.ThreatGraphConfig{
+			Input: config.InputConfig{
+				Mode: "elasticsearch",
+				Elasticsearch: config.ElasticsearchConfig{
+					Query: `{"query":{"match_all":{}}}`,
+					Since: "2026-03-04T00:00:00Z",
+					Until: "2026-03-05T00:00:00Z",
+				},
+			},
+		},
+	}
+	if err := ensureDefaultElasticsearchQuery(cfg); err != nil {
+		t.Fatalf("ensureDefaultElasticsearchQuery returned err: %v", err)
+	}
+	if got := cfg.ThreatGraph.Input.Elasticsearch.Query; got != `{"query":{"match_all":{}}}` {
+		t.Fatalf("custom query changed: %s", got)
 	}
 }

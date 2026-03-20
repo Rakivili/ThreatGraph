@@ -18,7 +18,6 @@
 
 - `produce`：完成第 1~2 层并落地邻接数据。
 - `analyze`：完成第 3~5 层（离线）。
-- `serve`：基于 IOA 微批触发第 3~5 层（增量）。
 
 ---
 
@@ -153,22 +152,9 @@
 
 ---
 
-## 8. serve 增量模式补充
-
-`serve`（`internal/service/analyze_service.go`）在工程上增加了三件事：
-
-1. 基于 `ioa_events` 微批触发主机分析窗口。
-2. 把已被 IIP 覆盖的 IOA 写入 `ioa_processed` 去重。
-3. 仅输出“新增或显著增强”的 incident（`host|root` 维度比较序列长度与风险）。
-
-因此，`serve` 更像“持续分诊器”，不是简单重复跑离线 `analyze`。
-
----
-
-## 9. 当前边界与注意事项
+## 8. 当前边界与注意事项
 
 1. 当前 `produce` 主链路 IOA 来自离线 EDR 字段，不是 Sigma 在线匹配。
 2. 检测效果高度依赖 `ioa_tags` 的召回和质量。
 3. happens-before 仍以同 host 时序与图可达为主，跨主机关联能力有限。
 4. `run_once` 对 ES 输入更多是兼容字段，ES 消费本身读完即结束。
-

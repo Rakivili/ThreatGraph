@@ -1,55 +1,35 @@
 threatgraph:
   input:
-    redis:
-      addr: 127.0.0.1:6379
+    mode: elasticsearch
+    elasticsearch:
+      url: https://127.0.0.1:9200
+      username: elastic
       password: ""
-      db: 0
-      key: sysmon_events
-      block_timeout: 5s
+      index: edr-offline-ls-*
+      # Minimal range controls. If query is empty, ThreatGraph builds
+      # the default prefilter + payload query automatically.
+      since: 2026-03-04T00:00:00Z
+      until: 2026-03-05T00:00:00Z
+      # Enable two-stage filtering:
+      # 1) discover non-notice candidate hosts
+      # 2) pull full payload only for discovered hosts
+      host_prefilter: true
+      # Optional tuning:
+      # host_batch_size: 50
+      # host_batch_workers: 4
 
-  pipeline:
-    workers: 8
-    batch_size: 1000
-    flush_interval: 2s
-
-  graph:
-    write_vertex_rows: false
-    include_edge_data: false
-
-  rules:
-    enabled: false
-    path: "./rules/sigma"
+      # Optional if your ES cert chain is private:
+      # ca_cert_path: /path/to/ca.pem
+      # insecure: false
 
   output:
-    mode: file
-    file:
-      path: output/adjacency.jsonl
-
-  # Lightweight IOA stream output for stage-1 sequence prefiltering.
-  ioa:
-    enabled: true
-    output:
-      mode: clickhouse
-      file:
-        path: output/ioa_events.jsonl
-      clickhouse:
-        url: http://127.0.0.1:8123
-        database: threatgraph
-        table: ioa_events
-        username: default
-        password: ""
-        timeout: 5s
-        headers: {}
-
-  replay_capture:
-    enabled: false
-    file:
-      path: output/raw_events.jsonl
-    batch_size: 1000
-    flush_interval: 2s
-
-  logging:
-    enabled: true
-    level: info
-    file: ""
-    console: true
+    mode: clickhouse
+    clickhouse:
+      url: http://127.0.0.1:8123
+      database: threatgraph
+      table: adjacency
+      username: default
+      password: ""
+      # Optional:
+      # format: row_binary
+      # timeout: 5s

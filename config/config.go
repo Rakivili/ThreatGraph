@@ -22,7 +22,6 @@ type ThreatGraphConfig struct {
 	IOA           IOAConfig           `yaml:"ioa"`
 	ReplayCapture ReplayCaptureConfig `yaml:"replay_capture"`
 	Logging       LoggingConfig       `yaml:"logging"`
-	Serve         ServeConfig         `yaml:"serve"`
 }
 
 // GraphConfig controls raw adjacency graph emission.
@@ -66,6 +65,8 @@ type ElasticsearchConfig struct {
 	Username         string            `yaml:"username"`
 	Password         string            `yaml:"password"`
 	Index            string            `yaml:"index"`
+	Since            string            `yaml:"since"`
+	Until            string            `yaml:"until"`
 	Query            string            `yaml:"query"`
 	HostPrefilter    bool              `yaml:"host_prefilter"`
 	HostBatchSize    int               `yaml:"host_batch_size"`
@@ -142,32 +143,6 @@ type LoggingConfig struct {
 	Level   string `yaml:"level"`
 	File    string `yaml:"file"`
 	Console bool   `yaml:"console"`
-}
-
-// ServeConfig controls the near-real-time serve command.
-type ServeConfig struct {
-	Analyze  AnalyzeConfig        `yaml:"analyze"`
-	Incident IncidentOutputConfig `yaml:"incident"`
-}
-
-// AnalyzeConfig controls incremental analysis polling.
-type AnalyzeConfig struct {
-	Window         time.Duration          `yaml:"window"`
-	Interval       time.Duration          `yaml:"interval"`
-	BatchSize      int                    `yaml:"batch_size"`
-	MinSeq         int                    `yaml:"min_seq"`
-	Workers        int                    `yaml:"workers"`
-	AdjacencyTable string                 `yaml:"adjacency_table"`
-	IOATable       string                 `yaml:"ioa_table"`
-	ProcessedTable string                 `yaml:"processed_table"`
-	ClickHouse     ClickHouseOutputConfig `yaml:"clickhouse"`
-}
-
-// IncidentOutputConfig controls incident output sink.
-type IncidentOutputConfig struct {
-	Mode string           `yaml:"mode"` // file|http
-	File FileOutputConfig `yaml:"file"`
-	HTTP HTTPOutputConfig `yaml:"http"`
 }
 
 // LoadConfig reads and parses a YAML config file.
