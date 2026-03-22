@@ -56,4 +56,4 @@ offline: build
 	[ -n "$$ES_URL" ] || ES_URL="https://127.0.0.1:9200"; \
 	[ -n "$$ES_USER" ] || ES_USER="elastic"; \
 	[ -n "$$ES_INDEX" ] || ES_INDEX="edr-offline-ls-*"; \
-	python3 tools/make_viewer.py --all-in-dir $(OFFLINE_SUBGRAPH_DIR) --out $(OFFLINE_REPORT) --es-url "$$ES_URL" --es-user "$$ES_USER" --es-pass "$$ES_PASS" --es-index "$$ES_INDEX" --es-ca "$$ES_CA"
+	python3 tools/make_viewer_falcon.py --all-in-dir $(OFFLINE_SUBGRAPH_DIR) --out $(OFFLINE_REPORT) --es-url "$$ES_URL" --es-user "$$ES_USER" --es-pass "$$ES_PASS" --es-index "$$ES_INDEX" --es-ca "$$ES_CA"
